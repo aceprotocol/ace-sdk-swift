@@ -50,6 +50,7 @@ struct InteropFixtureTests {
         let conversationId: String
         let messageId: String
         let threadId: String
+        let ephemeralPubKey: String
         let ciphertext: String
     }
 
@@ -132,9 +133,11 @@ struct InteropFixtureTests {
         let sd = v.vectors.signData
         let mp = sd.messagePayload
 
+        let ephemeralPubKey = try ACEBase64.decode(mp.ephemeralPubKey)
         let ciphertext = try ACEBase64.decode(mp.ciphertext)
         let messagePayload = ACESigning.encodePayload([
-            .string(mp.type), .string(mp.to), .string(mp.conversationId), .string(mp.messageId), .string(mp.threadId), .data(ciphertext)
+            .string(mp.type), .string(mp.to), .string(mp.conversationId), .string(mp.messageId), .string(mp.threadId),
+            .data(ephemeralPubKey), .data(ciphertext)
         ])
         let signData = ACESigning.buildSignData(
             action: sd.action,

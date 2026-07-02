@@ -162,9 +162,17 @@ private func buildSignedMessagePayload(
     conversationId: String,
     messageId: String,
     threadId: String?,
+    ephemeralPubKey: Data,
     payload: Data
 ) -> Data {
-    ACESigning.encodePayload([.string(type.rawValue), .string(to), .string(conversationId), .string(messageId), .string(normalizeThreadId(threadId)), .data(payload)])
+    // ephemeralPubKey is signed too: it is what the recipient uses to derive the
+    // decryption key, so it is part of the sender's commitment. Omitting it would
+    // let a relay swap the ephemeral key (garbling the message) without breaking
+    // the signature.
+    ACESigning.encodePayload([
+        .string(type.rawValue), .string(to), .string(conversationId), .string(messageId),
+        .string(normalizeThreadId(threadId)), .data(ephemeralPubKey), .data(payload),
+    ])
 }
 
 private func threadContainsMessage(
@@ -334,6 +342,7 @@ public func createMessage(_ opts: CreateMessageOptions) throws -> ACEMessage {
         conversationId: conversationId,
         messageId: messageId,
         threadId: opts.threadId,
+        ephemeralPubKey: ephemeralPubKey,
         payload: payload
     )
     let signData = ACESigning.buildSignData(action: "message", aceId: fromId, timestamp: timestamp, payload: messagePayload)
@@ -490,12 +499,14 @@ public func parseMessage(
         throw ACEError.payloadTooLarge(payloadBytes.count)
     }
 
+    let ephemeralPubKey = try ACEBase64.decode(msg.encryption.ephemeralPubKey)
     let messagePayload = buildSignedMessagePayload(
         type: msg.type,
         to: msg.to,
         conversationId: msg.conversationId,
         messageId: msg.messageId,
         threadId: msg.threadId,
+        ephemeralPubKey: ephemeralPubKey,
         payload: payloadBytes
     )
     let signData = ACESigning.buildSignData(action: "message", aceId: msg.from, timestamp: msg.timestamp, payload: messagePayload)
@@ -523,8 +534,7 @@ public func parseMessage(
     // must NOT release the reservation to prevent replay attacks.
     releaseReplayOnError = false
 
-    // 5. Decrypt body
-    let ephemeralPubKey = try ACEBase64.decode(msg.encryption.ephemeralPubKey)
+    // 5. Decrypt body — ephemeralPubKey was decoded and signature-verified above.
     let decrypted = try receiver.decrypt(
         ephemeralPubKey: ephemeralPubKey,
         payload: payloadBytes,
@@ -583,6 +593,27 @@ public func parseMessageFromRegistration(
         replayDetector: replayDetector,
         currentTimestamp: nil
     )
+}
+
+/// Safe path for messages whose sender keys came from a relay.
+///
+/// `sender` must be a ``VerifiedPeer`` — obtainable only after its encryption-key
+/// binding was verified — so the recipient never trusts a relay-substituted X25519
+/// key. `conversationId` is recomputed from the verified keys and must match.
+public func parseMessageFromPeer(
+    _ msg: ACEMessage,
+    receiver: any ACEIdentity,
+    sender: VerifiedPeer,
+    stateMachine: ThreadStateMachine,
+    replayDetector: ReplayDetector? = nil
+) throws -> ParsedMessage {
+    let opts = ParseMessageOptions(
+        stateMachine: stateMachine,
+        expectedScheme: sender.scheme,
+        replayDetector: replayDetector,
+        senderEncryptionPubKey: sender.encryptionPublicKey
+    )
+    return try parseMessage(msg, receiver: receiver, senderSigningPubKey: sender.signingPublicKey, opts: opts)
 }
 
 func parseMessageFromRegistrationInternal(

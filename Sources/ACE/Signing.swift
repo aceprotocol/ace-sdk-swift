@@ -16,6 +16,29 @@ import P256K
 
 private let domainPrefix = Data("ace.v1".utf8)
 
+// MARK: - secp256k1 order (canonical low-S enforcement)
+
+// N and N/2 as 32-byte big-endian. A signature is canonical (non-malleable) only
+// when s ∈ [1, N/2]; accepting high-S lets (r, s) and (r, N - s) both verify.
+private let secp256k1OrderBE = Data([
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+])
+private let secp256k1HalfOrderBE = Data([
+    0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+])
+
+/// Compare two equal-length big-endian byte strings numerically (-1 / 0 / 1).
+private func compareBE(_ a: Data, _ b: Data) -> Int {
+    let ab = [UInt8](a), bb = [UInt8](b)
+    for i in 0..<Swift.min(ab.count, bb.count) where ab[i] != bb[i] {
+        return ab[i] < bb[i] ? -1 : 1
+    }
+    return ab.count == bb.count ? 0 : (ab.count < bb.count ? -1 : 1)
+}
+private func isZeroBytes(_ d: Data) -> Bool { d.allSatisfy { $0 == 0 } }
+
 // MARK: - Sign Data Builder
 
 public enum ACESigning {
@@ -127,6 +150,14 @@ public enum ACESigning {
         // practically impossible for secp256k1 and not used in ACE)
         guard vByte <= 1 else { return false }
         let v = Int32(vByte)
+
+        // Reject out-of-range and non-canonical (high-S) signatures. ECDSA is
+        // malleable: (r, s) and (r, N - s) recover the same key, so accepting
+        // high-S lets an observer re-mint a valid signature with different bytes
+        // and slip past signature-keyed replay protection. All ACE SDKs sign low-S.
+        let rData = Data(r), sData = Data(s)
+        guard !isZeroBytes(rData), compareBE(rData, secp256k1OrderBE) < 0 else { return false }
+        guard !isZeroBytes(sData), compareBE(sData, secp256k1HalfOrderBE) <= 0 else { return false }
 
         do {
             // Build recoverable signature: compact(r||s) + recoveryId

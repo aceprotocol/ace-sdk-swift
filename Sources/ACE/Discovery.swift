@@ -108,6 +108,107 @@ public func getRegistrationEncryptionPublicKey(_ reg: RegistrationFile) throws -
     return try ACEBase64.decode(reg.signing.encryptionPublicKey)
 }
 
+// MARK: - Encryption-Key Binding (relay-sourced peer keys)
+//
+// `aceId` self-certifies only the SIGNING key (aceId == sha256(signingKey)). The
+// X25519 ENCRYPTION key is separate — on its own an unauthenticated claim. A relay
+// routes ciphertext and is untrusted by design, so it could hand a client its own
+// X25519 key and read messages the client believes are end-to-end encrypted. The
+// binding below is the proof that closes that gap: the exact signature the relay
+// already requires at registration, verifiable with the identity's signing key alone.
+
+/// A `GET /v1/peer` response or a `/v1/discover` agent entry.
+public struct RelayPeerResponse: Codable, Sendable {
+    public let aceId: String
+    public let scheme: SigningScheme
+    public let encryptionPublicKey: String
+    public let signingPublicKey: String
+    public let registrationSignature: String?
+    public let registeredAt: Int?
+
+    public init(
+        aceId: String, scheme: SigningScheme,
+        encryptionPublicKey: String, signingPublicKey: String,
+        registrationSignature: String?, registeredAt: Int?
+    ) {
+        self.aceId = aceId
+        self.scheme = scheme
+        self.encryptionPublicKey = encryptionPublicKey
+        self.signingPublicKey = signingPublicKey
+        self.registrationSignature = registrationSignature
+        self.registeredAt = registeredAt
+    }
+}
+
+/// A peer's public keys AFTER the identity + encryption-key binding are verified.
+/// Obtain ONLY via `verifyPeerResponse`; the memberwise initializer bypasses checks.
+public struct VerifiedPeer: Sendable {
+    public let aceId: String
+    public let scheme: SigningScheme
+    public let signingPublicKey: Data
+    public let encryptionPublicKey: Data
+}
+
+/// Verify that `encryptionPublicKey` was authorized by `aceId`.
+///
+/// The binding is identical to what `POST /v1/register` signs:
+///   buildSignData("register", aceId, timestamp,
+///                 encodePayload(encryptionPublicKey, signingPublicKey))
+/// signed by the identity's signing key. This also re-checks
+/// `aceId == sha256(signingPublicKey)`, so `true` means this exact X25519 key was
+/// signed by the key that defines this identity. Inputs MUST be the Base64 wire
+/// strings (the signature commits to those strings). Returns `false` on bad input.
+public func verifyEncryptionKeyBinding(
+    aceId: String,
+    scheme: SigningScheme,
+    encryptionPublicKey: String,
+    signingPublicKey: String,
+    timestamp: Int,
+    signature: String
+) -> Bool {
+    guard timestamp >= 0 else { return false }
+    guard let signingPubBytes = try? ACEBase64.decode(signingPublicKey) else { return false }
+    // The signing key must be the one that defines this identity.
+    guard computeACEId(signingPubBytes) == aceId else { return false }
+    let payload = ACESigning.encodePayload([.string(encryptionPublicKey), .string(signingPublicKey)])
+    let signData = ACESigning.buildSignData(action: "register", aceId: aceId, timestamp: timestamp, payload: payload)
+    guard let sigBytes = try? ACESigning.decodeSignature(signature, scheme: scheme) else { return false }
+    return ACESigning.verifySignature(signData: signData, signature: sigBytes, scheme: scheme, signingPublicKey: signingPubBytes)
+}
+
+/// Build a ``VerifiedPeer`` from a relay `GET /v1/peer` or `/v1/discover` entry.
+///
+/// Throws if the binding signature is absent or fails — a relay that substitutes an
+/// X25519 key cannot produce a passing binding. Use the keys with `parseMessageFromPeer`.
+public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer {
+    guard validateACEId(data.aceId) else {
+        throw ACEError.invalidRegistration("Invalid peer aceId: '\(String(data.aceId.prefix(80)))'")
+    }
+    guard let signature = data.registrationSignature, let registeredAt = data.registeredAt else {
+        throw ACEError.invalidRegistration(
+            "Peer response is missing the encryption-key binding (registrationSignature/registeredAt); " +
+            "its encryptionPublicKey cannot be trusted. Without the binding a relay could substitute " +
+            "its own X25519 key and read messages meant to be end-to-end encrypted."
+        )
+    }
+    guard verifyEncryptionKeyBinding(
+        aceId: data.aceId, scheme: data.scheme,
+        encryptionPublicKey: data.encryptionPublicKey, signingPublicKey: data.signingPublicKey,
+        timestamp: registeredAt, signature: signature
+    ) else {
+        throw ACEError.signatureVerificationFailed(
+            "Peer encryption-key binding failed verification: the encryptionPublicKey is not signed by " +
+            "this identity's signing key (possible key substitution / relay MITM)."
+        )
+    }
+    return VerifiedPeer(
+        aceId: data.aceId,
+        scheme: data.scheme,
+        signingPublicKey: try ACEBase64.decode(data.signingPublicKey),
+        encryptionPublicKey: try ACEBase64.decode(data.encryptionPublicKey)
+    )
+}
+
 // MARK: - URL Host Validation
 
 /// Reject URL hosts that resolve to private/reserved addresses.
