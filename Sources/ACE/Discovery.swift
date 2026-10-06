@@ -139,6 +139,7 @@ public struct RelayPeerResponse: Codable, Sendable {
 /// A peer's public keys AFTER the identity + encryption-key binding are verified.
 /// Obtain ONLY via `verifyPeerResponse`; the memberwise initializer bypasses checks.
 public struct VerifiedPeer: Sendable {
+    public let registeredAt: Int
     public let aceId: String
     public let scheme: SigningScheme
     public let signingPublicKey: Data
@@ -219,6 +220,7 @@ public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer
         )
     }
     return VerifiedPeer(
+        registeredAt: registeredAt,
         aceId: data.aceId,
         scheme: data.scheme,
         signingPublicKey: keys.signingPublicKey,

@@ -534,7 +534,10 @@ public func parseMessage(
     )
 
     // 6. Parse and validate body
-    guard let body = try JSONSerialization.jsonObject(with: decrypted) as? [String: Any] else {
+    let decoded: Any
+    do { decoded = try JSONSerialization.jsonObject(with: decrypted) }
+    catch { throw ACEError.invalidMessage("Decrypted body is not valid JSON") }
+    guard let body = decoded as? [String: Any] else {
         throw ACEError.invalidMessage("Decrypted body must be a JSON object")
     }
     try assertMaxDepth(body, maxJSONDepth)

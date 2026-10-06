@@ -10,6 +10,26 @@ import Foundation
 @Suite("Security")
 struct SecurityTests {
 
+    @Test("same message ID from different senders survives restart")
+    func senderIsolation() throws {
+        let d = Self.store()
+        #expect(Self.commit(d, 1, Self.t, from: Self.mallory))
+        #expect(Self.commit(d, 1, Self.t))
+        let restored = try ReplayDetector.fromExport(d.export())
+        #expect(!Self.commit(restored, 1, Self.t))
+        #expect(!Self.commit(restored, 1, Self.t, from: Self.mallory))
+    }
+
+    @Test("same-second capacity eviction survives restart")
+    func sameSecondEviction() throws {
+        let d = Self.store(capacity: 2)
+        for n in 1...3 { #expect(Self.commit(d, n, Self.t)) }
+        let restored = try ReplayDetector.fromExport(d.export(), capacity: 2)
+        for n in 1...3 { #expect(!restored.accepts(Self.id(n), from: Self.alice, timestamp: Self.t)) }
+        #expect(Self.commit(restored, 1, Self.t, from: Self.mallory))
+        #expect(try ReplayDetector.fromExport(restored.export(), capacity: 2).export() == restored.export())
+    }
+
     // MARK: - Timestamp
 
     @Test("accepts current timestamp")

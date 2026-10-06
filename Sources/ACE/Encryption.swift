@@ -197,8 +197,8 @@ public enum ACEEncryption {
         let sealedBox = try AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag)
 
         // 4. Decrypt
-        let plaintext = try AES.GCM.open(sealedBox, using: aesKey, authenticating: convIdBytes)
-        return plaintext
+        do { return try AES.GCM.open(sealedBox, using: aesKey, authenticating: convIdBytes) }
+        catch { throw ACEError.decryptionFailed("AES-GCM authentication failed") }
     }
 
     // MARK: - Validation

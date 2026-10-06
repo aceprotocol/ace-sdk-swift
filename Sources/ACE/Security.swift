@@ -116,7 +116,11 @@ public struct ReplayDetectorExport: Codable, Equatable, Sendable {
 /// `fromExport()` across restarts.
 public final class ReplayDetector: @unchecked Sendable {
     private let capacity: Int
-    private var ids: Set<String> = []
+    private struct ReplayKey: Hashable {
+        let sender: String
+        let messageId: String
+    }
+    private var ids: Set<ReplayKey> = []
     /// Min-heap ordered by timestamp.
     private var heap: [ReplayDetectorExport.Entry] = []
     private var _horizon: Int
@@ -154,7 +158,7 @@ public final class ReplayDetector: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard acceptsLocked(messageId, from: sender, timestamp: timestamp) else { return false }
-        ids.insert(messageId)
+        ids.insert(ReplayKey(sender: sender, messageId: messageId))
         push(.init(messageId: messageId, sender: sender, timestamp: timestamp))
         evict(below: floor)
         return true
@@ -163,6 +167,15 @@ public final class ReplayDetector: @unchecked Sendable {
     public func export() -> ReplayDetectorExport {
         lock.lock()
         defer { lock.unlock() }
+        // Serialization already traverses the heap; discard horizon-covered
+        // entries here so the result always passes fromExport validation.
+        let live = heap.filter { $0.timestamp > _horizon && $0.timestamp > senderHorizons[$0.sender, default: _horizon] }
+        heap.removeAll(keepingCapacity: true)
+        ids.removeAll(keepingCapacity: true)
+        for entry in live {
+            push(entry)
+            ids.insert(ReplayKey(sender: entry.sender, messageId: entry.messageId))
+        }
         return ReplayDetectorExport(horizon: _horizon, senderHorizons: senderHorizons, entries: heap)
     }
 
@@ -176,7 +189,7 @@ public final class ReplayDetector: @unchecked Sendable {
             try validateMessageId(entry.messageId)
             guard !entry.sender.isEmpty,
                   detector.acceptsLocked(entry.messageId, from: entry.sender, timestamp: entry.timestamp),
-                  detector.ids.insert(entry.messageId).inserted else {
+                  detector.ids.insert(ReplayKey(sender: entry.sender, messageId: entry.messageId)).inserted else {
                 throw ACEError.invalidMessage("fromExport: invalid entry")
             }
             detector.push(entry)
@@ -186,7 +199,7 @@ public final class ReplayDetector: @unchecked Sendable {
     }
 
     private func acceptsLocked(_ messageId: String, from sender: String, timestamp: Int) -> Bool {
-        timestamp > _horizon && timestamp > senderHorizons[sender, default: _horizon] && !ids.contains(messageId)
+        timestamp > _horizon && timestamp > senderHorizons[sender, default: _horizon] && !ids.contains(ReplayKey(sender: sender, messageId: messageId))
     }
 
     /// Remove smallest-timestamp entries: below `floor` they raise the horizon,
@@ -194,12 +207,12 @@ public final class ReplayDetector: @unchecked Sendable {
     private func evict(below floor: Int) {
         while let top = heap.first, top.timestamp < floor {
             pop()
-            ids.remove(top.messageId)
+            ids.remove(ReplayKey(sender: top.sender, messageId: top.messageId))
             _horizon = max(_horizon, top.timestamp)
         }
         while heap.count > capacity, let top = heap.first {
             pop()
-            ids.remove(top.messageId)
+            ids.remove(ReplayKey(sender: top.sender, messageId: top.messageId))
             senderHorizons[top.sender] = max(senderHorizons[top.sender, default: top.timestamp], top.timestamp)
         }
         compactSenderHorizons()
