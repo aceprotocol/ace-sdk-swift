@@ -26,11 +26,11 @@ struct SecurityHardeningTests {
             let iterations = 1000
 
             DispatchQueue.concurrentPerform(iterations: iterations) { i in
-                _ = detector.commit("msg-\(i)", timestamp: Self.t, floor: Self.t - maxDriftSeconds)
+                _ = detector.commit("msg-\(i)", from: "ace:sha256:alice", timestamp: Self.t, floor: Self.t - maxDriftSeconds)
             }
 
             // All should have been committed (no crash, no data corruption)
-            let committed = (0..<iterations).filter { !detector.accepts("msg-\($0)", timestamp: Self.t) }
+            let committed = (0..<iterations).filter { !detector.accepts("msg-\($0)", from: "ace:sha256:alice", timestamp: Self.t) }
             #expect(committed.count == iterations)
         }
 
@@ -43,7 +43,7 @@ struct SecurityHardeningTests {
             let lock = NSLock()
 
             DispatchQueue.concurrentPerform(iterations: iterations) { _ in
-                if detector.commit(id, timestamp: Self.t, floor: Self.t - maxDriftSeconds) {
+                if detector.commit(id, from: "ace:sha256:alice", timestamp: Self.t, floor: Self.t - maxDriftSeconds) {
                     lock.lock()
                     successCount += 1
                     lock.unlock()

@@ -60,14 +60,15 @@ struct SecurityTests {
 
     static let t = 1_800_000_000
     static func id(_ n: Int) -> String { String(format: "550e8400-e29b-41d4-a716-4466554400%02d", n) }
+    static let alice = "ace:sha256:alice", mallory = "ace:sha256:mallory"
     /// A new store at time `t`.
     static func store(capacity: Int = 100_000) -> ReplayDetector {
         ReplayDetector(capacity: capacity, horizon: t - maxDriftSeconds)
     }
     /// Commit with the online floor at time `now`.
     @discardableResult
-    static func commit(_ d: ReplayDetector, _ n: Int, _ ts: Int, now: Int = t) -> Bool {
-        d.commit(id(n), timestamp: ts, floor: now - maxDriftSeconds)
+    static func commit(_ d: ReplayDetector, _ n: Int, _ ts: Int, now: Int = t, from sender: String = alice) -> Bool {
+        d.commit(id(n), from: sender, timestamp: ts, floor: now - maxDriftSeconds)
     }
 
     @Test("new store starts with horizon = now - 5 min")
@@ -80,10 +81,10 @@ struct SecurityTests {
     func replayDuplicatesAndHorizon() {
         let d = Self.store()
         #expect(Self.commit(d, 1, Self.t))
-        #expect(!d.accepts(Self.id(1), timestamp: Self.t))
+        #expect(!d.accepts(Self.id(1), from: Self.alice, timestamp: Self.t))
         #expect(!Self.commit(d, 1, Self.t))
-        #expect(!d.accepts(Self.id(2), timestamp: Self.t - 300))
-        #expect(d.accepts(Self.id(2), timestamp: Self.t - 299))
+        #expect(!d.accepts(Self.id(2), from: Self.alice, timestamp: Self.t - 300))
+        #expect(d.accepts(Self.id(2), from: Self.alice, timestamp: Self.t - 299))
     }
 
     @Test("keeps an entry until it falls below the floor, then raises the horizon to it")
@@ -91,35 +92,58 @@ struct SecurityTests {
         let d = Self.store()
         Self.commit(d, 1, Self.t + 300) // max future drift: acceptable until t + 600
         Self.commit(d, 2, Self.t + 450, now: Self.t + 450)
-        #expect(!d.accepts(Self.id(1), timestamp: Self.t + 300))
+        #expect(!d.accepts(Self.id(1), from: Self.alice, timestamp: Self.t + 300))
         Self.commit(d, 3, Self.t + 650, now: Self.t + 650) // floor t + 350 > t + 300
         #expect(d.horizon == Self.t + 300)
-        #expect(!d.accepts(Self.id(1), timestamp: Self.t + 300))
+        #expect(!d.accepts(Self.id(1), from: Self.alice, timestamp: Self.t + 300))
     }
 
     @Test("a fixed earlier floor keeps entries; only capacity removes them")
     func replayOfflineFloor() {
         // A store that has been running since before the receiver went offline.
         let d = ReplayDetector(capacity: 2, horizon: Self.t - 7200)
-        _ = d.commit(Self.id(1), timestamp: Self.t - 3000, floor: Self.t - 7200)
-        _ = d.commit(Self.id(2), timestamp: Self.t - 1000, floor: Self.t - 7200)
+        _ = d.commit(Self.id(1), from: Self.alice, timestamp: Self.t - 3000, floor: Self.t - 7200)
+        _ = d.commit(Self.id(2), from: Self.alice, timestamp: Self.t - 1000, floor: Self.t - 7200)
         #expect(d.horizon == Self.t - 7200)
-        _ = d.commit(Self.id(3), timestamp: Self.t - 2000, floor: Self.t - 7200)
-        #expect(d.horizon == Self.t - 3000)
+        _ = d.commit(Self.id(3), from: Self.alice, timestamp: Self.t - 2000, floor: Self.t - 7200)
+        #expect(d.horizon == Self.t - 7200)
+        #expect(d.export().senderHorizons == [Self.alice: Self.t - 3000])
     }
 
-    @Test("at capacity removes the smallest timestamp, not the oldest insertion")
+    @Test("at capacity removes the smallest timestamp and raises only its sender's horizon")
     func replayCapacityEviction() {
         let d = Self.store(capacity: 2)
         Self.commit(d, 1, Self.t - 10)
         Self.commit(d, 2, Self.t - 50)
         Self.commit(d, 3, Self.t - 20)
-        #expect(d.horizon == Self.t - 50)
+        #expect(d.horizon == Self.t - 300)
         for (n, ts) in [(1, Self.t - 10), (2, Self.t - 50), (3, Self.t - 20)] {
-            #expect(!d.accepts(Self.id(n), timestamp: ts))
+            #expect(!d.accepts(Self.id(n), from: Self.alice, timestamp: ts))
         }
-        #expect(!d.accepts(Self.id(4), timestamp: Self.t - 50))
-        #expect(d.accepts(Self.id(4), timestamp: Self.t - 49))
+        #expect(!d.accepts(Self.id(4), from: Self.alice, timestamp: Self.t - 50))
+        #expect(d.accepts(Self.id(4), from: Self.alice, timestamp: Self.t - 49))
+        #expect(d.accepts(Self.id(4), from: Self.mallory, timestamp: Self.t - 50))
+    }
+
+    @Test("one sender flooding the store cannot block other senders")
+    func replayFloodIsolated() {
+        let d = Self.store(capacity: 3)
+        for n in 1...4 { Self.commit(d, n, Self.t + 300, from: Self.mallory) }
+        #expect(d.horizon == Self.t - 300)
+        #expect(!d.accepts(Self.id(5), from: Self.mallory, timestamp: Self.t + 300))
+        #expect(Self.commit(d, 5, Self.t))
+    }
+
+    @Test("sender horizons are bounded by capacity, folding the lowest into the horizon")
+    func replaySenderHorizonsBounded() {
+        let d = Self.store(capacity: 2)
+        for n in 1...6 { Self.commit(d, n, Self.t + n, from: "ace:sha256:s\(n)") }
+        let state = d.export()
+        #expect(state.senderHorizons.count <= 2)
+        #expect(d.horizon > Self.t - 300)
+        for n in 1...4 {
+            #expect(!d.accepts(Self.id(n), from: "ace:sha256:s\(n)", timestamp: Self.t + n))
+        }
     }
 
     @Test("export/import roundtrip")
@@ -129,17 +153,18 @@ struct SecurityTests {
         Self.commit(d, 2, Self.t - 20)
         let restored = try ReplayDetector.fromExport(d.export())
         #expect(restored.horizon == d.horizon)
-        #expect(!restored.accepts(Self.id(1), timestamp: Self.t - 10))
-        #expect(!restored.accepts(Self.id(2), timestamp: Self.t - 20))
-        #expect(restored.accepts(Self.id(3), timestamp: Self.t - 20))
+        #expect(!restored.accepts(Self.id(1), from: Self.alice, timestamp: Self.t - 10))
+        #expect(!restored.accepts(Self.id(2), from: Self.alice, timestamp: Self.t - 20))
+        #expect(restored.accepts(Self.id(3), from: Self.alice, timestamp: Self.t - 20))
     }
 
-    @Test("fromExport over capacity removes the smallest timestamps and raises the horizon")
+    @Test("fromExport over capacity removes the smallest timestamps and raises their sender horizon")
     func replayImportOverCapacity() throws {
         let entries = [(1, Self.t - 30), (2, Self.t - 10), (3, Self.t - 20)]
-            .map { ReplayDetectorExport.Entry(messageId: Self.id($0.0), timestamp: $0.1) }
+            .map { ReplayDetectorExport.Entry(messageId: Self.id($0.0), sender: Self.alice, timestamp: $0.1) }
         let restored = try ReplayDetector.fromExport(.init(horizon: Self.t - 300, entries: entries), capacity: 2)
-        #expect(restored.horizon == Self.t - 30)
+        #expect(restored.horizon == Self.t - 300)
+        #expect(restored.export().senderHorizons == [Self.alice: Self.t - 30])
         #expect(restored.export().entries.count == 2)
     }
 
@@ -148,9 +173,13 @@ struct SecurityTests {
         let t = Self.t
         let bad: [ReplayDetectorExport] = [
             .init(horizon: -1, entries: []),
-            .init(horizon: t, entries: [.init(messageId: "msg-1", timestamp: t + 1)]),
-            .init(horizon: t, entries: [.init(messageId: Self.id(1), timestamp: t)]),
-            .init(horizon: t, entries: [.init(messageId: Self.id(1), timestamp: t + 1), .init(messageId: Self.id(1), timestamp: t + 2)]),
+            .init(horizon: t, senderHorizons: ["": t], entries: []),
+            .init(horizon: t, senderHorizons: [Self.alice: -1], entries: []),
+            .init(horizon: t, entries: [.init(messageId: "msg-1", sender: Self.alice, timestamp: t + 1)]),
+            .init(horizon: t, entries: [.init(messageId: Self.id(1), sender: "", timestamp: t + 1)]),
+            .init(horizon: t, entries: [.init(messageId: Self.id(1), sender: Self.alice, timestamp: t)]),
+            .init(horizon: t, senderHorizons: [Self.alice: t + 5], entries: [.init(messageId: Self.id(1), sender: Self.alice, timestamp: t + 5)]),
+            .init(horizon: t, entries: [.init(messageId: Self.id(1), sender: Self.alice, timestamp: t + 1), .init(messageId: Self.id(1), sender: Self.alice, timestamp: t + 2)]),
         ]
         for state in bad {
             #expect(throws: ACEError.self) { try ReplayDetector.fromExport(state) }

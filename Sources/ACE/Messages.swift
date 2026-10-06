@@ -388,7 +388,7 @@ public struct ParseMessageOptions {
     public var replayDetector: ReplayDetector
     public var senderEncryptionPubKey: Data?
     var currentTimestamp: Int?
-    /// Offline acceptance floor; use the same value for every message of one backlog.
+    /// Offline acceptance floor; use it for every message, live ones included, until the backlog is done.
     public var oldestTimestamp: Int?
 
     public init(stateMachine: ThreadStateMachine, expectedScheme: SigningScheme? = nil, replayDetector: ReplayDetector, senderEncryptionPubKey: Data? = nil, oldestTimestamp: Int? = nil) {
@@ -470,7 +470,7 @@ public func parseMessage(
     // 2–3. Timestamp freshness, replay horizon and seen check
     let now = opts.currentTimestamp ?? Int(Date().timeIntervalSince1970)
     try checkTimestampFreshness(msg.timestamp, now: now, oldestTimestamp: opts.oldestTimestamp)
-    guard opts.replayDetector.accepts(msg.messageId, timestamp: msg.timestamp) else {
+    guard opts.replayDetector.accepts(msg.messageId, from: msg.from, timestamp: msg.timestamp) else {
         throw ACEError.replayDetected(msg.messageId)
     }
 
@@ -520,7 +520,7 @@ public func parseMessage(
 
     // Commit now: an authentic message is one-shot, even if a later step fails.
     let floor = opts.oldestTimestamp ?? now - maxDriftSeconds
-    guard opts.replayDetector.commit(msg.messageId, timestamp: msg.timestamp, floor: floor) else {
+    guard opts.replayDetector.commit(msg.messageId, from: msg.from, timestamp: msg.timestamp, floor: floor) else {
         throw ACEError.replayDetected(msg.messageId)
     }
 

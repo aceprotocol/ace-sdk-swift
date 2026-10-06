@@ -72,6 +72,20 @@ struct ReplayWindowTests {
         expectReplay { try parse(a, store, oldestTimestamp: floor) }
     }
 
+    @Test func floodFromOneSenderDoesNotBlockOthers() throws {
+        let mallory = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = ReplayDetector(capacity: 3, horizon: Self.t - maxDriftSeconds)
+        for _ in 0..<4 {
+            let flood = try createMessage(CreateMessageOptions(sender: mallory, recipientPubKey: bob.getEncryptionPublicKey(),
+                recipientACEId: bob.getACEId(), type: .text, body: ["message": "flood"],
+                stateMachine: ThreadStateMachine(), timestamp: Self.t + 300))
+            var opts = ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: store)
+            opts.currentTimestamp = Self.t
+            try parseMessage(flood, receiver: bob, senderSigningPubKey: mallory.getSigningPublicKey(), opts: opts)
+        }
+        #expect(try parse(message(Self.t), store).body["message"] as? String == "offline")
+    }
+
     @Test func backlogEvictedByOnlineFloorCannotBeReplayed() throws {
         let store = runningStore()
         let floor = Self.t - 7200
