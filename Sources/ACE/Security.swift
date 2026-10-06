@@ -79,6 +79,8 @@ public final class ReplayDetector: @unchecked Sendable {
         self.seen = TimedOrderedSet(capacity: capacity)
     }
 
+    var retentionSeconds: Int { Int(ttlSeconds) }
+
     /// Remove entries older than TTL. Caller must hold lock.
     private func evictExpired() {
         let cutoff = ProcessInfo.processInfo.systemUptime - ttlSeconds

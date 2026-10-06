@@ -467,9 +467,19 @@ public func parseMessage(
     }
 
     // 2. Timestamp freshness
-    try checkTimestampFreshness(msg.timestamp, now: opts.currentTimestamp, oldestTimestamp: opts.oldestTimestamp)
-    if opts.oldestTimestamp != nil && opts.replayDetector == nil {
-        throw ACEError.invalidMessage("Offline delivery requires a ReplayDetector")
+    let now = opts.currentTimestamp ?? Int(Date().timeIntervalSince1970)
+    try checkTimestampFreshness(msg.timestamp, now: now, oldestTimestamp: opts.oldestTimestamp)
+    if let oldestTimestamp = opts.oldestTimestamp {
+        guard let detector = opts.replayDetector else {
+            throw ACEError.invalidMessage("Offline delivery requires a ReplayDetector")
+        }
+        // The detector must remember a messageId for as long as its timestamp stays
+        // acceptable; otherwise an accepted message is evicted after the TTL and can
+        // be replayed while it is still above the floor.
+        let (span, overflow) = (now - oldestTimestamp).addingReportingOverflow(maxDriftSeconds)
+        guard !overflow, detector.retentionSeconds >= span else {
+            throw ACEError.invalidMessage("ReplayDetector ttlSeconds must cover the offline window (>= \(overflow ? Int.max : span)s)")
+        }
     }
 
     // 3. Replay detection
