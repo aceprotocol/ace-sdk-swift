@@ -119,7 +119,7 @@ func createMessage(
     let from = sender.getACEId()
     guard threads.localAceId == from else { throw ACEError(.invalidArgument, "threads.localAceId must be the sender") }
     let ts = timestamp ?? systemClock()
-    guard ts >= 0, ts <= maxSafeInteger else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
+    guard isWireInt(ts) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
     // 2. JSON values, then schema
     try checkJSONValue(.object(body), depth: 0)
     try validateBody(type, body)

@@ -177,11 +177,7 @@ public actor Inbox {
 
     private static func loadReplay(store: any ACEStore, threads: ThreadStore, local: String, capacity: Int,
                                    offlineWindow: Int, clock: @escaping @Sendable () -> Int) throws -> ReplayDetector {
-        let raw: Data?
-        do { raw = try store.read("replay.json") } catch {
-            throw ACEError(.storageFailed, "read replay.json failed: \(error)")
-        }
-        guard let raw else {
+        guard let raw = try store.checkedRead("replay.json") else {
             // Outbox-only threads (no inbound entry) may legitimately predate the first open.
             let inbound = try threads.records().contains { $0.snapshot.history.contains { $0.from != local } }
             if try !store.checkedList("deliveries/").isEmpty || inbound {
@@ -221,14 +217,15 @@ public actor Inbox {
         try store.checkedWrite("replay.json", r.exportState().jsonData())
     }
 
-    private func loadDelivery(_ key: String) throws -> DeliveryRecord? {
-        guard let v = try store.readJSON(key) else { return nil }
-        let rec = try DeliveryRecord.parse(v, key: key)
-        guard key == DeliveryRecord.key(from: rec.message.from, messageId: rec.message.messageId) else {
-            throw storageError(key, "delivery record does not match its key")
+    /// After the handler returns: drop the record once a horizon covers it, else mark it `acked`.
+    private func finishDelivery(_ rec: DeliveryRecord, key: String) throws {
+        if covered(rec.message) {
+            try store.checkedDelete(key)
+        } else {
+            var acked = rec
+            acked.status = .acked
+            try store.checkedWrite(key, try acked.data())
         }
-        if let t = rec.thread, t.localAceId != localAceId { throw storageError(key, "delivery thread belongs to another identity") }
-        return rec
     }
 
     /// Repair thread / replay state from delivery records (by timestamp, key), then hand
@@ -252,18 +249,13 @@ public actor Inbox {
             if rec.status == .pending { pending.append((key, rec)) } else if covered(m) { try store.checkedDelete(key) }
         }
         if replayChanged { try writeReplay(replay) }
-        for (key, var rec) in pending {
+        for (key, rec) in pending {
             do {
                 try await onMessage(rec.message)
             } catch {
                 throw ACEError(.handlerFailed, "onMessage failed during recovery: \(error)")
             }
-            if covered(rec.message) {
-                try store.checkedDelete(key)
-            } else {
-                rec.status = .acked
-                try store.checkedWrite(key, try rec.data())
-            }
+            try finishDelivery(rec, key: key)
         }
     }
 
@@ -288,12 +280,9 @@ public actor Inbox {
         case .delivered, .duplicate, .quarantined:
             do {
                 try advanceCursor(normalizedSource)
-            } catch let e as ACEError {
-                failed = true
-                return .retryable(e)
             } catch {
                 failed = true
-                return .retryable(ACEError(.storageFailed, "\(error)"))
+                return .retryable(.wrap(error))
             }
         case .retryable:
             break
@@ -307,7 +296,7 @@ public actor Inbox {
         var next = cursors
         next[url] = streamId
         let data = JSONWriter.serialize(.object([
-            "cursors": .object(next.mapValues { .string($0) }), "version": .number("1"),
+            "cursors": .object(next.mapValues { .string($0) }), "version": num(1),
         ]))
         try store.checkedWrite("cursors.json", data)
         cursors = next
@@ -349,16 +338,10 @@ public actor Inbox {
             return .retryable(ACEError(.handlerFailed, "onMessage failed: \(error)"))
         }
         do {
-            if covered(m) {
-                try store.checkedDelete(key)
-            } else {
-                var acked = rec
-                acked.status = .acked
-                try store.checkedWrite(key, try acked.data())
-            }
+            try finishDelivery(rec, key: key)
         } catch {
             failed = true
-            return .retryable(error as? ACEError ?? ACEError(.storageFailed, "\(error)"))
+            return .retryable(.wrap(error))
         }
         return .delivered(m)
     }
@@ -368,7 +351,7 @@ public actor Inbox {
         // 1. decode
         let env: ACEMessage
         do { env = try decodeEnvelope(data) } catch {
-            return .quarantined(error as? ACEError ?? ACEError(.invalidEnvelope), fingerprint: nil)
+            return .quarantined(.wrap(error, .invalidEnvelope), fingerprint: nil)
         }
         // 2. direct freshness
         if source == .direct, abs(now - env.timestamp) > ACELimits.timestampWindowSeconds {
@@ -386,15 +369,15 @@ public actor Inbox {
             peer = p
         } catch let e as ACEError {
             if e.isTransient { return .retryable(e) }
-            do { return try quarantine(e, env, source) } catch { return .retryable(error as? ACEError ?? ACEError(.storageFailed)) }
+            do { return try quarantine(e, env, source) } catch { return .retryable(.wrap(error)) }
         } catch {
-            return .retryable(ACEError(.storageFailed, "\(error)"))
+            return .retryable(.wrap(error))
         }
         // 4. stored delivery
         let key = DeliveryRecord.key(from: env.from, messageId: env.messageId)
         let stored: DeliveryRecord?
-        do { stored = try loadDelivery(key) } catch {
-            return .retryable(error as? ACEError ?? ACEError(.storageFailed))
+        do { stored = try threads.loadDelivery(key) } catch {
+            return .retryable(.wrap(error))
         }
         if let stored {
             if stored.status == .pending { return await handOver(stored, key: key) }
@@ -403,7 +386,7 @@ public actor Inbox {
         // 5–7
         let lock: (any ACEStoreLock)?
         do { lock = env.type.isEconomic ? try store.checkedLock("threads", timeout: 10) : nil } catch {
-            return .retryable(error as? ACEError ?? ACEError(.storageFailed))
+            return .retryable(.wrap(error))
         }
         let committed = parseAndCommit(env, peer: peer, key: key, source: source, now: now)
         if failed, let lock {
@@ -440,14 +423,13 @@ public actor Inbox {
         let rec: StoredThread?
         do {
             if env.type.isEconomic, let threadId = env.threadId {
-                rec = try threads.load(conversationId: env.conversationId, threadId: threadId)
-                machine = try threads.machine(for: rec)
+                (rec, machine) = try threads.loadWithMachine(conversationId: env.conversationId, threadId: threadId)
             } else {
                 rec = nil
                 machine = try ThreadStateMachine(localAceId: localAceId)
             }
         } catch {
-            return .done(.retryable(error as? ACEError ?? ACEError(.storageFailed)))
+            return .done(.retryable(.wrap(error)))
         }
         let tr = replay.clone()
         let parsed: ParsedMessage
@@ -466,7 +448,7 @@ public actor Inbox {
                 }
                 return .done(outcome)
             } catch {
-                return .done(.retryable(error as? ACEError ?? ACEError(.storageFailed)))
+                return .done(.retryable(.wrap(error)))
             }
         } catch {
             return .done(.retryable(ACEError(.identityUnavailable, "\(error)")))
@@ -477,7 +459,7 @@ public actor Inbox {
         do {
             try store.checkedWrite(key, try delivery.data()) // 7.1 commit point
         } catch {
-            return .done(.retryable(error as? ACEError ?? ACEError(.storageFailed)))
+            return .done(.retryable(.wrap(error)))
         }
         do {
             if let snap { try threads.write(StoredThread(snapshot: snap, pending: ThreadStore.clearProvenPending(rec, snap))) } // 7.2
@@ -485,7 +467,7 @@ public actor Inbox {
             replay = tr
         } catch {
             failed = true
-            return .done(.retryable(error as? ACEError ?? ACEError(.storageFailed)))
+            return .done(.retryable(.wrap(error)))
         }
         return .handOver(delivery)
     }
@@ -495,7 +477,7 @@ public actor Inbox {
     public func sweep() throws -> Int {
         var removed = 0
         for key in try store.checkedList("deliveries/") {
-            guard let rec = try loadDelivery(key) else { continue }
+            guard let rec = try threads.loadDelivery(key) else { continue }
             if rec.status == .acked && covered(rec.message) {
                 try store.checkedDelete(key)
                 removed += 1
@@ -531,7 +513,7 @@ public actor Inbox {
             do {
                 page = try await relay.fetchInbox(identity, since: cursors[relay.baseURLString], limit: limit)
             } catch {
-                return PullResult(outcomes: outcomes, blocked: error as? ACEError ?? ACEError(.relayUnavailable, "\(error)"))
+                return PullResult(outcomes: outcomes, blocked: .wrap(error, .relayUnavailable))
             }
             for entry in page.entries {
                 // A cancelled caller stops before the next entry; the cursor marks the spot.

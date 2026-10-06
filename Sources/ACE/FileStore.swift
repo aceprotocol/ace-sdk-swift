@@ -156,7 +156,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         let pid: Int32
         var data: Data {
             JSONWriter.serialize(.object([
-                "createdAt": .number(String(createdAt)), "host": .string(host), "pid": .number(String(pid)),
+                "createdAt": num(createdAt), "host": .string(host), "pid": num(Int(pid)),
             ]))
         }
     }
@@ -168,10 +168,10 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         guard Self.processMutexes.acquire(mutexKey, timeout: timeout) else { throw lockTimeoutError(name) }
         do {
             let content = try acquireFileLock(name, deadline: deadline)
-            let lockPath = root + "/locks/" + name + ".lock"
+            let lockKey = "locks/\(name).lock"
             return makeStoreLock {
-                if let current = FileManager.default.contents(atPath: lockPath), current == content.data {
-                    unlink(lockPath)
+                if let current = (try? self.read(lockKey)) ?? nil, current == content.data {
+                    unlink(self.root + "/" + lockKey)
                 }
                 Self.processMutexes.release(mutexKey)
             }
@@ -200,7 +200,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
                 return content
             }
             guard errno == EEXIST else { throw posixError("create", "locks/\(name).lock") }
-            if isStale(lockPath) {
+            if isStale("locks/\(name).lock") {
                 unlink(lockPath)
                 continue
             }
@@ -209,16 +209,16 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         }
     }
 
-    private func isStale(_ lockPath: String) -> Bool {
+    private func isStale(_ lockKey: String) -> Bool {
         var st = stat()
-        guard lstat(lockPath, &st) == 0 else { return false }
-        let raw = FileManager.default.contents(atPath: lockPath) ?? Data()
+        guard lstat(root + "/" + lockKey, &st) == 0 else { return false }
+        let raw = ((try? read(lockKey)) ?? nil) ?? Data()
         if let v = try? JSONParser.parse(raw), let host = v["host"]?.stringValue,
            let pidValue = v["pid"]?.wireInt, v["createdAt"]?.wireInt != nil {
             guard host == Self.hostname(), pidValue <= Int(Int32.max) else { return false }
             return kill(Int32(pidValue), 0) != 0 && errno == ESRCH
         }
-        let age = Date().timeIntervalSince1970 - TimeInterval(st.st_mtimespec.tv_sec)
+        let age = systemClock() - Int(st.st_mtimespec.tv_sec)
         return age > 60
     }
 

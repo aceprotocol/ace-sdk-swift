@@ -49,12 +49,6 @@ indirect enum JValue: Sendable, Equatable {
         guard case .number(let lex) = self else { return nil }
         return wireIntFromLexeme(lex)
     }
-
-    /// True for a number whose double value is finite.
-    var isFiniteNumber: Bool {
-        guard case .number(let lex) = self else { return false }
-        return Double(lex)?.isFinite ?? false
-    }
 }
 
 func wireIntFromLexeme(_ lex: String) -> Int? {

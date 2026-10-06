@@ -33,8 +33,12 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
     private let signingPublicKey: Data
     private let encryptionPublicKey: Data
     private let aceId: String
-    private let ed25519Key: Curve25519.Signing.PrivateKey?
-    private let secp256k1Key: P256K.Recovery.PrivateKey?
+    private let signingKey: SigningKey
+
+    private enum SigningKey {
+        case ed25519(Curve25519.Signing.PrivateKey)
+        case secp256k1(P256K.Recovery.PrivateKey)
+    }
 
     /// Build from raw keys. A 32-byte signing private key and a 32-byte X-Wing seed are
     /// required (`invalid_key`).
@@ -51,16 +55,14 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
             do { key = try Curve25519.Signing.PrivateKey(rawRepresentation: signingPrivateKey) } catch {
                 throw ACEError(.invalidKey, "invalid ed25519 private key")
             }
-            self.ed25519Key = key
-            self.secp256k1Key = nil
+            self.signingKey = .ed25519(key)
             self.signingPublicKey = Data(key.publicKey.rawRepresentation)
         case .secp256k1:
             let key: P256K.Recovery.PrivateKey
             do { key = try P256K.Recovery.PrivateKey(dataRepresentation: [UInt8](signingPrivateKey)) } catch {
                 throw ACEError(.invalidKey, "secp256k1 private key out of range")
             }
-            self.ed25519Key = nil
-            self.secp256k1Key = key
+            self.signingKey = .secp256k1(key)
             self.signingPublicKey = Data(key.publicKey.dataRepresentation)
         }
         self.aceId = computeACEId(signingPublicKey)
@@ -97,16 +99,17 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
     /// Sign a 32-byte signData digest. secp256k1 returns r‖s‖v (low-S, v ∈ {0,1}).
     public func sign(_ data: Data) throws -> Data {
         guard data.count == 32 else { throw ACEError(.invalidArgument, "signData must be 32 bytes") }
-        if let ed25519Key {
-            do { return try ed25519Key.signature(for: data) } catch {
+        switch signingKey {
+        case .ed25519(let key):
+            do { return try key.signature(for: data) } catch {
                 throw ACEError(.invalidKey, "ed25519 signing failed")
             }
+        case .secp256k1(let key):
+            let compact = key.signature(for: HashDigest([UInt8](data))).compactRepresentation
+            var out = Data(compact.signature)
+            out.append(UInt8(compact.recoveryId))
+            return out
         }
-        guard let secp256k1Key else { throw ACEError(.invalidKey, "no signing key") }
-        let compact = secp256k1Key.signature(for: HashDigest([UInt8](data))).compactRepresentation
-        var out = Data(compact.signature)
-        out.append(UInt8(compact.recoveryId))
-        return out
     }
 
     public func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data {

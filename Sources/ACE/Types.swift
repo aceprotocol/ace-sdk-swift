@@ -365,20 +365,6 @@ public struct ACEMessage: Codable, Sendable, Equatable {
         signature = try c.decode(SignatureEnvelope.self, forKey: .signature)
     }
 
-    public func encode(to encoder: any Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(ace, forKey: .ace)
-        try c.encode(messageId, forKey: .messageId)
-        try c.encode(from, forKey: .from)
-        try c.encode(to, forKey: .to)
-        try c.encode(conversationId, forKey: .conversationId)
-        try c.encode(type, forKey: .type)
-        try c.encodeIfPresent(threadId, forKey: .threadId)
-        try c.encode(timestamp, forKey: .timestamp)
-        try c.encode(encryption, forKey: .encryption)
-        try c.encode(signature, forKey: .signature)
-    }
-
     /// The wire JSON (compact, keys sorted).
     public func jsonData() -> Data {
         JSONWriter.serialize(jvalue)

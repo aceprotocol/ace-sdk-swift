@@ -288,7 +288,7 @@ public func verifyPeerRecord(_ record: PeerRecord) throws -> VerifiedPeer {
     let signingKey = try decodeSigningKey(scheme: scheme, record.signingPublicKey, code: code)
     guard computeACEId(signingKey) == record.aceId else { throw ACEError(code, "aceId does not match the signing key") }
     let encKey = try ACEEncryption.decodeKemPublicKey(record.encryptionPublicKey, code: code)
-    guard record.registeredAt >= 0, record.registeredAt <= maxSafeInteger else {
+    guard isWireInt(record.registeredAt) else {
         throw ACEError(code, "registeredAt must be an integer")
     }
     let sig = try decodeSignature(record.registrationSignature, scheme: scheme, code: code)
@@ -310,7 +310,7 @@ public func verifyPeerRecord(_ record: PeerRecord) throws -> VerifiedPeer {
 /// The peer's `registeredAt` is `pinnedAt` or now (a file has no signed timestamp).
 public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil, clock: @Sendable () -> Int = systemClock) throws -> VerifiedPeer {
     let code = ACEError.Code.invalidRegistration
-    if let pinnedAt, pinnedAt < 0 || pinnedAt > maxSafeInteger {
+    if let pinnedAt, !isWireInt(pinnedAt) {
         throw ACEError(.invalidArgument, "pinnedAt must be an integer in [0, 2^53-1]")
     }
     guard reg.ace == "1.0" else { throw ACEError(code, "ace must be '1.0'") }
@@ -511,9 +511,7 @@ public func fetchRegistrationFile(
         guard http.statusCode == 200 else {
             throw ACEError(.invalidRegistration, "HTTP \(http.statusCode) (redirects are not followed)", status: http.statusCode)
         }
-        let media = (http.value(forHTTPHeaderField: "Content-Type") ?? "")
-            .split(separator: ";", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
-        guard media == "application/json" else {
+        guard mediaType(http) == "application/json" else {
             throw ACEError(.invalidRegistration, "content-type must be application/json")
         }
         for try await byte in bytes {

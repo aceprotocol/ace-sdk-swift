@@ -38,5 +38,8 @@ public enum ACELimits {
 /// 2^53 − 1: the largest wire integer.
 let maxSafeInteger = 9_007_199_254_740_991
 
+/// An integer in [0, 2^53-1], the range every wire integer must fall in.
+func isWireInt(_ v: Int) -> Bool { (0...maxSafeInteger).contains(v) }
+
 /// The default clock: integer Unix seconds.
 @usableFromInline @Sendable func systemClock() -> Int { Int(Date().timeIntervalSince1970) }

@@ -93,7 +93,7 @@ public func createRegistrationRequest(
     timestamp: Int? = nil
 ) throws -> RegistrationRequest {
     let ts = timestamp ?? systemClock()
-    guard ts >= 0, ts <= maxSafeInteger else {
+    guard isWireInt(ts) else {
         throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]")
     }
     let enc = identity.getEncryptionPublicKey()

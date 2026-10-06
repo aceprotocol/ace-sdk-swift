@@ -94,12 +94,11 @@ public actor Outbox {
             if type.isEconomic, let threadId {
                 let conversationId = try ACEEncryption.computeConversationId(
                     pubA: identity.getEncryptionPublicKey(), pubB: recipient.encryptionPublicKey)
-                let rec = try threads.load(conversationId: conversationId, threadId: threadId)
+                let (rec, machine) = try threads.loadWithMachine(conversationId: conversationId, threadId: threadId)
                 if rec?.pending != nil {
                     throw ACEError(.pendingSendConflict, "the thread already has a pending send")
                 }
                 if rec == nil { try threads.checkCanOpenThread(peer: recipient.aceId) }
-                let machine = try threads.machine(for: rec)
                 let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
                                             threads: machine, threadId: threadId, timestamp: now)
                 let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env)
@@ -133,26 +132,18 @@ public actor Outbox {
             }
             throw e
         }
-        try acknowledge(rid, messageId: message.messageId)
+        try update(rid, messageId: message.messageId) { _ in nil }
     }
 
-    private func update(_ rid: String, messageId: String, _ change: (PendingSend) -> PendingSend) throws {
+    /// Replace the pending send (nil clears it).
+    private func update(_ rid: String, messageId: String, _ change: (PendingSend) -> PendingSend?) throws {
         try store.withLock("threads") {
             guard let (p, rec) = try find(rid), p.message.messageId == messageId else { return }
             let new = change(p)
             if let rec {
                 try threads.write(StoredThread(snapshot: rec.snapshot, pending: new))
-            } else {
+            } else if let new {
                 try writeOutbox(new)
-            }
-        }
-    }
-
-    private func acknowledge(_ rid: String, messageId: String) throws {
-        try store.withLock("threads") {
-            guard let (p, rec) = try find(rid), p.message.messageId == messageId else { return }
-            if let rec {
-                try threads.write(StoredThread(snapshot: rec.snapshot, pending: nil))
             } else {
                 try store.checkedDelete(Self.outboxKey(rid))
             }

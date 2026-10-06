@@ -111,4 +111,9 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
 
 extension ACEError {
     static func invalidArgument(_ message: String) -> ACEError { ACEError(.invalidArgument, message) }
+
+    /// `error` itself when it is an `ACEError`, else `code` carrying its description.
+    static func wrap(_ error: Error, _ code: Code = .storageFailed) -> ACEError {
+        error as? ACEError ?? ACEError(code, "\(error)")
+    }
 }

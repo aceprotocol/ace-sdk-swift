@@ -13,7 +13,7 @@ func storageError(_ key: String, _ msg: String) -> ACEError {
     ACEError(.storageFailed, "\(key): \(msg)")
 }
 
-private func num(_ i: Int) -> JValue { .number(String(i)) }
+func num(_ i: Int) -> JValue { .number(String(i)) }
 
 /// Status of a staged outbound message.
 public enum PendingStatus: String, Sendable, Codable {

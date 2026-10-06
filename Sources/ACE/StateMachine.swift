@@ -137,7 +137,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
             guard threads[key] == nil else { throw bad("duplicate thread") }
             guard !snap.history.isEmpty else { throw bad("history must not be empty") }
             for h in snap.history {
-                guard h.type.isEconomic, isMessageId(h.messageId), h.timestamp >= 0, h.timestamp <= maxSafeInteger,
+                guard h.type.isEconomic, isMessageId(h.messageId), isWireInt(h.timestamp),
                       h.from == localAceId || h.from == snap.peerAceId else {
                     throw bad("invalid history entry")
                 }

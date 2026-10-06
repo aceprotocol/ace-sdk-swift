@@ -123,3 +123,9 @@ func constantTimeEqual(_ a: Data, _ b: Data) -> Bool {
         b.withUnsafeBytes { bp in timingsafe_bcmp(ap.baseAddress!, bp.baseAddress!, a.count) == 0 }
     }
 }
+
+/// The lowercased media type of `Content-Type`, without parameters ("" when absent).
+func mediaType(_ response: HTTPURLResponse) -> String {
+    (response.value(forHTTPHeaderField: "Content-Type") ?? "")
+        .split(separator: ";", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+}

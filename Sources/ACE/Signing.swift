@@ -35,7 +35,7 @@ enum ACESigning {
     }
 
     static func buildSignData(action: String, aceId: String, timestamp: Int, payload: Data = Data()) throws -> Data {
-        guard timestamp >= 0, timestamp <= maxSafeInteger else {
+        guard isWireInt(timestamp) else {
             throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]")
         }
         var buf = Data("ace.v1".utf8)

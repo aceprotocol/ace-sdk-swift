@@ -202,7 +202,6 @@ public actor RelayClient {
     /// `GET /v1/inbox`. `since` is a stream ID (`nil` = from the start); `limit` 1…100.
     public func fetchInbox(_ identity: any ACEIdentity, since: String? = nil, limit: Int = ACELimits.maxInboxPage) async throws -> InboxPage {
         let auth = RelayAuthRequest.inbox(since: since ?? "-", limit: limit)
-        try auth.validate()
         var q: [(String, String)] = []
         if let since { q.append(("since", since)) }
         q.append(("limit", String(limit)))
@@ -221,7 +220,6 @@ public actor RelayClient {
     public func postIntent(_ identity: any ACEIdentity, need: String, tags: [String] = [], maxPrice: String? = nil,
                            currency: String? = nil, ttl: Int) async throws -> PostedIntent {
         let auth = RelayAuthRequest.intent(need: need, tags: tags, maxPrice: maxPrice, currency: currency, ttl: ttl)
-        try auth.validate()
         var o: [String: JValue] = ["need": .string(need), "ttl": .number(String(ttl))]
         if !tags.isEmpty { o["tags"] = .array(tags.map { .string($0) }) }
         if let maxPrice { o["maxPrice"] = .string(maxPrice) }
@@ -336,10 +334,7 @@ public actor RelayClient {
             do {
                 (b, response) = try await session.bytes(for: request)
             } catch {
-                if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
-                    throw CancellationError()
-                }
-                throw ACEError(.relayUnavailable, "listen connect failed: \(error.localizedDescription)")
+                throw transportError(error, "listen connect failed")
             }
             guard let h = response as? HTTPURLResponse else { throw ACEError(.relayProtocolError, "not an HTTP response") }
             if h.statusCode == 200 {
@@ -352,9 +347,7 @@ public actor RelayClient {
             throw error
         }
         guard let bytes, let http else { throw ACEError(.relayProtocolError, "listen connect failed") }
-        let media = (http.value(forHTTPHeaderField: "Content-Type") ?? "")
-            .split(separator: ";", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
-        guard media == "text/event-stream" else {
+        guard mediaType(http) == "text/event-stream" else {
             bytes.task.cancel()
             throw ACEError(.relayProtocolError, "listen response is not text/event-stream")
         }
@@ -374,10 +367,7 @@ public actor RelayClient {
         } catch let e as ACEError {
             throw e
         } catch {
-            if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
-                throw CancellationError()
-            }
-            throw ACEError(.relayUnavailable, "listen stream failed: \(error.localizedDescription)")
+            throw transportError(error, "listen stream failed")
         }
     }
 
@@ -462,11 +452,16 @@ public actor RelayClient {
         } catch let e as ACEError {
             throw e
         } catch {
-            if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
-                throw CancellationError()
-            }
-            throw ACEError(.relayUnavailable, "relay request failed: \(error.localizedDescription)")
+            throw transportError(error, "relay request failed")
         }
+    }
+
+    /// Map a URLSession failure: cancellation stays cancellation, anything else is `relay_unavailable`.
+    private func transportError(_ error: Error, _ what: String) -> Error {
+        if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
+            return CancellationError()
+        }
+        return ACEError(.relayUnavailable, "\(what): \(error.localizedDescription)")
     }
 
     private func readBounded(_ bytes: URLSession.AsyncBytes) async throws -> Data {
@@ -481,10 +476,7 @@ public actor RelayClient {
         } catch let e as ACEError {
             throw e
         } catch {
-            if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
-                throw CancellationError()
-            }
-            throw ACEError(.relayUnavailable, "relay read failed: \(error.localizedDescription)")
+            throw transportError(error, "relay read failed")
         }
         return data
     }

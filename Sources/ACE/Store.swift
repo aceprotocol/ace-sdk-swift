@@ -150,50 +150,42 @@ public final class MemoryStore: ACEStore, @unchecked Sendable {
 // MARK: - Helpers used by the pipeline
 
 extension ACEStore {
-    /// Read and parse a JSON record; `storage_failed` on any error.
-    func readJSON(_ key: String) throws -> JValue? {
-        let raw: Data?
-        do { raw = try read(key) } catch let e as ACEError where e.code == .storageFailed {
+    /// Run a store call, surfacing any failure as `storage_failed` (codes in `keep` pass through).
+    private func storageCall<T>(_ op: String, _ key: String, keep: Set<ACEError.Code> = [.storageFailed],
+                                _ body: () throws -> T) throws -> T {
+        do { return try body() } catch let e as ACEError where keep.contains(e.code) {
             throw e
         } catch {
-            throw ACEError(.storageFailed, "read \(key) failed: \(error)")
+            throw ACEError(.storageFailed, "\(op) \(key) failed: \(error)")
         }
-        guard let raw else { return nil }
+    }
+
+    func checkedRead(_ key: String) throws -> Data? {
+        try storageCall("read", key) { try read(key) }
+    }
+
+    /// Read and parse a JSON record; `storage_failed` on any error.
+    func readJSON(_ key: String) throws -> JValue? {
+        guard let raw = try checkedRead(key) else { return nil }
         do { return try JSONParser.parse(raw) } catch {
             throw ACEError(.storageFailed, "\(key) is not valid JSON")
         }
     }
 
     func checkedWrite(_ key: String, _ value: Data) throws {
-        do { try write(key, value) } catch let e as ACEError where e.code == .storageFailed {
-            throw e
-        } catch {
-            throw ACEError(.storageFailed, "write \(key) failed: \(error)")
-        }
+        try storageCall("write", key) { try write(key, value) }
     }
 
     func checkedDelete(_ key: String) throws {
-        do { try delete(key) } catch let e as ACEError where e.code == .storageFailed {
-            throw e
-        } catch {
-            throw ACEError(.storageFailed, "delete \(key) failed: \(error)")
-        }
+        try storageCall("delete", key) { try delete(key) }
     }
 
     func checkedList(_ prefix: String) throws -> [String] {
-        do { return try list(prefix: prefix) } catch let e as ACEError where e.code == .storageFailed {
-            throw e
-        } catch {
-            throw ACEError(.storageFailed, "list \(prefix) failed: \(error)")
-        }
+        try storageCall("list", prefix) { try list(prefix: prefix) }
     }
 
     func checkedLock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
-        do { return try lock(name, timeout: timeout) } catch let e as ACEError where e.code == .storageFailed || e.code == .receiverBusy {
-            throw e
-        } catch {
-            throw ACEError(.storageFailed, "lock \(name) failed: \(error)")
-        }
+        try storageCall("lock", name, keep: [.storageFailed, .receiverBusy]) { try lock(name, timeout: timeout) }
     }
 
     /// Run `body` holding lock `name`.

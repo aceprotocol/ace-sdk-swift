@@ -49,15 +49,17 @@ public func isThreadId(_ value: String) -> Bool {
     let scalars = value.unicodeScalars
     var count = 0
     for s in scalars {
-        if s.value < 0x20 || s.value == 0x7F { return false }
+        if isControlScalar(s) { return false }
         count += 1
         if count > ACELimits.maxThreadIdLength { return false }
     }
     return count >= 1
 }
 
+func isControlScalar(_ s: Unicode.Scalar) -> Bool { s.value < 0x20 || s.value == 0x7F }
+
 func hasControlCharacter(_ value: String) -> Bool {
-    value.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
+    value.unicodeScalars.contains(where: isControlScalar)
 }
 
 // MARK: - HTTPS URL grammar

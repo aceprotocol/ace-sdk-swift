@@ -37,7 +37,7 @@ public enum RelayAuthRequest: Sendable, Equatable {
             break
         case .intent(_, let tags, _, _, let ttl):
             guard !tags.contains(where: { $0.contains(",") }) else { throw ACEError.invalidArgument("tags must be strings without ','") }
-            guard ttl >= 0, ttl <= maxSafeInteger else { throw ACEError.invalidArgument("ttl must be an integer in [0, 2^53-1]") }
+            guard isWireInt(ttl) else { throw ACEError.invalidArgument("ttl must be an integer in [0, 2^53-1]") }
         }
     }
 
@@ -75,7 +75,7 @@ public struct RelayAuth: Sendable, Equatable {
 
 /// `X-ACE-Id` / `X-ACE-Timestamp` / `X-ACE-Signature` for one relay call.
 public func createAuthHeaders(identity: any ACEIdentity, request: RelayAuthRequest, timestamp: Int) throws -> [String: String] {
-    guard timestamp >= 0, timestamp <= maxSafeInteger else {
+    guard isWireInt(timestamp) else {
         throw ACEError.invalidArgument("timestamp must be an integer in [0, 2^53-1]")
     }
     let aceId = identity.getACEId()

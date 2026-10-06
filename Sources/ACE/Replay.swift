@@ -62,13 +62,13 @@ public struct ReplayState: Sendable, Equatable {
     /// Canonical bytes: compact, keys sorted, ASCII only (byte-identical across SDKs).
     public func jsonData() -> Data {
         let entriesJSON: [JValue] = entries.map {
-            .array([.string($0.messageId), .string($0.sender), .number(String($0.timestamp))])
+            .array([.string($0.messageId), .string($0.sender), num($0.timestamp)])
         }
         let v: JValue = .object([
             "entries": .array(entriesJSON),
-            "horizon": .number(String(horizon)),
-            "senderHorizons": .object(senderHorizons.mapValues { .number(String($0)) }),
-            "version": .number(String(version)),
+            "horizon": num(horizon),
+            "senderHorizons": .object(senderHorizons.mapValues(num)),
+            "version": num(version),
         ])
         return JSONWriter.serialize(v)
     }
@@ -79,7 +79,6 @@ public struct ReplayState: Sendable, Equatable {
 struct MinHeap<T: Comparable> {
     private(set) var items: [T] = []
 
-    var isEmpty: Bool { items.isEmpty }
     var first: T? { items.first }
 
     mutating func push(_ x: T) {
@@ -172,7 +171,7 @@ public final class ReplayDetector: @unchecked Sendable {
     /// `horizon` defaults to `now − 300`. `capacity` must be ≥ 1 (`invalid_argument`).
     public init(capacity: Int = ACELimits.defaultReplayCapacity, horizon: Int? = nil, clock: @escaping @Sendable () -> Int = systemClock) throws {
         guard capacity >= 1 else { throw ACEError(.invalidArgument, "capacity must be an integer >= 1") }
-        if let horizon, horizon < 0 || horizon > maxSafeInteger {
+        if let horizon, !isWireInt(horizon) {
             throw ACEError(.invalidArgument, "horizon must be an integer in [0, 2^53-1]")
         }
         self.capacity = capacity
@@ -185,14 +184,14 @@ public final class ReplayDetector: @unchecked Sendable {
     public convenience init(state: ReplayState, capacity: Int = ACELimits.defaultReplayCapacity, clock: @escaping @Sendable () -> Int = systemClock) throws {
         func bad(_ msg: String) -> ACEError { ACEError(.invalidArgument, "fromState: \(msg)") }
         guard state.version == 1 else { throw bad("version must be 1") }
-        guard state.horizon >= 0, state.horizon <= maxSafeInteger else { throw bad("invalid horizon") }
+        guard isWireInt(state.horizon) else { throw bad("invalid horizon") }
         try self.init(capacity: capacity, horizon: state.horizon, clock: clock)
         for (s, h) in state.senderHorizons {
-            guard !s.isEmpty, h >= 0, h <= maxSafeInteger else { throw bad("invalid sender horizon") }
+            guard !s.isEmpty, isWireInt(h) else { throw bad("invalid sender horizon") }
             setSH(s, h)
         }
         for e in state.entries {
-            guard isMessageId(e.messageId), !e.sender.isEmpty, e.timestamp >= 0, e.timestamp <= maxSafeInteger else {
+            guard isMessageId(e.messageId), !e.sender.isEmpty, isWireInt(e.timestamp) else {
                 throw bad("invalid entry")
             }
             guard acceptsLocked(e.messageId, e.sender, e.timestamp) else {
@@ -218,13 +217,13 @@ public final class ReplayDetector: @unchecked Sendable {
         return _horizon
     }
 
-    private static func checkArgs(_ id: String, _ sender: String, _ ts: Int) throws {
+    private static func checkArgs(_ sender: String, _ ts: Int) throws {
         guard !sender.isEmpty else { throw ACEError(.invalidArgument, "messageId and sender must be non-empty strings") }
-        guard ts >= 0, ts <= maxSafeInteger else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
+        guard isWireInt(ts) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
     }
 
     public func accepts(_ messageId: String, from sender: String, timestamp: Int) throws -> Bool {
-        try Self.checkArgs(messageId, sender, timestamp)
+        try Self.checkArgs(sender, timestamp)
         lock.lock()
         defer { lock.unlock() }
         return acceptsLocked(messageId, sender, timestamp)
@@ -234,8 +233,8 @@ public final class ReplayDetector: @unchecked Sendable {
     /// `floor` defaults to `now − 300`.
     @discardableResult
     public func commit(_ messageId: String, from sender: String, timestamp: Int, floor: Int? = nil) throws -> Bool {
-        try Self.checkArgs(messageId, sender, timestamp)
-        if let floor, floor < 0 || floor > maxSafeInteger {
+        try Self.checkArgs(sender, timestamp)
+        if let floor, !isWireInt(floor) {
             throw ACEError(.invalidArgument, "floor must be an integer in [0, 2^53-1]")
         }
         let floor = floor ?? max(0, clock() - ACELimits.timestampWindowSeconds)
