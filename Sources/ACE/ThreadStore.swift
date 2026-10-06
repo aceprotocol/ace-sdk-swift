@@ -20,7 +20,7 @@ struct StoredThread {
 /// threads with no entry from `localAceId`, are deleted 30 days after their last entry.
 ///
 /// A per-peer index of non-terminal threads (`threads/index/<sha256hex(peerAceId)>.json`,
-/// `{"open":[<thread record key>…sorted],"version":1}`) bounds how many threads one peer
+/// `{"open":["threads/<64 hex>"…sorted],"version":1}`, record keys without `.json`) bounds how many threads one peer
 /// can hold open: `ACELimits.maxOpenThreadsPerPeer`.
 public final class ThreadStore: Sendable {
     /// 30 days (04 retention, > OFFLINE_WINDOW_SECONDS).
@@ -121,8 +121,12 @@ public final class ThreadStore: Sendable {
         fields["pending"] = record.pending?.jvalue(version: false) ?? .null
         fields["version"] = .number("1")
         let key = Self.key(conversationId: record.snapshot.conversationId, threadId: record.snapshot.threadId)
+        let open = !record.snapshot.state.isTerminal
+        // Crash-safe order: index an open thread before its record exists; unindex a
+        // terminal one only after its record says so. A stale entry is reconciled at the bound.
+        if open { try updateIndex(peer: record.snapshot.peerAceId, key: key, open: true) }
         try store.checkedWrite(key, JSONWriter.serialize(.object(fields)))
-        try updateIndex(peer: record.snapshot.peerAceId, key: key, open: !record.snapshot.state.isTerminal)
+        if !open { try updateIndex(peer: record.snapshot.peerAceId, key: key, open: false) }
         try pruneIfDue(except: key)
     }
 
@@ -149,9 +153,13 @@ public final class ThreadStore: Sendable {
         ])))
     }
 
+    /// Index entry of a record key: the key without `.json` (`threads/<64 hex>`).
+    private static func indexEntry(_ key: String) -> String { String(key.dropLast(".json".count)) }
+
     private func updateIndex(peer: String, key: String, open: Bool) throws {
         var index = try readIndex(peer)
-        let changed = open ? index.insert(key).inserted : index.remove(key) != nil
+        let entry = Self.indexEntry(key)
+        let changed = open ? index.insert(entry).inserted : index.remove(entry) != nil
         if changed { try writeIndex(peer, index) }
     }
 
@@ -161,8 +169,8 @@ public final class ThreadStore: Sendable {
     func checkCanOpenThread(peer: String) throws {
         var index = try readIndex(peer)
         guard index.count >= ACELimits.maxOpenThreadsPerPeer else { return }
-        let verified = try index.filter { key in
-            guard let rec = try load(key: key) else { return false }
+        let verified = try index.filter { entry in
+            guard let rec = try load(key: entry + ".json") else { return false }
             return rec.snapshot.peerAceId == peer && !rec.snapshot.state.isTerminal
         }
         if verified != index {

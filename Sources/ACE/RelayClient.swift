@@ -266,18 +266,21 @@ public actor RelayClient {
     /// At most 64 events wait for the consumer; while the buffer is full the socket is not
     /// read (TCP backpressure), so memory stays bounded.
     ///
-    /// `onConnect` is called each time a connection is established (HTTP 200,
-    /// `text/event-stream`), before its first event. Cancelling the consuming task or
+    /// `onOpen` is called each time a connection is established (HTTP 200,
+    /// `text/event-stream`), before its first event. An error it throws ends the stream
+    /// with that error (it is not retried). Cancelling the consuming task or
     /// dropping the stream cancels the HTTP request at once, also while the stream only
     /// carries heartbeats and during a backoff sleep. Uses the dedicated stream session
     /// described in `init`.
     public nonisolated func listen(_ identity: any ACEIdentity, since: String? = nil,
-                                   onConnect: (@Sendable () -> Void)? = nil) -> AsyncThrowingStream<Event, Error> {
+                                   onOpen: (@Sendable () throws -> Void)? = nil) -> AsyncThrowingStream<Event, Error> {
         AsyncThrowingStream(bufferingPolicy: .bufferingOldest(Self.listenBuffer)) { continuation in
             let task = Task {
                 do {
-                    try await self.runListen(identity, since: since, onConnect: onConnect, continuation)
+                    try await self.runListen(identity, since: since, onOpen: onOpen, continuation)
                     continuation.finish()
+                } catch let hook as OnOpenFailure {
+                    continuation.finish(throwing: hook.error)
                 } catch {
                     continuation.finish(throwing: error is CancellationError ? nil : error)
                 }
@@ -288,7 +291,10 @@ public actor RelayClient {
 
     // MARK: Listen internals
 
-    private func runListen(_ identity: any ACEIdentity, since: String?, onConnect: (@Sendable () -> Void)?,
+    /// An error thrown by `onOpen`, carried past the reconnect logic unchanged.
+    private struct OnOpenFailure: Error { let error: any Error }
+
+    private func runListen(_ identity: any ACEIdentity, since: String?, onOpen: (@Sendable () throws -> Void)?,
                            _ out: AsyncThrowingStream<Event, Error>.Continuation) async throws {
         var cursor = since ?? "-"
         guard cursor == "-" || isStreamCursor(cursor) else { throw ACEError(.invalidArgument, "since must be a stream ID") }
@@ -297,7 +303,7 @@ public actor RelayClient {
             try Task.checkCancellation()
             do {
                 // A clean end (drain or EOF) reconnects at once.
-                try await connectOnce(identity, cursor: &cursor, onConnect: onConnect, out, onProgress: { failures = 0 })
+                try await connectOnce(identity, cursor: &cursor, onOpen: onOpen, out, onProgress: { failures = 0 })
                 failures = 0
                 continue
             } catch let e as ACEError where e.code == .relayUnavailable {
@@ -311,7 +317,7 @@ public actor RelayClient {
     }
 
     /// One connection; returns after `drain` or a clean end of stream.
-    private func connectOnce(_ identity: any ACEIdentity, cursor: inout String, onConnect: (@Sendable () -> Void)?,
+    private func connectOnce(_ identity: any ACEIdentity, cursor: inout String, onOpen: (@Sendable () throws -> Void)?,
                              _ out: AsyncThrowingStream<Event, Error>.Continuation,
                              onProgress: () -> Void) async throws {
         var q: [(String, String)] = []
@@ -353,7 +359,7 @@ public actor RelayClient {
             throw ACEError(.relayProtocolError, "listen response is not text/event-stream")
         }
         onProgress()
-        onConnect?()
+        do { try onOpen?() } catch { throw OnOpenFailure(error: error) }
         var parser = SSEParser(maxLine: ACELimits.maxEnvelopeBytes + 512)
         // Cancel the data task itself on task cancellation, so a stream that only carries
         // heartbeats (or nothing) is torn down at once; every exit path cancels it too.

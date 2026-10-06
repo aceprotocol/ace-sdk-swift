@@ -537,7 +537,10 @@ public actor Inbox {
                 // A cancelled caller stops before the next entry; the cursor marks the spot.
                 if Task.isCancelled { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
                 let outcome = await receive(entry.envelope, source: .relay(url: relay.baseURLString, streamId: entry.streamId))
-                if case .retryable(let e) = outcome { return PullResult(outcomes: outcomes, blocked: e) }
+                if case .retryable(let e) = outcome {
+                    await yield?(outcome)  // follow yields it, then throws `blocked`
+                    return PullResult(outcomes: outcomes, blocked: e)
+                }
                 if let yield { await yield(outcome) } else { outcomes.append(outcome) }
             }
             if page.entries.count < limit { return PullResult(outcomes: outcomes, blocked: nil) }
@@ -546,8 +549,9 @@ public actor Inbox {
 
     /// Receive everything queued, then live events, as one stream of outcomes:
     ///
-    /// 1. A full `pull`, yielding each of its outcomes as it happens. If it is blocked,
-    ///    the stream throws the blocking error.
+    /// 1. A full `pull`, yielding each of its outcomes as it happens. A `retryable`
+    ///    outcome is yielded and then thrown; a failed fetch is thrown (and `onLive` is
+    ///    never called).
     /// 2. `relay.listen` from the durable cursor; each event is received and its outcome
     ///    yielded. After yielding a `retryable` outcome the stream throws its error.
     ///
@@ -568,7 +572,7 @@ public actor Inbox {
                                                  yield: { try? await continuation.yieldWaiting($0) })
                     if let blocked = result.blocked { throw blocked }
                     try Task.checkCancellation()
-                    let events = relay.listen(self.identity, since: await self.cursor(for: relay), onConnect: onLive)
+                    let events = relay.listen(self.identity, since: await self.cursor(for: relay), onOpen: onLive)
                     for try await event in events {
                         let outcome = await self.receive(event.envelope, source: .relay(url: relay.baseURLString, streamId: event.streamId))
                         try await continuation.yieldWaiting(outcome)

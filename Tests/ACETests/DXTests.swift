@@ -229,7 +229,7 @@ struct DXTests {
         let alice = Fixtures.agent("alice")
         let connected = Locked(false)
         let consumer = Task {
-            for try await _ in relay.listen(alice, onConnect: { connected.mutate { $0 = true } }) {}
+            for try await _ in relay.listen(alice, onOpen: { connected.mutate { $0 = true } }) {}
         }
         #expect(await eventually { connected.value })
         try await Task.sleep(nanoseconds: 100_000_000)  // a few heartbeats
@@ -306,6 +306,8 @@ struct DXTests {
         }
         let index = try p.bobStore.readJSON(ThreadStore.indexKey(peerAceId: peer))!
         #expect(index["open"]?.arrayValue?.count == ACELimits.maxOpenThreadsPerPeer && index["version"]?.wireInt == 1)
+        let firstKey = ThreadStore.key(conversationId: sha256Hex(Data("c0".utf8)), threadId: "t0")
+        #expect(index["open"]?.arrayValue?.contains(.string(String(firstKey.dropLast(5)))) == true)  // "threads/<hex>"
 
         let bobPeer = try await p.alicePeers.get(local)!
         let alicePeer = try await p.bobPeers.get(peer)!
@@ -396,6 +398,45 @@ struct DXTests {
         var seen = 1
         while seen < total, try await iterator.next() != nil { seen += 1 }
         #expect(seen == total && sink.count == total)
+        await bIn.close()
+    }
+
+    @Test func onOpenErrorEndsListenWithoutRetry() async throws {
+        struct HookError: Error {}
+        let (relay, host) = try endlessRelay()
+        do {
+            for try await _ in relay.listen(Fixtures.agent("alice"), onOpen: { throw HookError() }) {}
+            Issue.record("expected the hook's error")
+        } catch {
+            #expect(error is HookError)
+        }
+        #expect(EndlessSSEProtocol.info(host).connects == 1)
+    }
+
+    @Test func followYieldsThenThrowsAnInitialRetryable() async throws {
+        let p = try await Pair()
+        let fake = FakeRelay()
+        let relay = try makeRelay(fake.handle, clock: p.clock.fn)
+        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
+        let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "x"],
+                                    threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
+        _ = fake.enqueue(env)
+        let sink = Sink()
+        sink.failing = true  // handler_failed: retryable
+        let bIn = try await p.inbox(p.bob, sink)
+        let live = Locked(0)
+        var seen: [ReceiveOutcome] = []
+        do {
+            for try await o in bIn.follow(relay, onLive: { live.mutate { $0 += 1 } }) { seen.append(o) }
+            Issue.record("expected handler_failed")
+        } catch {
+            #expect(error as? ACEError == ACEError(.handlerFailed))
+        }
+        #expect(seen.count == 1 && seen[0].error == ACEError(.handlerFailed) && live.value == 0)
+        // A failed fetch throws without yielding or going live.
+        let down = try makeRelay({ _, _ in .error(503, "x") }, clock: p.clock.fn)
+        await expectCodeAsync(.relayUnavailable) { for try await _ in bIn.follow(down, onLive: { live.mutate { $0 += 1 } }) {} }
+        #expect(live.value == 0)
         await bIn.close()
     }
 }
