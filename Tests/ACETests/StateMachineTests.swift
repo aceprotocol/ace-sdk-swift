@@ -528,6 +528,97 @@ struct StateMachineTests {
     }
 
     // ============================================================
+    // Resource Limits (reject, never evict)
+    // ============================================================
+
+    @Suite("resource limits")
+    struct ResourceLimits {
+        @Test("thread limit rejects new threads; canTransition agrees")
+        func threadLimit() throws {
+            let sm = ThreadStateMachine(maxThreads: 1)
+            try sm.transition(conversationId: CONV_A, threadId: "t1", messageType: .rfq, messageId: uuid(), timestamp: now)
+            #expect(!sm.canTransition(conversationId: CONV_A, threadId: "t2", messageType: .rfq))
+            #expect(throws: InvalidTransitionError.self) {
+                try sm.transition(conversationId: CONV_A, threadId: "t2", messageType: .rfq, messageId: uuid(), timestamp: now)
+            }
+            // Existing thread is kept (not evicted) and can still advance
+            #expect(sm.canTransition(conversationId: CONV_A, threadId: "t1", messageType: .offer))
+            try sm.transition(conversationId: CONV_A, threadId: "t1", messageType: .offer, messageId: uuid(), timestamp: now)
+        }
+
+        @Test("history limit rejects appends; canTransition agrees")
+        func historyLimit() throws {
+            let sm = ThreadStateMachine(maxHistoryPerThread: 2)
+            try sm.transition(conversationId: CONV_A, threadId: "t", messageType: .rfq, messageId: uuid(), timestamp: now)
+            try sm.transition(conversationId: CONV_A, threadId: "t", messageType: .offer, messageId: uuid(), timestamp: now)
+            #expect(!sm.canTransition(conversationId: CONV_A, threadId: "t", messageType: .offer))
+            let err = #expect(throws: InvalidTransitionError.self) {
+                try sm.transition(conversationId: CONV_A, threadId: "t", messageType: .offer, messageId: uuid(), timestamp: now)
+            }
+            #expect(err?.description == "Thread history exceeds maximum of 2 entries")
+        }
+
+        @Test("allowedTypes follows transition-table declaration order")
+        func allowedTypesOrder() throws {
+            let sm = ThreadStateMachine()
+            try sm.transition(conversationId: CONV_A, threadId: "t", messageType: .rfq, messageId: uuid(), timestamp: now)
+            try sm.transition(conversationId: CONV_A, threadId: "t", messageType: .offer, messageId: uuid(), timestamp: now)
+            #expect(sm.allowedTypes(conversationId: CONV_A, threadId: "t") == [.accept, .reject, .offer])
+            try sm.transition(conversationId: CONV_A, threadId: "t", messageType: .accept, messageId: uuid(), timestamp: now)
+            #expect(sm.allowedTypes(conversationId: CONV_A, threadId: "t") == [.invoice, .receipt, .deliver])
+        }
+
+        @Test("threadId length counts Unicode code points")
+        func threadIdCodePoints() {
+            // "e\u{301}" is one Character but two code points: 129 of them = 258 code points
+            #expect(throws: InvalidTransitionError.self) {
+                try validateThreadId(String(repeating: "e\u{301}", count: 129))
+            }
+            #expect(throws: Never.self) { try validateThreadId(String(repeating: "e\u{301}", count: 128)) }
+        }
+    }
+
+    @Suite("fromExport validation")
+    struct FromExportValidation {
+        private static func entry(_ type: String, _ ts: Int = now) -> ThreadHistoryEntry {
+            ThreadHistoryEntry(type: type, messageId: uuid(), timestamp: ts)
+        }
+
+        private static func rfqSnap(_ threadId: String = "t") -> ThreadSnapshot {
+            ThreadSnapshot(conversationId: CONV_A, threadId: threadId, state: .rfq, history: [entry("rfq")])
+        }
+
+        @Test("rejects malformed snapshots")
+        func rejectsMalformed() {
+            let bad: [[ThreadSnapshot]] = [
+                [ThreadSnapshot(conversationId: CONV_A, threadId: "t", state: .idle, history: [])],
+                [ThreadSnapshot(conversationId: CONV_A, threadId: "", state: .idle, history: [])],
+                [ThreadSnapshot(conversationId: CONV_A, threadId: "t", state: .rfq, history: [Self.entry("text")])],
+                [ThreadSnapshot(conversationId: CONV_A, threadId: "t", state: .rfq, history: [Self.entry("rfq", -1)])],
+                [ThreadSnapshot(conversationId: String(repeating: "e\u{301}", count: 129), threadId: "t", state: .rfq, history: [Self.entry("rfq")])],
+                [Self.rfqSnap(), Self.rfqSnap()],
+            ]
+            for snaps in bad {
+                #expect(throws: (any Error).self) { try ThreadStateMachine.fromExport(snaps) }
+            }
+        }
+
+        @Test("enforces maxThreads and maxHistoryPerThread")
+        func enforcesLimits() throws {
+            #expect(throws: (any Error).self) {
+                try ThreadStateMachine.fromExport([Self.rfqSnap("t1"), Self.rfqSnap("t2")], maxThreads: 1)
+            }
+            let twoEntries = ThreadSnapshot(conversationId: CONV_A, threadId: "t", state: .offered, history: [Self.entry("rfq"), Self.entry("offer")])
+            #expect(throws: (any Error).self) {
+                try ThreadStateMachine.fromExport([twoEntries], maxHistoryPerThread: 1)
+            }
+            // Limits carry over to the restored machine
+            let sm = try ThreadStateMachine.fromExport([Self.rfqSnap("t1")], maxThreads: 1)
+            #expect(!sm.canTransition(conversationId: CONV_A, threadId: "t2", messageType: .rfq))
+        }
+    }
+
+    // ============================================================
     // Composite Key Safety
     // ============================================================
 

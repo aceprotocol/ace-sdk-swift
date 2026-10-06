@@ -21,6 +21,8 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
     private let signingPrivateKey: Data
     /// 32-byte X-Wing private key seed (expands to ML-KEM-768 + X25519 keys).
     private let encryptionSeed: Data
+    /// The seed expanded once, so each decrypt skips SHAKE256 + ML-KEM keygen.
+    private let decapsulationKey: XWingMLKEM768X25519.PrivateKey
     private let signingPublicKey: Data
     private let encryptionPublicKey: Data
     private let aceId: String
@@ -33,7 +35,8 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         self.scheme = scheme
         self.signingPrivateKey = signingPrivateKey
         self.encryptionSeed = encryptionSeed
-        self.encryptionPublicKey = try ACEEncryption.publicKey(fromSeed: encryptionSeed)
+        self.decapsulationKey = try ACEEncryption.privateKey(fromSeed: encryptionSeed)
+        self.encryptionPublicKey = Data(decapsulationKey.publicKey.rawRepresentation)
 
         switch scheme {
         case .ed25519:
@@ -79,7 +82,6 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
     public static func fromExport(_ export: SoftwareIdentityExport) throws -> SoftwareIdentity {
         let sigPriv = try ACEBase64.decode(export.signingPrivateKey)
         let encSeed = try ACEBase64.decode(export.encryptionPrivateKey)
-        try ACEEncryption.validateSeed(encSeed)
         return try SoftwareIdentity(scheme: export.scheme, signingPrivateKey: sigPriv, encryptionSeed: encSeed)
     }
 
@@ -108,26 +110,12 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
             }
             // Sign pre-computed hash (signData is already SHA-256)
             let digest = HashDigest([UInt8](data))
-            let ecdsaSig = try privKey.signature(for: digest)
-            let compact = try ecdsaSig.compactRepresentation
+            let ecdsaSig = privKey.signature(for: digest)
+            let compact = ecdsaSig.compactRepresentation
 
-            // Extract r, s, v
+            // r[32] || s[32] || v[1]. libsecp256k1 always emits low-S, as ACE verifiers require.
             var sigBytes = Data(compact.signature)
-            let recoveryId = compact.recoveryId
-
-            // Low-S normalization
-            let order = secp256k1Order
-            let s = sigBytes.suffix(32)
-            let halfOrder = order.shiftedRight()
-            if s.lexicographicallyPrecedes(halfOrder) == false && s != halfOrder {
-                // s > order/2 → s = order - s, flip v
-                let newS = order.subtract(Data(s))
-                sigBytes.replaceSubrange(32..<64, with: newS)
-                // Append flipped recovery ID
-                sigBytes.append(UInt8(recoveryId ^ 1))
-            } else {
-                sigBytes.append(UInt8(recoveryId))
-            }
+            sigBytes.append(UInt8(compact.recoveryId))
 
             return (signature: sigBytes, scheme: .secp256k1)
         }
@@ -137,7 +125,7 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         return try ACEEncryption.decrypt(
             kemCiphertext: kemCiphertext,
             payload: payload,
-            seed: encryptionSeed,
+            privateKey: decapsulationKey,
             conversationId: conversationId
         )
     }
@@ -215,45 +203,5 @@ public struct SoftwareIdentityExport: Codable, Sendable {
         self.scheme = scheme
         self.signingPrivateKey = signingPrivateKey
         self.encryptionPrivateKey = encryptionPrivateKey
-    }
-}
-
-// MARK: - secp256k1 Order (for low-S normalization)
-
-/// secp256k1 curve order N
-private let secp256k1Order: Data = {
-    let hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
-    return try! ACEHex.decode(hex)
-}()
-
-// Big-endian 256-bit arithmetic helpers for low-S normalization
-private extension Data {
-    func shiftedRight() -> Data {
-        var result = [UInt8](repeating: 0, count: count)
-        var carry: UInt8 = 0
-        for i in 0..<count {
-            let byte = self[startIndex + i]
-            result[i] = (byte >> 1) | (carry << 7)
-            carry = byte & 1
-        }
-        return Data(result)
-    }
-
-    func subtract(_ other: Data) -> Data {
-        // self - other (big-endian, assumes self >= other)
-        precondition(count == other.count, "subtract requires equal-length Data (\(count) vs \(other.count))")
-        var result = [UInt8](repeating: 0, count: count)
-        var borrow: Int = 0
-        for i in stride(from: count - 1, through: 0, by: -1) {
-            let diff = Int(self[startIndex + i]) - Int(other[other.startIndex + i]) - borrow
-            if diff < 0 {
-                result[i] = UInt8((diff + 256) & 0xFF)
-                borrow = 1
-            } else {
-                result[i] = UInt8(diff)
-                borrow = 0
-            }
-        }
-        return Data(result)
     }
 }

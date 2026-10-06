@@ -56,6 +56,14 @@ struct SecurityTests {
         }
     }
 
+    @Test("UUID match is case-insensitive and full-string")
+    func uuidFullMatch() throws {
+        try validateMessageId("550E8400-E29B-41D4-A716-446655440000")
+        #expect(throws: ACEError.self) {
+            try validateMessageId("550e8400-e29b-41d4-a716-446655440000\n")
+        }
+    }
+
     // MARK: - Replay Detector
 
     static let t = 1_800_000_000
@@ -168,6 +176,27 @@ struct SecurityTests {
         #expect(restored.export().entries.count == 2)
     }
 
+    @Test("export entries encode as [messageId, sender, timestamp] arrays")
+    func replayExportJSONFormat() throws {
+        let state = ReplayDetectorExport(
+            horizon: Self.t, senderHorizons: [Self.alice: Self.t + 1],
+            entries: [.init(messageId: Self.id(1), sender: Self.alice, timestamp: Self.t + 2)]
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? [String: Any])
+        let entries = try #require(json["entries"] as? [[Any]])
+        #expect(entries.count == 1)
+        #expect(entries[0][0] as? String == Self.id(1))
+        #expect(entries[0][1] as? String == Self.alice)
+        #expect(entries[0][2] as? Int == Self.t + 2)
+        #expect(try JSONDecoder().decode(ReplayDetectorExport.self, from: JSONEncoder().encode(state)) == state)
+
+        // senderHorizons is required; entries must be exactly 3 elements
+        let noSenderHorizons = #"{"horizon":1,"entries":[]}"#
+        #expect(throws: DecodingError.self) { try JSONDecoder().decode(ReplayDetectorExport.self, from: Data(noSenderHorizons.utf8)) }
+        let shortEntry = #"{"horizon":1,"senderHorizons":{},"entries":[["id","s"]]}"#
+        #expect(throws: DecodingError.self) { try JSONDecoder().decode(ReplayDetectorExport.self, from: Data(shortEntry.utf8)) }
+    }
+
     @Test("fromExport rejects malformed state")
     func replayImportRejectsMalformed() {
         let t = Self.t
@@ -220,8 +249,8 @@ struct SecurityTests {
                     opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
                 return false
-            } catch ACEError.payloadTooLarge(let size) {
-                return size > ACEEncryption.maxPayloadSize
+            } catch ACEError.invalidMessage(let reason) {
+                return reason.hasPrefix("Payload too large")
             } catch {
                 return false
             }

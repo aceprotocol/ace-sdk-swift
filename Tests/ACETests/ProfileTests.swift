@@ -194,6 +194,30 @@ struct ProfileValidationTests {
         #expect(throws: Never.self) { try validateProfile(profile) }
     }
 
+    @Test("chains must fully match CAIP-2")
+    func chainCAIP2() {
+        for chain in ["eip155:8453\n", "e:1", "EIP155:1", "eip155:", "eip155:" + String(repeating: "1", count: 33), "eip155:1:2"] {
+            let profile = AgentProfile(chains: [chain])
+            let err = #expect(throws: ACEError.self) { try validateProfile(profile) }
+            #expect(err?.description.contains("Invalid profile: each chain must be a CAIP-2 identifier (chains)") == true)
+        }
+    }
+
+    // MARK: - Unified Rules
+
+    @Test("tags fully match and lengths count Unicode code points")
+    func codePointsAndFullMatch() {
+        #expect(throws: ACEError.self) { try validateProfile(AgentProfile(tags: ["abc\n"])) }
+        // "e\u{301}" is one Character but two code points
+        #expect(throws: ACEError.self) { try validateProfile(AgentProfile(name: String(repeating: "e\u{301}", count: 33))) }
+        #expect(throws: ACEError.self) { try validateProfile(AgentProfile(description: String(repeating: "e\u{301}", count: 129))) }
+    }
+
+    @Test("URLs: https case-insensitive, no host SSRF checks")
+    func urlRule() throws {
+        try validateProfile(AgentProfile(image: "HTTPS://127.0.0.1/a.png", endpoint: "https://localhost/ace"))
+    }
+
     // MARK: - Endpoint Validation
 
     @Test("rejects non-HTTPS endpoint")

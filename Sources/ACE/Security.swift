@@ -11,15 +11,15 @@ import Foundation
 
 public let maxDriftSeconds = 300 // 5 minutes
 private let messageIdV4Pattern = try! NSRegularExpression(
-    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    options: [.caseInsensitive]
 )
 
 // MARK: - Message ID Validation
 
 /// Validate that a message ID is a valid UUID v4.
 public func validateMessageId(_ messageId: String) throws {
-    let range = NSRange(messageId.startIndex..., in: messageId)
-    guard messageIdV4Pattern.firstMatch(in: messageId, range: range) != nil else {
+    guard messageIdV4Pattern.fullMatch(messageId) else {
         throw ACEError.invalidMessage("Invalid messageId: expected UUID v4, got '\(String(messageId.prefix(50)))'")
     }
 }
@@ -69,6 +69,24 @@ public struct ReplayDetectorExport: Codable, Equatable, Sendable {
             self.messageId = messageId
             self.sender = sender
             self.timestamp = timestamp
+        }
+
+        /// Encoded as the JSON array `[messageId, sender, timestamp]` (same format as Py/TS).
+        public init(from decoder: any Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            messageId = try container.decode(String.self)
+            sender = try container.decode(String.self)
+            timestamp = try container.decode(Int.self)
+            guard container.isAtEnd else {
+                throw DecodingError.dataCorruptedError(in: container, debugDescription: "Replay entry must have exactly 3 elements")
+            }
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.unkeyedContainer()
+            try container.encode(messageId)
+            try container.encode(sender)
+            try container.encode(timestamp)
         }
     }
 

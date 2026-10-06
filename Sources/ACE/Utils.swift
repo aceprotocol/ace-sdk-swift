@@ -16,9 +16,22 @@ public enum ACEBase64 {
         data.base64EncodedString()
     }
 
-    public static func decode(_ string: String) throws -> Data {
+    /// Strictly decode padded standard Base64.
+    ///
+    /// With `maxLength`, anything longer than the padded encoding of `maxLength`
+    /// bytes is refused before decoding (DoS guard).
+    public static func decode(_ string: String, maxLength: Int? = nil, what: String = "Base64 value") throws -> Data {
+        if let maxLength {
+            let maxEncoded = ((maxLength + 2) / 3) * 4
+            guard string.utf8.count <= maxEncoded else {
+                throw ACEError.invalidMessage("\(what) too large: \(string.utf8.count) Base64 chars exceeds max \(maxEncoded)")
+            }
+        }
         guard let data = Data(base64Encoded: string) else {
             throw ACEError.invalidMessage("Invalid Base64 string")
+        }
+        if let maxLength, data.count > maxLength {
+            throw ACEError.invalidMessage("\(what) too large: \(data.count) bytes exceeds max \(maxLength)")
         }
         return data
     }
@@ -223,6 +236,16 @@ public func secp256k1Address(_ compressedPubKey: Data) throws -> String {
 public func computeACEId(_ signingPublicKey: Data) -> String {
     let hash = Data(SHA256.hash(data: signingPublicKey))
     return "ace:sha256:" + ACEHex.encode(hash)
+}
+
+// MARK: - Regex Full Match
+
+extension NSRegularExpression {
+    /// True only if the match covers the whole string (`$` alone also matches before a final "\n").
+    func fullMatch(_ string: String) -> Bool {
+        let range = NSRange(string.startIndex..., in: string)
+        return firstMatch(in: string, range: range)?.range == range
+    }
 }
 
 // MARK: - Constant-Time Comparison

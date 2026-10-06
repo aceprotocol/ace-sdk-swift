@@ -52,18 +52,19 @@ public enum ACEEncryption {
     /// Maximum plaintext size
     public static let maxPlaintextSize = maxPayloadSize - minPayloadLength
 
-    /// Padded Base64 length of a `publicKeySize`-byte value (1624 characters).
-    static let publicKeyBase64Length = paddedBase64Length(publicKeySize)
-
-    /// Padded Base64 length of a `kemCiphertextSize`-byte value (1496 characters).
-    static let kemCiphertextBase64Length = paddedBase64Length(kemCiphertextSize)
-
     // MARK: - Key Generation
 
     /// Derive the X-Wing public key (1216 bytes) from a 32-byte seed.
     public static func publicKey(fromSeed seed: Data) throws -> Data {
-        let privateKey = try privateKey(fromSeed: seed)
-        return Data(privateKey.publicKey.rawRepresentation)
+        Data(try privateKey(fromSeed: seed).publicKey.rawRepresentation)
+    }
+
+    /// Expand a 32-byte seed into an X-Wing private key (SHAKE256 + ML-KEM-768
+    /// keygen + X25519). Holders that decrypt repeatedly should keep the result
+    /// and call `decrypt(kemCiphertext:payload:privateKey:conversationId:)`.
+    public static func privateKey(fromSeed seed: Data) throws -> XWingMLKEM768X25519.PrivateKey {
+        try validateSeed(seed)
+        return try XWingMLKEM768X25519.PrivateKey(seedRepresentation: seed, publicKey: nil)
     }
 
     /// Generate a fresh random 32-byte X-Wing seed.
@@ -82,9 +83,8 @@ public enum ACEEncryption {
     /// Sorting ensures symmetry: A→B and B→A produce the same ID.
     /// Variable-time comparison is safe here — these are public keys, not secrets.
     public static func computeConversationId(pubA: Data, pubB: Data) throws -> String {
-        guard pubA.count == publicKeySize, pubB.count == publicKeySize else {
-            throw ACEError.invalidKey("X-Wing public keys must be \(publicKeySize) bytes, got \(pubA.count) and \(pubB.count)")
-        }
+        try validatePublicKey(pubA)
+        try validatePublicKey(pubB)
         let (first, second) = compareBytes(pubA, pubB) <= 0 ? (pubA, pubB) : (pubB, pubA)
         let combined = first + second
         let hash = Data(SHA256.hash(data: combined))
@@ -151,6 +151,23 @@ public enum ACEEncryption {
         seed: Data,
         conversationId: String
     ) throws -> Data {
+        // Ciphertext length is checked before the (more expensive) key expansion.
+        try validateKEMCiphertext(kemCiphertext)
+        return try decrypt(
+            kemCiphertext: kemCiphertext,
+            payload: payload,
+            privateKey: privateKey(fromSeed: seed),
+            conversationId: conversationId
+        )
+    }
+
+    /// Decrypt with an already-expanded X-Wing private key (see `privateKey(fromSeed:)`).
+    public static func decrypt(
+        kemCiphertext: Data,
+        payload: Data,
+        privateKey: XWingMLKEM768X25519.PrivateKey,
+        conversationId: String
+    ) throws -> Data {
         // Validate
         try validateKEMCiphertext(kemCiphertext)
         guard payload.count >= minPayloadLength else {
@@ -162,7 +179,6 @@ public enum ACEEncryption {
 
         // 1. X-Wing decapsulate (implicit rejection: a bad ciphertext yields a
         //    pseudorandom secret and the AES-GCM tag check fails below)
-        let privateKey = try privateKey(fromSeed: seed)
         let sharedSecret: SymmetricKey
         do {
             sharedSecret = try privateKey.decapsulate(kemCiphertext)
@@ -211,47 +227,27 @@ public enum ACEEncryption {
     // MARK: - Decoding (Base64 wire strings)
 
     /// Decode and validate a Base64 X-Wing public key (1216 bytes).
-    ///
-    /// The string length is checked before decoding: anything longer than the
-    /// padded Base64 encoding of 1216 bytes cannot be a valid key and is rejected
-    /// without allocating for the decode. All failures are `ACEError.invalidKey`.
+    /// Oversized input is refused before decoding. All failures are `ACEError.invalidKey`.
     public static func decodePublicKey(base64: String) throws -> Data {
-        guard base64.utf8.count <= publicKeyBase64Length else {
-            throw ACEError.invalidKey("X-Wing public key must be \(publicKeySize) bytes; Base64 input of \(base64.utf8.count) characters exceeds the \(publicKeyBase64Length)-character encoding")
-        }
-        guard let key = try? ACEBase64.decode(base64) else {
-            throw ACEError.invalidKey("X-Wing public key is not valid Base64")
+        let key: Data
+        do {
+            key = try ACEBase64.decode(base64, maxLength: publicKeySize, what: "X-Wing public key")
+        } catch ACEError.invalidMessage(let reason) {
+            throw ACEError.invalidKey(reason)
         }
         try validatePublicKey(key)
         return key
     }
 
     /// Decode and validate a Base64 X-Wing ciphertext (1120 bytes).
-    ///
-    /// Same shape as `decodePublicKey(base64:)`: string-length pre-check, decode,
-    /// then length validation. All failures are `ACEError.invalidMessage`.
+    /// Oversized input is refused before decoding. All failures are `ACEError.invalidMessage`.
     public static func decodeKEMCiphertext(base64: String) throws -> Data {
-        guard base64.utf8.count <= kemCiphertextBase64Length else {
-            throw ACEError.invalidMessage("kemCiphertext must be \(kemCiphertextSize) bytes; Base64 input of \(base64.utf8.count) characters exceeds the \(kemCiphertextBase64Length)-character encoding")
-        }
-        guard let ct = try? ACEBase64.decode(base64) else {
-            throw ACEError.invalidMessage("kemCiphertext is not valid Base64")
-        }
+        let ct = try ACEBase64.decode(base64, maxLength: kemCiphertextSize, what: "kemCiphertext")
         try validateKEMCiphertext(ct)
         return ct
     }
 
     // MARK: - Private Helpers
-
-    /// Length of the padded Base64 encoding of `byteCount` bytes.
-    private static func paddedBase64Length(_ byteCount: Int) -> Int {
-        ((byteCount + 2) / 3) * 4
-    }
-
-    private static func privateKey(fromSeed seed: Data) throws -> XWingMLKEM768X25519.PrivateKey {
-        try validateSeed(seed)
-        return try XWingMLKEM768X25519.PrivateKey(seedRepresentation: seed, publicKey: nil)
-    }
 
     /// aesKey = HKDF-SHA256(ikm = X-Wing shared secret, salt = ACE_KEM_SALT, info = conversationId, L = 32)
     private static func deriveAESKey(sharedSecret: SymmetricKey, conversationId: Data) -> SymmetricKey {

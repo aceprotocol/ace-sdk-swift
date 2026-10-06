@@ -23,6 +23,26 @@ struct EncryptionTests {
 
     // MARK: - Key generation
 
+    @Test("expanded private key decrypts like the seed it came from")
+    func expandedKeyDecrypt() throws {
+        let seed = ACEEncryption.generateSeed()
+        let pk = try ACEEncryption.publicKey(fromSeed: seed)
+        let (ct, payload) = try ACEEncryption.encrypt(Data("hi".utf8), recipientPublicKey: pk, conversationId: "c")
+        let key = try ACEEncryption.privateKey(fromSeed: seed)
+        #expect(Data(key.publicKey.rawRepresentation) == pk)
+        #expect(try ACEEncryption.decrypt(kemCiphertext: ct, payload: payload, privateKey: key, conversationId: "c") == Data("hi".utf8))
+        #expect(try ACEEncryption.decrypt(kemCiphertext: ct, payload: payload, seed: seed, conversationId: "c") == Data("hi".utf8))
+    }
+
+    @Test("Base64 wire values must be padded")
+    func base64MustBePadded() throws {
+        let ct = ACEBase64.encode(Data(repeating: 7, count: ACEEncryption.kemCiphertextSize))
+        #expect(throws: ACEError.self) {
+            try ACEEncryption.decodeKEMCiphertext(base64: String(ct.drop(while: { _ in false }).reversed().drop(while: { $0 == "=" }).reversed()))
+        }
+        #expect(try ACEEncryption.decodeKEMCiphertext(base64: ct).count == ACEEncryption.kemCiphertextSize)
+    }
+
     @Test("public key derivation from seed is deterministic")
     func deterministicPublicKey() throws {
         let seed = ACEEncryption.generateSeed()

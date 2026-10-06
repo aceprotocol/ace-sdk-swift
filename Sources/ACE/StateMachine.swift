@@ -24,23 +24,28 @@ public enum ThreadState: String, Codable, Sendable {
 
 // MARK: - Transition Table
 
-private let TRANSITIONS: [String: ThreadState] = [
+/// Ordered so `allowedTypes` lists types in declaration order (same as Py/TS).
+private let TRANSITION_TABLE: [(from: ThreadState, type: MessageType, to: ThreadState)] = [
     // Phase 1: Negotiation
-    "idle:rfq": .rfq,
-    "rfq:offer": .offered,
-    "offered:accept": .accepted,
-    "offered:reject": .rejected,
-    "offered:offer": .offered,       // Counter-offer
+    (.idle, .rfq, .rfq),
+    (.rfq, .offer, .offered),
+    (.offered, .accept, .accepted),
+    (.offered, .reject, .rejected),
+    (.offered, .offer, .offered),       // Counter-offer
 
     // Phase 2: Execution
-    "accepted:invoice": .invoiced,
-    "accepted:receipt": .paid,       // Pre-paid (no invoice needed)
-    "invoiced:receipt": .paid,
+    (.accepted, .invoice, .invoiced),
+    (.accepted, .receipt, .paid),       // Pre-paid (no invoice needed)
+    (.invoiced, .receipt, .paid),
 
-    "accepted:deliver": .delivered,  // Deliver-first (trust-based)
-    "paid:deliver": .delivered,      // Standard: deliver after payment
-    "delivered:confirm": .confirmed,
+    (.accepted, .deliver, .delivered),  // Deliver-first (trust-based)
+    (.paid, .deliver, .delivered),      // Standard: deliver after payment
+    (.delivered, .confirm, .confirmed),
 ]
+
+private func transitionTarget(from state: ThreadState, on type: MessageType) -> ThreadState? {
+    TRANSITION_TABLE.first { $0.from == state && $0.type == type }?.to
+}
 
 // Rejected and confirmed are terminal — no outgoing economic transitions.
 private let TERMINAL_STATES: Set<ThreadState> = [.rejected, .confirmed]
@@ -54,7 +59,7 @@ public func validateThreadId(_ threadId: String) throws {
     if threadId.isEmpty {
         throw InvalidTransitionError.validationError("threadId must not be empty")
     }
-    if threadId.count > MAX_THREAD_ID_LENGTH {
+    if threadId.unicodeScalars.count > MAX_THREAD_ID_LENGTH {
         throw InvalidTransitionError.validationError("threadId exceeds max length of \(MAX_THREAD_ID_LENGTH) characters")
     }
     for scalar in threadId.unicodeScalars {
@@ -125,6 +130,8 @@ public final class ThreadStateMachine: @unchecked Sendable {
     private let maxHistoryPerThread: Int
 
     public init(maxThreads: Int = 100_000, maxHistoryPerThread: Int = 1_000) {
+        precondition(maxThreads > 0, "maxThreads must be a positive integer")
+        precondition(maxHistoryPerThread > 0, "maxHistoryPerThread must be a positive integer")
         self.maxThreads = maxThreads
         self.maxHistoryPerThread = maxHistoryPerThread
     }
@@ -164,8 +171,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
             )
         }
 
-        let transitionKey = "\(currentState.rawValue):\(messageType.rawValue)"
-        guard let nextState = TRANSITIONS[transitionKey] else {
+        guard let nextState = transitionTarget(from: currentState, on: messageType) else {
             throw InvalidTransitionError.invalidTransition(
                 threadId: threadId, currentState: currentState, messageType: messageType.rawValue
             )
@@ -209,14 +215,17 @@ public final class ThreadStateMachine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        let currentState = threads[compositeKey(conversationId, threadId)]?.state ?? .idle
+        let thread = threads[compositeKey(conversationId, threadId)]
+        let currentState = thread?.state ?? .idle
 
-        if TERMINAL_STATES.contains(currentState) {
+        if TERMINAL_STATES.contains(currentState) || transitionTarget(from: currentState, on: messageType) == nil {
             return false
         }
-
-        let transitionKey = "\(currentState.rawValue):\(messageType.rawValue)"
-        return TRANSITIONS[transitionKey] != nil
+        // Must agree with transition(): resource limits reject, never evict.
+        if let thread {
+            return thread.history.count < maxHistoryPerThread
+        }
+        return threads.count < maxThreads
     }
 
     public func getState(conversationId: String, threadId: String) -> ThreadState {
@@ -247,17 +256,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
             return []
         }
 
-        var allowed: [MessageType] = []
-        let prefix = "\(currentState.rawValue):"
-        for (transKey, _) in TRANSITIONS {
-            if transKey.hasPrefix(prefix) {
-                let typeStr = String(transKey.dropFirst(prefix.count))
-                if let msgType = MessageType(rawValue: typeStr) {
-                    allowed.append(msgType)
-                }
-            }
-        }
-        return allowed
+        return TRANSITION_TABLE.filter { $0.from == currentState }.map(\.type)
     }
 
     public func isTerminal(conversationId: String, threadId: String) -> Bool {
@@ -287,29 +286,42 @@ public final class ThreadStateMachine: @unchecked Sendable {
     /// Import previously exported state. Validates that each snapshot's history
     /// represents a legal walk through the transition table from .idle.
     /// Rejects snapshots with invalid transition sequences to prevent state injection.
-    public static func fromExport(_ snapshots: [ThreadSnapshot]) throws -> ThreadStateMachine {
-        let sm = ThreadStateMachine()
+    public static func fromExport(
+        _ snapshots: [ThreadSnapshot],
+        maxThreads: Int = 100_000,
+        maxHistoryPerThread: Int = 1_000
+    ) throws -> ThreadStateMachine {
+        let sm = ThreadStateMachine(maxThreads: maxThreads, maxHistoryPerThread: maxHistoryPerThread)
         sm.lock.lock()
         defer { sm.lock.unlock() }
+
+        guard snapshots.count <= maxThreads else {
+            throw ACEError.invalidTransition("fromExport: \(snapshots.count) threads exceeds maximum of \(maxThreads)")
+        }
 
         for snap in snapshots {
             // Validate threadId and conversationId format (same rules as live messages)
             try validateThreadId(snap.threadId)
-            guard !snap.conversationId.isEmpty, snap.conversationId.count <= 256 else {
+            guard !snap.conversationId.isEmpty, snap.conversationId.unicodeScalars.count <= 256 else {
                 throw ACEError.invalidTransition("fromExport: invalid conversationId")
+            }
+            guard !snap.history.isEmpty, snap.history.count <= maxHistoryPerThread else {
+                throw ACEError.invalidTransition("fromExport: history must have 1-\(maxHistoryPerThread) entries")
             }
 
             // Validate the history represents a valid transition sequence
             var replayState: ThreadState = .idle
             for entry in snap.history {
-                guard let msgType = MessageType(rawValue: entry.type) else {
-                    throw ACEError.invalidMessage("fromExport: unknown message type '\(entry.type)' in thread history")
+                guard let msgType = MessageType(rawValue: entry.type), isEconomicType(msgType) else {
+                    throw ACEError.invalidMessage("fromExport: unknown message type '\(String(entry.type.prefix(32)))' in thread history")
                 }
-                let transitionKey = "\(replayState.rawValue):\(msgType.rawValue)"
-                guard let nextState = TRANSITIONS[transitionKey] else {
+                guard entry.timestamp >= 0 else {
+                    throw ACEError.invalidMessage("fromExport: invalid timestamp in thread history")
+                }
+                guard let next = transitionTarget(from: replayState, on: msgType) else {
                     throw ACEError.invalidTransition("fromExport: invalid transition '\(msgType.rawValue)' from state '\(replayState.rawValue)'")
                 }
-                replayState = nextState
+                replayState = next
             }
             // Final replayed state must match the declared state
             guard replayState == snap.state else {
@@ -317,6 +329,9 @@ public final class ThreadStateMachine: @unchecked Sendable {
             }
 
             let key = sm.compositeKey(snap.conversationId, snap.threadId)
+            guard sm.threads[key] == nil else {
+                throw ACEError.invalidTransition("fromExport: duplicate thread")
+            }
             sm.threads[key] = ThreadEntry(
                 conversationId: snap.conversationId,
                 threadId: snap.threadId,

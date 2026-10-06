@@ -43,7 +43,7 @@ public func validateBody(_ type: MessageType, _ body: [String: Any]) throws {
         try requireString(body, "settlementMethod", "invoice")
         try validateOptionalObject(body, "settlementDetails", "invoice")
     case .receipt:
-        try validateOptionalString(body, "invoiceId", "receipt")
+        try requireString(body, "referenceId", "receipt")
         try requireString(body, "amount", "receipt")
         try requireString(body, "currency", "receipt")
         try requireString(body, "settlementMethod", "receipt")
@@ -71,9 +71,15 @@ public func validateBody(_ type: MessageType, _ body: [String: Any]) throws {
     }
 }
 
+/// JSON `null` is treated as absent: missing for `require*`, skipped by `validateOptional*`.
+private func presentValue(_ body: [String: Any], _ field: String) -> Any? {
+    guard let value = body[field], !(value is NSNull) else { return nil }
+    return value
+}
+
 @discardableResult
 private func requireString(_ body: [String: Any], _ field: String, _ typeName: String) throws -> String {
-    guard let value = body[field] else {
+    guard let value = presentValue(body, field) else {
         throw ACEError.invalidMessage("\(typeName) body requires '\(field)' field")
     }
     guard let string = value as? String else {
@@ -83,28 +89,28 @@ private func requireString(_ body: [String: Any], _ field: String, _ typeName: S
 }
 
 private func requireObject(_ body: [String: Any], _ field: String, _ typeName: String) throws {
-    guard let value = body[field] else {
+    guard let value = presentValue(body, field) else {
         throw ACEError.invalidMessage("\(typeName) body requires '\(field)' field")
     }
     try validateObject(value, field, typeName)
 }
 
 private func validateOptionalString(_ body: [String: Any], _ field: String, _ typeName: String) throws {
-    guard let value = body[field] else { return }
+    guard let value = presentValue(body, field) else { return }
     guard value is String else {
         throw ACEError.invalidMessage("\(typeName).\(field) must be a string")
     }
 }
 
 private func validateOptionalNumber(_ body: [String: Any], _ field: String, _ typeName: String) throws {
-    guard let value = body[field] else { return }
+    guard let value = presentValue(body, field) else { return }
     guard isJSONNumber(value) else {
         throw ACEError.invalidMessage("\(typeName).\(field) must be a number")
     }
 }
 
 private func validateOptionalObject(_ body: [String: Any], _ field: String, _ typeName: String) throws {
-    guard let value = body[field] else { return }
+    guard let value = presentValue(body, field) else { return }
     try validateObject(value, field, typeName)
 }
 
@@ -115,7 +121,12 @@ private func validateObject(_ value: Any, _ field: String, _ typeName: String) t
 }
 
 private func isJSONNumber(_ value: Any) -> Bool {
+    // NSNumber first: JSONSerialization's 0/1 also bridge to Bool, so `is Bool`
+    // would reject them. Only a real CFBoolean is a JSON boolean.
     switch value {
+    case let n as NSNumber:
+        if CFGetTypeID(n as CFTypeRef) == CFBooleanGetTypeID() { return false }
+        return n.doubleValue.isFinite
     case is Bool:
         return false
     case is Int, is Int8, is Int16, is Int32, is Int64,
@@ -126,32 +137,33 @@ private func isJSONNumber(_ value: Any) -> Bool {
         return f.isFinite
     case let d as Double:
         return d.isFinite
-    case let n as NSNumber:
-        // Reject NSNumber-wrapped booleans (CFBoolean) and non-finite doubles
-        if CFGetTypeID(n as CFTypeRef) == CFBooleanGetTypeID() { return false }
-        return n.doubleValue.isFinite
     default:
         return false
     }
 }
 
-private func estimateBase64DecodedLength(_ encoded: String) -> Int {
-    let length = encoded.utf8.count
-    guard length > 0 else { return 0 }
+private let conversationIdPattern = try! NSRegularExpression(pattern: "^[0-9a-f]{64}$")
+private let maxJSONDepth = 32
 
-    // Handle both padded (length % 4 == 0) and unpadded base64
-    var padding = 0
-    if encoded.hasSuffix("==") {
-        padding = 2
-    } else if encoded.hasSuffix("=") {
-        padding = 1
+/// Iterative nesting-depth check (top-level object is depth 0); same semantics as TS/Py.
+private func assertMaxDepth(_ value: Any, _ maxDepth: Int) throws {
+    var stack: [(value: Any, depth: Int)] = [(value, 0)]
+    while let (val, depth) = stack.popLast() {
+        if depth > maxDepth {
+            throw ACEError.invalidMessage("Decrypted body exceeds maximum nesting depth of \(maxDepth)")
+        }
+        let children: [Any]
+        if let dict = val as? [String: Any] {
+            children = Array(dict.values)
+        } else if let array = val as? [Any] {
+            children = array
+        } else {
+            continue
+        }
+        for child in children where child is [String: Any] || child is [Any] {
+            stack.append((child, depth + 1))
+        }
     }
-
-    if length % 4 == 0 {
-        return (length / 4) * 3 - padding
-    }
-    // Unpadded: ceil(length * 3 / 4) gives upper bound
-    return (length * 3 + 3) / 4
 }
 
 private func normalizeThreadId(_ threadId: String?) -> String {
@@ -210,12 +222,11 @@ private func validateThreadReferences(
             throw ACEError.invalidMessage("invoice.offerId must reference an offer in the same thread")
         }
     case .receipt:
-        // invoiceId is optional: absent on pre-paid path (accepted→receipt),
-        // present and validated on invoiced→receipt path.
-        if let invoiceId = body["invoiceId"] as? String, !invoiceId.isEmpty {
-            guard threadContainsMessage(stateMachine: stateMachine, conversationId: conversationId, threadId: threadId, messageType: .invoice, messageId: invoiceId) else {
-                throw ACEError.invalidMessage("receipt.invoiceId must reference an invoice in the same thread")
-            }
+        // Pre-paid path (accepted→receipt) references the accept; otherwise the invoice.
+        let referenceId = try requireString(body, "referenceId", "receipt")
+        let isPrePaid = stateMachine.getState(conversationId: conversationId, threadId: threadId) == .accepted
+        guard threadContainsMessage(stateMachine: stateMachine, conversationId: conversationId, threadId: threadId, messageType: isPrePaid ? .accept : .invoice, messageId: referenceId) else {
+            throw ACEError.invalidMessage("receipt.referenceId must reference the invoice (or, when pre-paid, the accept) in the same thread")
         }
     case .confirm:
         let deliverId = try requireString(body, "deliverId", "confirm")
@@ -428,8 +439,8 @@ public func parseMessage(
     guard !msg.messageId.isEmpty, !msg.from.isEmpty, !msg.conversationId.isEmpty else {
         throw ACEError.invalidMessage("Missing required envelope fields")
     }
-    guard msg.conversationId.count <= 256 else {
-        throw ACEError.invalidMessage("conversationId exceeds max length of 256 characters")
+    guard conversationIdPattern.fullMatch(msg.conversationId) else {
+        throw ACEError.invalidMessage("Invalid conversationId: expected 64 lowercase hex characters")
     }
     try validateMessageId(msg.messageId)
 
@@ -475,16 +486,7 @@ public func parseMessage(
     }
 
     // 4. Signature verification BEFORE decryption
-    let estimatedPayloadBytes = estimateBase64DecodedLength(msg.encryption.payload)
-    if estimatedPayloadBytes > ACEEncryption.maxPayloadSize {
-        throw ACEError.payloadTooLarge(estimatedPayloadBytes)
-    }
-
-    let payloadBytes = try ACEBase64.decode(msg.encryption.payload)
-
-    guard payloadBytes.count <= ACEEncryption.maxPayloadSize else {
-        throw ACEError.payloadTooLarge(payloadBytes.count)
-    }
+    let payloadBytes = try ACEBase64.decode(msg.encryption.payload, maxLength: ACEEncryption.maxPayloadSize, what: "Payload")
 
     // kemCiphertext length is enforced here, BEFORE signature verification and
     // long before any decapsulation runs.
@@ -533,8 +535,9 @@ public func parseMessage(
 
     // 6. Parse and validate body
     guard let body = try JSONSerialization.jsonObject(with: decrypted) as? [String: Any] else {
-        throw ACEError.invalidMessage("Decrypted body is not a valid JSON object")
+        throw ACEError.invalidMessage("Decrypted body must be a JSON object")
     }
+    try assertMaxDepth(body, maxJSONDepth)
     try validateBody(msg.type, body)
     try validateThreadReferences(
         type: msg.type,
@@ -619,13 +622,14 @@ func parseMessageFromRegistrationInternal(
     currentTimestamp: Int? = nil,
     oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {
-    try validateRegistrationFile(senderRegistration)
-    guard try verifyRegistrationId(senderRegistration) else {
+    // validateRegistrationFile already checks the secp256k1 address against the
+    // signing key, so the only remaining verifyRegistrationId check is the id.
+    let keys = try validateRegistrationFile(senderRegistration)
+    guard computeACEId(keys.signingPublicKey) == senderRegistration.id else {
         throw ACEError.invalidRegistration("Sender registration file failed cryptographic verification")
     }
-
-    let signingPubKey = try getRegistrationSigningPublicKey(senderRegistration)
-    let encryptionPubKey = try getRegistrationEncryptionPublicKey(senderRegistration)
+    let signingPubKey = keys.signingPublicKey
+    let encryptionPubKey = keys.encryptionPublicKey
 
     var opts = ParseMessageOptions(
         stateMachine: stateMachine,

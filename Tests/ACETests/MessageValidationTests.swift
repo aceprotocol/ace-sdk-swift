@@ -63,10 +63,10 @@ struct MessageValidationTests {
             }
         }
 
-        @Test("validates receipt body - invoiceId, amount, currency, settlementMethod, proof required")
+        @Test("validates receipt body - referenceId, amount, currency, settlementMethod, proof required")
         func receiptBody() throws {
             try validateBody(.receipt, [
-                "invoiceId": "inv-1",
+                "referenceId": "inv-1",
                 "amount": "3.50",
                 "currency": "USD",
                 "settlementMethod": "crypto/instant",
@@ -74,7 +74,7 @@ struct MessageValidationTests {
             ])
             #expect(throws: ACEError.self) {
                 try validateBody(.receipt, [
-                    "invoiceId": "inv-1",
+                    "referenceId": "inv-1",
                     "amount": "3.50",
                     "currency": "USD",
                     "settlementMethod": "crypto/instant",
@@ -504,6 +504,113 @@ struct MessageValidationTests {
                 opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: detector)
             )
             #expect(parsed.body["message"] as? String == "hi")
+        }
+    }
+
+    // ============================================================
+    // Cross-SDK unified rules
+    // ============================================================
+
+    @Suite("unified body and envelope rules")
+    struct UnifiedRules {
+        private static func send(
+            _ from: SoftwareIdentity, _ to: SoftwareIdentity, _ type: MessageType,
+            _ body: [String: Any], _ sm: ThreadStateMachine, threadId: String? = "deal"
+        ) throws -> ACEMessage {
+            try createMessage(CreateMessageOptions(
+                sender: from, recipientPubKey: to.getEncryptionPublicKey(), recipientACEId: to.getACEId(),
+                type: type, body: body, stateMachine: sm, threadId: threadId
+            ))
+        }
+
+        private static func receipt(_ referenceId: String) -> [String: Any] {
+            ["referenceId": referenceId, "amount": "10", "currency": "USD", "settlementMethod": "crypto/instant", "proof": ["tx": "0x1"]]
+        }
+
+        @Test("receipt.referenceId is required")
+        func receiptInvoiceIdRequired() {
+            var body = Self.receipt("x")
+            body["referenceId"] = nil
+            #expect(throws: ACEError.self) { try validateBody(.receipt, body) }
+        }
+
+        @Test("pre-paid receipt references the accept; invoiced receipt references the invoice")
+        func receiptReference() throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+
+            let sm = ThreadStateMachine()
+            _ = try Self.send(alice, bob, .rfq, ["need": "gpu"], sm)
+            let offer = try Self.send(bob, alice, .offer, ["price": "10", "currency": "USD"], sm)
+            let accept = try Self.send(alice, bob, .accept, ["offerId": offer.messageId], sm)
+            #expect(throws: ACEError.self) { try Self.send(alice, bob, .receipt, Self.receipt(offer.messageId), sm) }
+            _ = try Self.send(alice, bob, .receipt, Self.receipt(accept.messageId), sm)
+
+            let sm2 = ThreadStateMachine()
+            _ = try Self.send(alice, bob, .rfq, ["need": "gpu"], sm2)
+            let offer2 = try Self.send(bob, alice, .offer, ["price": "10", "currency": "USD"], sm2)
+            let accept2 = try Self.send(alice, bob, .accept, ["offerId": offer2.messageId], sm2)
+            let invoice = try Self.send(bob, alice, .invoice, [
+                "offerId": offer2.messageId, "amount": "10", "currency": "USD", "settlementMethod": "crypto/instant",
+            ], sm2)
+            #expect(throws: ACEError.self) { try Self.send(alice, bob, .receipt, Self.receipt(accept2.messageId), sm2) }
+            _ = try Self.send(alice, bob, .receipt, Self.receipt(invoice.messageId), sm2)
+        }
+
+        @Test("JSON null is treated as absent")
+        func nullIsAbsent() throws {
+            try validateBody(.rfq, ["need": "gpu", "maxPrice": NSNull(), "ttl": NSNull()])
+            #expect(throws: ACEError.self) { try validateBody(.rfq, ["need": NSNull()]) }
+        }
+
+        @Test("decoded ttl 0/1 are numbers, JSON booleans are not")
+        func decodedNumbers() throws {
+            for json in [#"{"need":"gpu","ttl":0}"#, #"{"need":"gpu","ttl":1}"#, #"{"need":"gpu","ttl":1.5}"#] {
+                let body = try #require(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+                try validateBody(.rfq, body)
+            }
+            let body = try #require(JSONSerialization.jsonObject(with: Data(#"{"need":"gpu","ttl":true}"#.utf8)) as? [String: Any])
+            #expect(throws: ACEError.self) { try validateBody(.rfq, body) }
+        }
+
+        @Test("decrypted body nesting depth is capped at 32")
+        func nestingDepth() throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+            func nested(_ levels: Int) -> [String: Any] {
+                // Top-level object is depth 0; "x" is depth 1, innermost is depth 1 + levels.
+                var v: Any = [String: Any]()
+                for _ in 0..<levels { v = ["a": v] }
+                return ["message": "hi", "x": v]
+            }
+            let ok = try Self.send(alice, bob, .text, nested(31), ThreadStateMachine(), threadId: nil)
+            _ = try parseMessage(ok, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                                 opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector()))
+
+            let deep = try Self.send(alice, bob, .text, nested(32), ThreadStateMachine(), threadId: nil)
+            let err = #expect(throws: ACEError.self) {
+                try parseMessage(deep, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                                 opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector()))
+            }
+            #expect(err?.description.contains("maximum nesting depth of 32") == true)
+        }
+
+        @Test("conversationId must be 64 lowercase hex characters")
+        func conversationIdFormat() throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+            let msg = try Self.send(alice, bob, .text, ["message": "hi"], ThreadStateMachine(), threadId: nil)
+            for bad in [msg.conversationId.uppercased(), msg.conversationId + "\n", String(msg.conversationId.dropLast())] {
+                let tampered = ACEMessage(
+                    messageId: msg.messageId, from: msg.from, to: msg.to, conversationId: bad, type: msg.type,
+                    threadId: msg.threadId, timestamp: msg.timestamp, encryption: msg.encryption, signature: msg.signature
+                )
+                let err = #expect(throws: ACEError.self) {
+                    try parseMessage(tampered, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                                     opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector()))
+                }
+                #expect(err?.description.contains("Invalid conversationId: expected 64 lowercase hex characters") == true)
+            }
         }
     }
 

@@ -15,14 +15,21 @@ private let aceIdPattern = try! NSRegularExpression(
 
 /// Validate ACE ID format: ace:sha256:<64 hex chars>
 public func validateACEId(_ id: String) -> Bool {
-    let range = NSRange(id.startIndex..., in: id)
-    return aceIdPattern.firstMatch(in: id, range: range) != nil
+    aceIdPattern.fullMatch(id)
 }
 
 // MARK: - Registration File Validation
 
+/// Decoded public keys of a validated registration file.
+public struct RegistrationKeys: Sendable {
+    public let signingPublicKey: Data
+    public let encryptionPublicKey: Data
+}
+
 /// Validate a registration file has all required fields and correct format.
-public func validateRegistrationFile(_ reg: RegistrationFile) throws {
+/// Returns the decoded keys so callers need not decode them a second time.
+@discardableResult
+public func validateRegistrationFile(_ reg: RegistrationFile) throws -> RegistrationKeys {
     guard reg.ace == "1.0" else {
         throw ACEError.invalidRegistration("Invalid ace version: expected '1.0', got '\(reg.ace)'")
     }
@@ -32,13 +39,9 @@ public func validateRegistrationFile(_ reg: RegistrationFile) throws {
     guard !reg.name.isEmpty else {
         throw ACEError.invalidRegistration("Missing required field: name")
     }
-    guard let endpointURL = URL(string: reg.endpoint),
-          endpointURL.scheme == "https",
-          let host = endpointURL.host,
-          !host.isEmpty else {
+    guard isHTTPSURL(reg.endpoint) else {
         throw ACEError.invalidRegistration("endpoint must be a valid HTTPS URL")
     }
-    try validateURLHost(host)
     // IdentityTier enum enforces valid values (0, 1) at decode time
     guard !reg.signing.address.isEmpty else {
         throw ACEError.invalidRegistration("Missing required field: signing.address")
@@ -46,31 +49,12 @@ public func validateRegistrationFile(_ reg: RegistrationFile) throws {
     guard !reg.signing.encryptionPublicKey.isEmpty else {
         throw ACEError.invalidRegistration("Missing required field: signing.encryptionPublicKey")
     }
-    _ = try getRegistrationEncryptionPublicKey(reg)
-
-    if reg.signing.scheme == .ed25519 {
-        let addressPubKey = try Base58.decode(reg.signing.address)
-        guard addressPubKey.count == 32 else {
-            throw ACEError.invalidRegistration("ed25519 signing.address must decode to 32 bytes")
-        }
-        if let sigPubB64 = reg.signing.signingPublicKey, !sigPubB64.isEmpty {
-            let signingPubKeyBytes = try ACEBase64.decode(sigPubB64)
-            guard constantTimeEqual(addressPubKey, signingPubKeyBytes) else {
-                throw ACEError.invalidRegistration("ed25519 signing.signingPublicKey does not match signing.address")
-            }
-        }
-    } else if reg.signing.scheme == .secp256k1 {
-        // secp256k1 requires signingPublicKey (address is a hash, can't recover pubkey from it)
-        guard let sigPubB64 = reg.signing.signingPublicKey, !sigPubB64.isEmpty else {
-            throw ACEError.invalidRegistration("secp256k1 scheme requires signing.signingPublicKey")
-        }
-        // Verify address matches signingPublicKey
-        let signingPubKeyBytes = try ACEBase64.decode(sigPubB64)
-        let derivedAddress = try secp256k1Address(signingPubKeyBytes)
-        guard reg.signing.address == derivedAddress else {
-            throw ACEError.invalidRegistration("signing.address does not match signing.signingPublicKey")
-        }
+    let encryptionPublicKey = try getRegistrationEncryptionPublicKey(reg)
+    let signingPublicKey = try getRegistrationSigningPublicKey(reg)
+    if reg.signing.scheme == .secp256k1, try reg.signing.address != secp256k1Address(signingPublicKey) {
+        throw ACEError.invalidRegistration("signing.address does not match signing.signingPublicKey")
     }
+    return RegistrationKeys(signingPublicKey: signingPublicKey, encryptionPublicKey: encryptionPublicKey)
 }
 
 /// Verify that a registration file's ACE ID matches its signing key.
@@ -90,6 +74,9 @@ public func verifyRegistrationId(_ reg: RegistrationFile) throws -> Bool {
 public func getRegistrationSigningPublicKey(_ reg: RegistrationFile) throws -> Data {
     if reg.signing.scheme == .ed25519 {
         let addressPubKey = try Base58.decode(reg.signing.address)
+        guard addressPubKey.count == 32 else {
+            throw ACEError.invalidRegistration("ed25519 signing.address must decode to 32 bytes")
+        }
         if let sigPubB64 = reg.signing.signingPublicKey, !sigPubB64.isEmpty {
             let signingPubKeyBytes = try ACEBase64.decode(sigPubB64)
             guard constantTimeEqual(addressPubKey, signingPubKeyBytes) else {
@@ -101,22 +88,16 @@ public func getRegistrationSigningPublicKey(_ reg: RegistrationFile) throws -> D
     if let sigPubB64 = reg.signing.signingPublicKey, !sigPubB64.isEmpty {
         return try ACEBase64.decode(sigPubB64)
     }
-    throw ACEError.invalidRegistration("Cannot derive signing public key from registration file")
+    throw ACEError.invalidRegistration("\(reg.signing.scheme.rawValue) scheme requires signing.signingPublicKey")
 }
 
 /// Extract the X-Wing encryption public key (1216 bytes) from a validated registration file.
 public func getRegistrationEncryptionPublicKey(_ reg: RegistrationFile) throws -> Data {
-    try decodeEncryptionPublicKey(reg.signing.encryptionPublicKey, field: "signing.encryptionPublicKey")
-}
-
-/// Decode a Base64 X-Wing public key carried in a registration file or peer
-/// response. `ACEEncryption` owns the length rule; this only re-labels its
-/// `invalidKey` as `invalidRegistration` for the named field.
-private func decodeEncryptionPublicKey(_ base64: String, field: String) throws -> Data {
+    // `ACEEncryption` owns the length rule; re-label its error for this field.
     do {
-        return try ACEEncryption.decodePublicKey(base64: base64)
+        return try ACEEncryption.decodePublicKey(base64: reg.signing.encryptionPublicKey)
     } catch ACEError.invalidKey(let reason) {
-        throw ACEError.invalidRegistration("\(field): \(reason)")
+        throw ACEError.invalidRegistration("signing.encryptionPublicKey: \(reason)")
     }
 }
 
@@ -178,16 +159,34 @@ public func verifyEncryptionKeyBinding(
     timestamp: Int,
     signature: String
 ) -> Bool {
-    guard timestamp >= 0 else { return false }
+    verifyBinding(
+        aceId: aceId, scheme: scheme,
+        encryptionPublicKey: encryptionPublicKey, signingPublicKey: signingPublicKey,
+        timestamp: timestamp, signature: signature
+    ) != nil
+}
+
+/// `verifyEncryptionKeyBinding`, returning the decoded keys on success.
+private func verifyBinding(
+    aceId: String,
+    scheme: SigningScheme,
+    encryptionPublicKey: String,
+    signingPublicKey: String,
+    timestamp: Int,
+    signature: String
+) -> RegistrationKeys? {
+    guard timestamp >= 0 else { return nil }
     // The bound key must be a well-formed X-Wing public key.
-    guard (try? ACEEncryption.decodePublicKey(base64: encryptionPublicKey)) != nil else { return false }
-    guard let signingPubBytes = try? ACEBase64.decode(signingPublicKey) else { return false }
+    guard let encryptionPubBytes = try? ACEEncryption.decodePublicKey(base64: encryptionPublicKey) else { return nil }
+    guard let signingPubBytes = try? ACEBase64.decode(signingPublicKey) else { return nil }
     // The signing key must be the one that defines this identity.
-    guard computeACEId(signingPubBytes) == aceId else { return false }
+    guard computeACEId(signingPubBytes) == aceId else { return nil }
     let payload = ACESigning.encodePayload([.string(encryptionPublicKey), .string(signingPublicKey)])
     let signData = ACESigning.buildSignData(action: "register", aceId: aceId, timestamp: timestamp, payload: payload)
-    guard let sigBytes = try? ACESigning.decodeSignature(signature, scheme: scheme) else { return false }
-    return ACESigning.verifySignature(signData: signData, signature: sigBytes, scheme: scheme, signingPublicKey: signingPubBytes)
+    guard let sigBytes = try? ACESigning.decodeSignature(signature, scheme: scheme),
+          ACESigning.verifySignature(signData: signData, signature: sigBytes, scheme: scheme, signingPublicKey: signingPubBytes)
+    else { return nil }
+    return RegistrationKeys(signingPublicKey: signingPubBytes, encryptionPublicKey: encryptionPubBytes)
 }
 
 /// Build a ``VerifiedPeer`` from a relay `GET /v1/peer` or `/v1/discover` entry.
@@ -206,7 +205,7 @@ public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer
             "its own X-Wing key and read messages meant to be end-to-end encrypted."
         )
     }
-    guard verifyEncryptionKeyBinding(
+    guard let keys = verifyBinding(
         aceId: data.aceId, scheme: data.scheme,
         encryptionPublicKey: data.encryptionPublicKey, signingPublicKey: data.signingPublicKey,
         timestamp: registeredAt, signature: signature
@@ -216,13 +215,22 @@ public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer
             "X-Wing key signed by this identity's signing key (possible key substitution / relay MITM)."
         )
     }
-    // The binding check already validated both keys; decode them once for the caller.
     return VerifiedPeer(
         aceId: data.aceId,
         scheme: data.scheme,
-        signingPublicKey: try ACEBase64.decode(data.signingPublicKey),
-        encryptionPublicKey: try decodeEncryptionPublicKey(data.encryptionPublicKey, field: "Peer encryptionPublicKey")
+        signingPublicKey: keys.signingPublicKey,
+        encryptionPublicKey: keys.encryptionPublicKey
     )
+}
+
+// MARK: - URL Validation
+
+/// Absolute URL with scheme `https` (case-insensitive) and a non-empty host.
+/// SSRF host checks belong to the fetcher (`fetchRegistrationFile`), not here.
+private func isHTTPSURL(_ string: String) -> Bool {
+    guard let url = URL(string: string), url.scheme?.lowercased() == "https",
+          let host = url.host, !host.isEmpty else { return false }
+    return true
 }
 
 // MARK: - URL Host Validation
@@ -242,8 +250,7 @@ func validateURLHost(_ host: String) throws {
     }
 
     // Block IPv4 literals (any dotted decimal)
-    let range = NSRange(host.startIndex..., in: host)
-    if ipv4Pattern.firstMatch(in: host, range: range) != nil {
+    if ipv4Pattern.fullMatch(host) {
         throw ACEError.invalidRegistration("URL host must not be an IP address: '\(String(host.prefix(100)))'")
     }
 
@@ -273,8 +280,7 @@ public func fetchRegistrationFile(
     timeout: TimeInterval = defaultRegistrationFetchTimeout,
     maxBytes: Int = defaultMaxRegistrationBytes
 ) async throws -> RegistrationFile {
-    let range = NSRange(domain.startIndex..., in: domain)
-    guard validDomainPattern.firstMatch(in: domain, range: range) != nil else {
+    guard validDomainPattern.fullMatch(domain) else {
         throw ACEError.invalidRegistration("Invalid domain: '\(String(domain.prefix(100)))'")
     }
     // Block reserved/private domains to prevent SSRF via DNS rebinding
@@ -332,8 +338,8 @@ public func fetchRegistrationFile(
         throw ACEError.invalidRegistration("Failed to parse registration JSON: \(error)")
     }
 
-    try validateRegistrationFile(reg)
-    guard try verifyRegistrationId(reg) else {
+    let keys = try validateRegistrationFile(reg)
+    guard computeACEId(keys.signingPublicKey) == reg.id else {
         throw ACEError.invalidRegistration("Registration ACE ID does not match signing key")
     }
 
@@ -343,6 +349,7 @@ public func fetchRegistrationFile(
 // MARK: - Profile Validation
 
 private let tagPattern = try! NSRegularExpression(pattern: "^[a-z0-9][a-z0-9-]*$")
+private let caip2Pattern = try! NSRegularExpression(pattern: "^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$")
 private let controlCharPattern = try! NSRegularExpression(pattern: "[\\x00-\\x1f\\x7f]")
 
 private func validateTagLikeArray(_ items: [String], fieldName: String, maxCount: Int) throws {
@@ -350,8 +357,7 @@ private func validateTagLikeArray(_ items: [String], fieldName: String, maxCount
         throw ACEError.invalidRegistration("Invalid profile: \(fieldName) must have at most \(maxCount) items")
     }
     for item in items {
-        let range = NSRange(item.startIndex..., in: item)
-        guard item.count <= 32, tagPattern.firstMatch(in: item, range: range) != nil else {
+        guard item.unicodeScalars.count <= 32, tagPattern.fullMatch(item) else {
             throw ACEError.invalidRegistration("Invalid profile: each \(fieldName.dropLast(1)) must be 1-32 lowercase alphanumeric chars or hyphens (\(fieldName))")
         }
     }
@@ -359,7 +365,7 @@ private func validateTagLikeArray(_ items: [String], fieldName: String, maxCount
 
 public func validateProfile(_ profile: AgentProfile) throws {
     if let name = profile.name {
-        guard !name.isEmpty, name.count <= 64 else {
+        guard !name.isEmpty, name.unicodeScalars.count <= 64 else {
             throw ACEError.invalidRegistration("Invalid profile: name must be 1-64 characters")
         }
         let nameRange = NSRange(name.startIndex..., in: name)
@@ -369,7 +375,7 @@ public func validateProfile(_ profile: AgentProfile) throws {
     }
 
     if let description = profile.description {
-        guard description.count <= 256 else {
+        guard description.unicodeScalars.count <= 256 else {
             throw ACEError.invalidRegistration("Invalid profile: description must be at most 256 characters")
         }
         let range = NSRange(description.startIndex..., in: description)
@@ -379,18 +385,12 @@ public func validateProfile(_ profile: AgentProfile) throws {
     }
 
     if let image = profile.image {
-        guard image.count <= 512 else {
+        guard image.unicodeScalars.count <= 512 else {
             throw ACEError.invalidRegistration("Invalid profile: image must be at most 512 characters")
         }
-        guard
-            let url = URL(string: image),
-            url.scheme == "https",
-            let host = url.host,
-            !host.isEmpty
-        else {
+        guard isHTTPSURL(image) else {
             throw ACEError.invalidRegistration("Invalid profile: image must be a valid HTTPS URL (image)")
         }
-        try validateURLHost(host)
     }
 
     if let tags = profile.tags {
@@ -406,26 +406,16 @@ public func validateProfile(_ profile: AgentProfile) throws {
             throw ACEError.invalidRegistration("Invalid profile: chains must have at most 10 items")
         }
         for chain in chains {
-            guard chain.contains(":") else {
+            guard caip2Pattern.fullMatch(chain) else {
                 throw ACEError.invalidRegistration("Invalid profile: each chain must be a CAIP-2 identifier (chains)")
-            }
-            let parts = chain.split(separator: ":", maxSplits: 1)
-            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
-                throw ACEError.invalidRegistration("Invalid profile: each chain must have non-empty namespace and reference (chains)")
             }
         }
     }
 
     if let endpoint = profile.endpoint {
-        guard
-            let url = URL(string: endpoint),
-            url.scheme == "https",
-            let host = url.host,
-            !host.isEmpty
-        else {
+        guard isHTTPSURL(endpoint) else {
             throw ACEError.invalidRegistration("Invalid profile: endpoint must be a valid HTTPS URL (endpoint)")
         }
-        try validateURLHost(host)
     }
 
     if let pricing = profile.pricing {

@@ -55,6 +55,11 @@ struct DiscoveryTests {
             #expect(!validateACEId(invalidId))
         }
 
+        @Test("rejects trailing newline (full match)")
+        func trailingNewline() {
+            #expect(!validateACEId("ace:sha256:" + String(repeating: "a", count: 64) + "\n"))
+        }
+
         @Test("rejects empty string")
         func emptyString() {
             #expect(!validateACEId(""))
@@ -87,6 +92,14 @@ struct DiscoveryTests {
                 endpoint: "https://agent.example.com"
             )
             try validateRegistrationFile(reg)
+        }
+
+        @Test("returns the decoded signing and X-Wing encryption keys", arguments: [SigningScheme.ed25519, .secp256k1])
+        func returnsKeys(scheme: SigningScheme) throws {
+            let identity = try SoftwareIdentity.generate(scheme: scheme)
+            let keys = try validateRegistrationFile(identity.toRegistrationFile(name: "A", endpoint: "https://a.example.com"))
+            #expect(keys.signingPublicKey == identity.getSigningPublicKey())
+            #expect(keys.encryptionPublicKey == identity.getEncryptionPublicKey())
         }
 
         @Test("rejects invalid ACE version")
@@ -131,6 +144,19 @@ struct DiscoveryTests {
 
             #expect(throws: ACEError.self) {
                 try validateRegistrationFile(badReg)
+            }
+        }
+
+        @Test("endpoint: https scheme is case-insensitive; host SSRF checks are left to the fetcher")
+        func endpointRule() throws {
+            let identity = try SoftwareIdentity.generate(scheme: .ed25519)
+            for endpoint in ["HTTPS://agent.example.com", "https://127.0.0.1:8443/ace", "https://localhost/ace"] {
+                try validateRegistrationFile(identity.toRegistrationFile(name: "A", endpoint: endpoint))
+            }
+            for endpoint in ["http://agent.example.com", "https://", "agent.example.com"] {
+                #expect(throws: ACEError.self) {
+                    try validateRegistrationFile(identity.toRegistrationFile(name: "A", endpoint: endpoint))
+                }
             }
         }
 

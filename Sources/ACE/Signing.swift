@@ -169,7 +169,7 @@ public enum ACESigning {
 
             // Recover public key from signature + signData hash
             let digest = HashDigest([UInt8](signData))
-            let recoveredPub = try P256K.Recovery.PublicKey(
+            let recoveredPub = P256K.Recovery.PublicKey(
                 digest,
                 signature: recoverableSig
             )
