@@ -28,7 +28,7 @@ public func validateMessageId(_ messageId: String) throws {
 
 /// Check that a timestamp is within the 5-minute freshness window.
 /// Rejects messages with |now - timestamp| > 5 minutes.
-public func checkTimestampFreshness(_ timestamp: Int, now: Int? = nil) throws {
+public func checkTimestampFreshness(_ timestamp: Int, now: Int? = nil, oldestTimestamp: Int? = nil) throws {
     guard timestamp >= 0 else {
         throw ACEError.timestampNotFresh(Int.max)
     }
@@ -36,7 +36,10 @@ public func checkTimestampFreshness(_ timestamp: Int, now: Int? = nil) throws {
     let (lowerBound, lowerOverflow) = now.subtractingReportingOverflow(maxDriftSeconds)
     let (upperBound, upperOverflow) = now.addingReportingOverflow(maxDriftSeconds)
 
-    let isTooOld = !lowerOverflow && timestamp < lowerBound
+    if let oldestTimestamp, oldestTimestamp < 0 || oldestTimestamp > now {
+        throw ACEError.invalidMessage("Invalid offline timestamp floor")
+    }
+    let isTooOld = oldestTimestamp.map { timestamp < $0 } ?? (!lowerOverflow && timestamp < lowerBound)
     let isTooNew = !upperOverflow && timestamp > upperBound
     if isTooOld || isTooNew {
         let drift: Int

@@ -82,12 +82,7 @@ struct InteropVectorsTests {
         let expectedBody: [String: String]
     }
 
-    private static let vectorsPath = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent()  // ACETests/
-        .deletingLastPathComponent()  // Tests/
-        .deletingLastPathComponent()  // sdk-swift/
-        .deletingLastPathComponent()  // ace-protocol/
-        .appendingPathComponent("spec/test-vectors.json")
+    private static let vectorsPath = Bundle.module.url(forResource: "test-vectors", withExtension: "json", subdirectory: "Fixtures")!
 
     private func loadVectors() throws -> Vectors {
         let data = try Data(contentsOf: Self.vectorsPath)

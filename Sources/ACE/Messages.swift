@@ -387,14 +387,16 @@ public struct ParseMessageOptions {
     public var expectedScheme: SigningScheme?
     public var replayDetector: ReplayDetector?
     public var senderEncryptionPubKey: Data?
-    public var currentTimestamp: Int?
+    var currentTimestamp: Int?
+    public var oldestTimestamp: Int?
 
-    public init(stateMachine: ThreadStateMachine, expectedScheme: SigningScheme? = nil, replayDetector: ReplayDetector? = nil, senderEncryptionPubKey: Data? = nil) {
+    public init(stateMachine: ThreadStateMachine, expectedScheme: SigningScheme? = nil, replayDetector: ReplayDetector? = nil, senderEncryptionPubKey: Data? = nil, oldestTimestamp: Int? = nil) {
         self.stateMachine = stateMachine
         self.expectedScheme = expectedScheme
         self.replayDetector = replayDetector
         self.senderEncryptionPubKey = senderEncryptionPubKey
         self.currentTimestamp = nil
+        self.oldestTimestamp = oldestTimestamp
     }
 }
 
@@ -465,7 +467,10 @@ public func parseMessage(
     }
 
     // 2. Timestamp freshness
-    try checkTimestampFreshness(msg.timestamp, now: opts.currentTimestamp)
+    try checkTimestampFreshness(msg.timestamp, now: opts.currentTimestamp, oldestTimestamp: opts.oldestTimestamp)
+    if opts.oldestTimestamp != nil && opts.replayDetector == nil {
+        throw ACEError.invalidMessage("Offline delivery requires a ReplayDetector")
+    }
 
     // 3. Replay detection
     // Economic messages REQUIRE replay detection — replaying payment/receipt
@@ -587,7 +592,8 @@ public func parseMessageFromRegistration(
     receiver: any ACEIdentity,
     senderRegistration: RegistrationFile,
     stateMachine: ThreadStateMachine,
-    replayDetector: ReplayDetector? = nil
+    replayDetector: ReplayDetector? = nil,
+    oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {
     try parseMessageFromRegistrationInternal(
         msg,
@@ -595,7 +601,8 @@ public func parseMessageFromRegistration(
         senderRegistration: senderRegistration,
         stateMachine: stateMachine,
         replayDetector: replayDetector,
-        currentTimestamp: nil
+        currentTimestamp: nil,
+        oldestTimestamp: oldestTimestamp
     )
 }
 
@@ -609,13 +616,15 @@ public func parseMessageFromPeer(
     receiver: any ACEIdentity,
     sender: VerifiedPeer,
     stateMachine: ThreadStateMachine,
-    replayDetector: ReplayDetector? = nil
+    replayDetector: ReplayDetector? = nil,
+    oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {
     let opts = ParseMessageOptions(
         stateMachine: stateMachine,
         expectedScheme: sender.scheme,
         replayDetector: replayDetector,
-        senderEncryptionPubKey: sender.encryptionPublicKey
+        senderEncryptionPubKey: sender.encryptionPublicKey,
+        oldestTimestamp: oldestTimestamp
     )
     return try parseMessage(msg, receiver: receiver, senderSigningPubKey: sender.signingPublicKey, opts: opts)
 }
@@ -626,7 +635,8 @@ func parseMessageFromRegistrationInternal(
     senderRegistration: RegistrationFile,
     stateMachine: ThreadStateMachine,
     replayDetector: ReplayDetector? = nil,
-    currentTimestamp: Int? = nil
+    currentTimestamp: Int? = nil,
+    oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {
     try validateRegistrationFile(senderRegistration)
     guard try verifyRegistrationId(senderRegistration) else {
@@ -640,7 +650,8 @@ func parseMessageFromRegistrationInternal(
         stateMachine: stateMachine,
         expectedScheme: senderRegistration.signing.scheme,
         replayDetector: replayDetector,
-        senderEncryptionPubKey: encryptionPubKey
+        senderEncryptionPubKey: encryptionPubKey,
+        oldestTimestamp: oldestTimestamp
     )
     opts.currentTimestamp = currentTimestamp
 

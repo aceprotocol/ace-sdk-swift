@@ -12,6 +12,7 @@ let package = Package(
         .package(url: "https://github.com/GigaBitcoin/secp256k1.swift", exact: "0.23.0"),
     ],
     targets: [
+        .executableTarget(name: "ACEQuickstart", dependencies: ["ACE"], path: "Examples/Quickstart"),
         .target(
             name: "ACE",
             dependencies: [
@@ -22,7 +23,8 @@ let package = Package(
         .testTarget(
             name: "ACETests",
             dependencies: ["ACE"],
-            path: "Tests/ACETests"
+            path: "Tests/ACETests",
+            resources: [.copy("Fixtures")]
         ),
     ]
 )
