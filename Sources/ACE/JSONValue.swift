@@ -105,7 +105,7 @@ public enum JSONValue: Sendable, Hashable {
 // MARK: - Literals
 
 extension JSONValue: ExpressibleByNilLiteral, ExpressibleByBooleanLiteral, ExpressibleByIntegerLiteral,
-    ExpressibleByFloatLiteral, ExpressibleByStringLiteral, ExpressibleByArrayLiteral, ExpressibleByDictionaryLiteral {
+    ExpressibleByFloatLiteral, ExpressibleByStringLiteral, ExpressibleByStringInterpolation, ExpressibleByArrayLiteral, ExpressibleByDictionaryLiteral {
     public init(nilLiteral: ()) { self = .null }
     public init(booleanLiteral value: Bool) { self = .bool(value) }
     public init(integerLiteral value: Int) { self = .number(Double(value)) }

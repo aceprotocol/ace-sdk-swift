@@ -440,3 +440,9 @@ struct DXTests {
         await bIn.close()
     }
 }
+
+@Test func jsonValueAcceptsStringInterpolation() throws {
+    let name = "bob"
+    let body: [String: JSONValue] = ["message": "hello \(name) ✓"]
+    #expect(body["message"]?.stringValue == "hello bob ✓")
+}
