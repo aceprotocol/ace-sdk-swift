@@ -24,6 +24,9 @@ public actor Outbox {
     private let store: any ACEStore
     private let clock: @Sendable () -> Int
     private let threads: ThreadStore
+    /// Thread of each economic pending send staged or found by this instance. Only a hint:
+    /// `find` checks the record and falls back to scanning every thread.
+    private var threadHints: [String: (conversationId: String, threadId: String)] = [:]
 
     /// Open the outbox. Under lock `threads`, thread records are repaired from `deliveries/`
     /// records whose snapshot strictly extends the stored history (divergence is
@@ -66,8 +69,17 @@ public actor Outbox {
             guard p.requestId == requestId else { throw storageError(key, "outbox record does not match its requestId") }
             return (p, nil)
         }
+        if let hint = threadHints[requestId],
+           let rec = try threads.load(conversationId: hint.conversationId, threadId: hint.threadId),
+           let p = rec.pending, p.requestId == requestId {
+            return (p, rec)
+        }
+        threadHints[requestId] = nil
         for rec in try threads.records() {
-            if let p = rec.pending, p.requestId == requestId { return (p, rec) }
+            if let p = rec.pending, p.requestId == requestId {
+                threadHints[requestId] = (rec.snapshot.conversationId, rec.snapshot.threadId)
+                return (p, rec)
+            }
         }
         return nil
     }
@@ -89,7 +101,8 @@ public actor Outbox {
         let rid = try requestId.map(Self.checkRequestId) ?? UUID().uuidString.lowercased()
         let local = identity.getACEId()
         return try store.withLock("threads") {
-            if let found = try find(rid) { return found.0 }
+            // A generated requestId is fresh, so only a caller-supplied one can already exist.
+            if requestId != nil, let found = try find(rid) { return found.0 }
             let now = clock()
             if type.isEconomic, let threadId {
                 let conversationId = try ACEEncryption.computeConversationId(
@@ -106,6 +119,7 @@ public actor Outbox {
                     throw ACEError(.storageFailed, "thread snapshot missing after createMessage")
                 }
                 try threads.write(StoredThread(snapshot: snap, pending: pending))
+                threadHints[rid] = (conversationId, threadId)
                 return pending
             }
             let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
@@ -140,6 +154,7 @@ public actor Outbox {
         try store.withLock("threads") {
             guard let (p, rec) = try find(rid), p.message.messageId == messageId else { return }
             let new = change(p)
+            if new == nil { threadHints[rid] = nil }
             if let rec {
                 try threads.write(StoredThread(snapshot: rec.snapshot, pending: new))
             } else if let new {
@@ -182,6 +197,7 @@ public actor Outbox {
         let rid = try Self.checkRequestId(requestId)
         try store.withLock("threads") {
             guard let (p, rec) = try find(rid) else { return }
+            threadHints[rid] = nil
             guard let rec else {
                 try store.checkedDelete(Self.outboxKey(rid))
                 return

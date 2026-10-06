@@ -196,6 +196,21 @@ struct PipelineTests {
         await bIn.close()
     }
 
+    @Test func outboxInstancesSharingAStoreSeeEachOthersSends() async throws {
+        let p = try await Pair()
+        let first = try await p.outbox(p.alice), second = try await p.outbox(p.alice)
+        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
+        // Staged by `first` (which remembers its thread), found by `second` only by scanning.
+        let staged = try await first.stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "t1")
+        #expect(try await second.stage(recipient: bobPeer, type: .rfq, body: ["need": "y"], threadId: "t2",
+                                       requestId: staged.requestId) == staged)
+        // `second` clears it; `first`'s remembered thread no longer holds it.
+        try await second.deliver(staged.requestId) { _ in }
+        await expectCodeAsync(.invalidArgument) { try await first.deliver(staged.requestId) { _ in } }
+        try await first.abandon(staged.requestId)
+        #expect(try await first.pending().isEmpty)
+    }
+
     @Test func quarantineAndDirectRules() async throws {
         let p = try await Pair()
         let sink = Sink()
