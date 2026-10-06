@@ -279,10 +279,10 @@ enum JSONWriter {
 
     private static func write(_ v: JValue, into out: inout [UInt8]) {
         switch v {
-        case .null: out.append(contentsOf: Array("null".utf8))
-        case .bool(let b): out.append(contentsOf: Array((b ? "true" : "false").utf8))
-        case .number(let lex): out.append(contentsOf: Array(lex.utf8))
-        case .string(let s): out.append(contentsOf: Array(jsonString(s).utf8))
+        case .null: out.append(contentsOf: "null".utf8)
+        case .bool(let b): out.append(contentsOf: (b ? "true" : "false").utf8)
+        case .number(let lex): out.append(contentsOf: lex.utf8)
+        case .string(let s): writeString(s, into: &out)
         case .array(let a):
             out.append(UInt8(ascii: "["))
             for (n, e) in a.enumerated() {
@@ -294,37 +294,36 @@ enum JSONWriter {
             out.append(UInt8(ascii: "{"))
             for (n, k) in o.keys.sorted(by: utf16Less).enumerated() {
                 if n > 0 { out.append(UInt8(ascii: ",")) }
-                out.append(contentsOf: Array(jsonString(k).utf8))
+                writeString(k, into: &out)
                 out.append(UInt8(ascii: ":"))
                 write(o[k]!, into: &out)
             }
             out.append(UInt8(ascii: "}"))
         }
     }
-}
 
-/// RFC 8785 string form: escapes `"`, `\` and controls only (`\b \f \n \r \t`, others `\u00xx`).
-func jsonString(_ s: String) -> String {
-    var out = "\""
-    for scalar in s.unicodeScalars {
-        switch scalar {
-        case "\"": out += "\\\""
-        case "\\": out += "\\\\"
-        case "\u{08}": out += "\\b"
-        case "\u{0C}": out += "\\f"
-        case "\n": out += "\\n"
-        case "\r": out += "\\r"
-        case "\t": out += "\\t"
-        default:
-            if scalar.value < 0x20 {
-                out += String(format: "\\u%04x", scalar.value)
-            } else {
-                out.unicodeScalars.append(scalar)
+    /// RFC 8785 string form: escapes `"`, `\` and controls only (`\b \f \n \r \t`, others
+    /// `\u00xx`). Escaping per UTF-8 byte matches escaping per scalar: multi-byte sequences
+    /// are all >= 0x80.
+    private static func writeString(_ s: String, into out: inout [UInt8]) {
+        out.append(UInt8(ascii: "\""))
+        for b in s.utf8 {
+            switch b {
+            case UInt8(ascii: "\""): out.append(contentsOf: [92, 34])
+            case UInt8(ascii: "\\"): out.append(contentsOf: [92, 92])
+            case 0x08: out.append(contentsOf: [92, UInt8(ascii: "b")])
+            case 0x0C: out.append(contentsOf: [92, UInt8(ascii: "f")])
+            case 0x0A: out.append(contentsOf: [92, UInt8(ascii: "n")])
+            case 0x0D: out.append(contentsOf: [92, UInt8(ascii: "r")])
+            case 0x09: out.append(contentsOf: [92, UInt8(ascii: "t")])
+            case ..<0x20: out.append(contentsOf: [92, UInt8(ascii: "u"), 48, 48, hexDigit(b >> 4), hexDigit(b & 0xF)])
+            default: out.append(b)
             }
         }
+        out.append(UInt8(ascii: "\""))
     }
-    out += "\""
-    return out
+
+    private static func hexDigit(_ n: UInt8) -> UInt8 { n < 10 ? 48 + n : 87 + n }
 }
 
 /// Key order by UTF-16 code units (RFC 8785); identical to code-point order for ASCII keys.
