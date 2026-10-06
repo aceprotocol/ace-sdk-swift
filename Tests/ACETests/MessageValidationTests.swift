@@ -301,7 +301,7 @@ struct MessageValidationTests {
                     msg,
                     receiver: bob,
                     senderSigningPubKey: mallory.getSigningPublicKey(),
-                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
             }
         }
@@ -425,11 +425,11 @@ struct MessageValidationTests {
     }
 
     // ============================================================
-    // Replay reservation lifecycle
+    // Replay commit rule
     // ============================================================
 
-    @Suite("replay reservation")
-    struct ReplayReservation {
+    @Suite("replay commit")
+    struct ReplayCommit {
 
         @Test("a validly signed message whose decryption fails still consumes the messageId")
         func decryptionFailureAfterValidSignatureConsumesMessageId() throws {
@@ -471,8 +471,8 @@ struct MessageValidationTests {
             }
         }
 
-        @Test("a failure before signature verification releases the reservation")
-        func preSignatureFailureReleasesReservation() throws {
+        @Test("a failure before signature verification leaves the seen store untouched")
+        func preSignatureFailureLeavesSeenStoreUntouched() throws {
             let alice = try SoftwareIdentity.generate(scheme: .ed25519)
             let bob = try SoftwareIdentity.generate(scheme: .ed25519)
             let msg = try createMessage(CreateMessageOptions(
@@ -498,7 +498,7 @@ struct MessageValidationTests {
                 )
             }
 
-            // Reservation released: the genuine message parses with the same detector.
+            // Not committed: the genuine message parses with the same detector.
             let parsed = try parseMessage(
                 msg, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
                 opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: detector)
@@ -548,7 +548,7 @@ struct MessageValidationTests {
             let err = #expect(throws: ACEError.self) {
                 try parseMessage(
                     bad, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
-                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
             }
             if case .invalidMessage(let text)? = err {

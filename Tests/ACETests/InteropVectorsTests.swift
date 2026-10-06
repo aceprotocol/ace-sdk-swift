@@ -250,11 +250,12 @@ struct InteropVectorsTests {
         #expect(envelope.conversationId == v.vectors.conversationId)
         #expect(try ACEBase64.decode(envelope.encryption.kemCiphertext).count == 1120)
 
-        // Vector timestamps are fixed; pin "now" to the envelope's timestamp.
+        // Vector timestamps are fixed; pin "now" to the envelope's timestamp and
+        // start the replay horizon below it.
         var opts = ParseMessageOptions(
             stateMachine: ThreadStateMachine(),
             expectedScheme: aliceV.scheme == "ed25519" ? .ed25519 : .secp256k1,
-            replayDetector: ReplayDetector(),
+            replayDetector: try ReplayDetector.fromExport(.init(horizon: 0, entries: [])),
             senderEncryptionPubKey: try ACEBase64.decode(aliceV.encryptionPublicKey)
         )
         opts.currentTimestamp = envelope.timestamp

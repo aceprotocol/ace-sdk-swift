@@ -325,7 +325,7 @@ public enum ACEError: Error, CustomStringConvertible {
         case .invalidMessage(let msg): return "Invalid message: \(msg)"
         case .invalidRegistration(let msg): return "Invalid registration: \(msg)"
         case .timestampNotFresh(let drift): return "Timestamp not fresh: drift \(drift)s exceeds max 300s"
-        case .replayDetected(let id): return "Replay detected: messageId '\(id)' already processed"
+        case .replayDetected(let id): return "Replay detected: messageId '\(id)' already processed or below replay horizon"
         case .payloadTooLarge(let size): return "Payload too large: \(size) bytes exceeds max \(ACEEncryption.maxPayloadSize)"
         case .invalidACEId(let id): return "Invalid ACE ID: '\(id)'"
         case .invalidTransition(let msg): return "Invalid transition: \(msg)"

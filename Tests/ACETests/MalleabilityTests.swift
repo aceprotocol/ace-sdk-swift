@@ -117,7 +117,7 @@ struct KEMCiphertextBindingTests {
         let err = #expect(throws: ACEError.self) {
             try parseMessage(
                 swapped, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
-                opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
             )
         }
         guard case .signatureVerificationFailed? = err else {
@@ -145,7 +145,7 @@ struct KEMCiphertextBindingTests {
         let err = #expect(throws: ACEError.self) {
             try parseMessage(
                 tampered, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
-                opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
             )
         }
         guard case .signatureVerificationFailed? = err else {

@@ -6,11 +6,11 @@
 //
 //  Security pipeline order (parseMessage):
 //    1. Envelope validation (cheap)
-//    2. Timestamp freshness (cheap, before expensive ops)
-//    3. Replay detection (atomic check-and-reserve; released on failures before
-//       signature verification, kept on any failure after it — an authentic
-//       message is one-shot regardless of outcome)
-//    4. Signature verification BEFORE decryption (prevents decryption oracle attacks)
+//    2. Timestamp freshness and replay horizon (cheap, before expensive ops)
+//    3. Replay check (messageId not in the seen store)
+//    4. Signature verification BEFORE decryption (prevents decryption oracle attacks),
+//       then atomic replay commit — kept on any later failure: an authentic
+//       message is one-shot regardless of outcome
 //    5. Decryption
 //    6. Body schema validation
 //
@@ -385,12 +385,13 @@ public func createMessage(_ opts: CreateMessageOptions) throws -> ACEMessage {
 public struct ParseMessageOptions {
     public var stateMachine: ThreadStateMachine
     public var expectedScheme: SigningScheme?
-    public var replayDetector: ReplayDetector?
+    public var replayDetector: ReplayDetector
     public var senderEncryptionPubKey: Data?
     var currentTimestamp: Int?
+    /// Offline acceptance floor; use the same value for every message of one backlog.
     public var oldestTimestamp: Int?
 
-    public init(stateMachine: ThreadStateMachine, expectedScheme: SigningScheme? = nil, replayDetector: ReplayDetector? = nil, senderEncryptionPubKey: Data? = nil, oldestTimestamp: Int? = nil) {
+    public init(stateMachine: ThreadStateMachine, expectedScheme: SigningScheme? = nil, replayDetector: ReplayDetector, senderEncryptionPubKey: Data? = nil, oldestTimestamp: Int? = nil) {
         self.stateMachine = stateMachine
         self.expectedScheme = expectedScheme
         self.replayDetector = replayDetector
@@ -406,9 +407,9 @@ public struct ParseMessageOptions {
 ///
 /// Security pipeline:
 /// 1. Envelope validation
-/// 2. Timestamp freshness check
-/// 3. Replay detection
-/// 4. Signature verification (BEFORE decryption)
+/// 2. Timestamp freshness and replay horizon
+/// 3. Replay check
+/// 4. Signature verification (BEFORE decryption), then replay commit
 /// 5. Decryption
 /// 6. Body schema validation
 public func parseMessage(
@@ -466,44 +467,11 @@ public func parseMessage(
         try validateThreadId(threadId)
     }
 
-    // 2. Timestamp freshness
+    // 2–3. Timestamp freshness, replay horizon and seen check
     let now = opts.currentTimestamp ?? Int(Date().timeIntervalSince1970)
     try checkTimestampFreshness(msg.timestamp, now: now, oldestTimestamp: opts.oldestTimestamp)
-    if let oldestTimestamp = opts.oldestTimestamp {
-        guard let detector = opts.replayDetector else {
-            throw ACEError.invalidMessage("Offline delivery requires a ReplayDetector")
-        }
-        // The detector must remember a messageId for as long as its timestamp stays
-        // acceptable; otherwise an accepted message is evicted after the TTL and can
-        // be replayed while it is still above the floor.
-        let (span, overflow) = (now - oldestTimestamp).addingReportingOverflow(maxDriftSeconds)
-        guard !overflow, detector.retentionSeconds >= span else {
-            throw ACEError.invalidMessage("ReplayDetector ttlSeconds must cover the offline window (>= \(overflow ? Int.max : span)s)")
-        }
-    }
-
-    // 3. Replay detection
-    // Economic messages REQUIRE replay detection — replaying payment/receipt
-    // messages could cause double-crediting or duplicate fulfillment.
-    if isEconomic && opts.replayDetector == nil {
-        throw ACEError.invalidMessage("Economic message type '\(msg.type.rawValue)' requires a ReplayDetector for security")
-    }
-    if let detector = opts.replayDetector {
-        guard detector.checkAndReserve(msg.messageId) else {
-            throw ACEError.replayDetected(msg.messageId)
-        }
-    }
-
-    // Cross-SDK rule: release the reservation only when the message fails BEFORE
-    // signature verification. Once the signature has verified, the messageId stays
-    // consumed on ANY later failure (decrypt, body schema, state machine) — otherwise
-    // a captured authentic message rejected by the state machine could be replayed
-    // later when the state allows it.
-    var releaseReservationOnError = opts.replayDetector != nil
-    defer {
-        if releaseReservationOnError {
-            opts.replayDetector?.release(msg.messageId)
-        }
+    guard opts.replayDetector.accepts(msg.messageId, timestamp: msg.timestamp) else {
+        throw ACEError.replayDetected(msg.messageId)
     }
 
     // 4. Signature verification BEFORE decryption
@@ -550,8 +518,11 @@ public func parseMessage(
         throw ACEError.signatureVerificationFailed("Signature verification failed")
     }
 
-    // Signature verified — the messageId is now permanently consumed.
-    releaseReservationOnError = false
+    // Commit now: an authentic message is one-shot, even if a later step fails.
+    let floor = opts.oldestTimestamp ?? now - maxDriftSeconds
+    guard opts.replayDetector.commit(msg.messageId, timestamp: msg.timestamp, floor: floor) else {
+        throw ACEError.replayDetected(msg.messageId)
+    }
 
     // 5. Decrypt body — kemCiphertext was decoded, length-checked and signature-verified above.
     let decrypted = try receiver.decrypt(
@@ -602,7 +573,7 @@ public func parseMessageFromRegistration(
     receiver: any ACEIdentity,
     senderRegistration: RegistrationFile,
     stateMachine: ThreadStateMachine,
-    replayDetector: ReplayDetector? = nil,
+    replayDetector: ReplayDetector,
     oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {
     try parseMessageFromRegistrationInternal(
@@ -626,7 +597,7 @@ public func parseMessageFromPeer(
     receiver: any ACEIdentity,
     sender: VerifiedPeer,
     stateMachine: ThreadStateMachine,
-    replayDetector: ReplayDetector? = nil,
+    replayDetector: ReplayDetector,
     oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {
     let opts = ParseMessageOptions(
@@ -644,7 +615,7 @@ func parseMessageFromRegistrationInternal(
     receiver: any ACEIdentity,
     senderRegistration: RegistrationFile,
     stateMachine: ThreadStateMachine,
-    replayDetector: ReplayDetector? = nil,
+    replayDetector: ReplayDetector,
     currentTimestamp: Int? = nil,
     oldestTimestamp: Int? = nil
 ) throws -> ParsedMessage {

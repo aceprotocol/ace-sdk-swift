@@ -56,161 +56,143 @@ public func checkTimestampFreshness(_ timestamp: Int, now: Int? = nil, oldestTim
 
 // MARK: - Replay Detector
 
-/// In-memory replay detector with TTL-based eviction.
-///
-/// Messages are evicted after `ttlSeconds` (default: matches the freshness
-/// window of 300 s).  A hard `capacity` cap prevents unbounded memory growth
-/// under burst traffic — when reached, the oldest entry is evicted regardless
-/// of TTL.
-///
-/// Thread-safe via NSLock (matches Python SDK's threading.Lock).
-///
-/// Callers SHOULD persist state via `export()` / `fromExport()` across
-/// restarts to avoid a replay window during the freshness period after restart.
-public final class ReplayDetector: @unchecked Sendable {
-    private var seen: TimedOrderedSet
-    private let capacity: Int
-    private let ttlSeconds: TimeInterval
-    private let lock = NSLock()
+/// Persisted state of a ``ReplayDetector``.
+public struct ReplayDetectorExport: Codable, Equatable, Sendable {
+    public struct Entry: Codable, Equatable, Sendable {
+        public let messageId: String
+        /// Signed envelope timestamp.
+        public let timestamp: Int
 
-    public init(capacity: Int = 100_000, ttlSeconds: Int = maxDriftSeconds) {
-        self.capacity = capacity
-        self.ttlSeconds = TimeInterval(ttlSeconds)
-        self.seen = TimedOrderedSet(capacity: capacity)
-    }
-
-    var retentionSeconds: Int { Int(ttlSeconds) }
-
-    /// Remove entries older than TTL. Caller must hold lock.
-    private func evictExpired() {
-        let cutoff = ProcessInfo.processInfo.systemUptime - ttlSeconds
-        seen.evictBefore(cutoff)
-    }
-
-    /// Atomically check if a messageId has been seen and reserve it.
-    /// Returns true if new (accepted), false if duplicate (rejected).
-    public func checkAndReserve(_ messageId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        evictExpired()
-
-        if seen.contains(messageId) {
-            return false
+        public init(messageId: String, timestamp: Int) {
+            self.messageId = messageId
+            self.timestamp = timestamp
         }
-
-        // Hard capacity cap — evict oldest regardless of TTL
-        if seen.count >= capacity {
-            seen.removeFirst()
-        }
-
-        seen.insert(messageId, at: ProcessInfo.processInfo.systemUptime)
-        return true
     }
 
-    /// Check if a messageId has been seen (without reserving).
-    public func hasSeen(_ messageId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        evictExpired()
-        return seen.contains(messageId)
-    }
+    /// Messages with `timestamp <= horizon` are rejected.
+    public let horizon: Int
+    public let entries: [Entry]
 
-    /// Release a previously reserved message ID after processing failure.
-    public func release(_ messageId: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        seen.remove(messageId)
-    }
-
-    /// Export seen message IDs for persistence.
-    public func export() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        evictExpired()
-        return seen.elements
-    }
-
-    /// Import previously persisted seen message IDs.
-    public static func fromExport(_ messageIds: [String], capacity: Int = 100_000, ttlSeconds: Int = maxDriftSeconds) -> ReplayDetector {
-        let detector = ReplayDetector(capacity: capacity, ttlSeconds: ttlSeconds)
-        // Truncate to capacity — keep the most recent entries
-        let trimmed = messageIds.count > capacity
-            ? Array(messageIds.suffix(capacity))
-            : messageIds
-        let now = ProcessInfo.processInfo.systemUptime
-        for id in trimmed {
-            detector.seen.insert(id, at: now)
-        }
-        return detector
+    public init(horizon: Int, entries: [Entry]) {
+        self.horizon = horizon
+        self.entries = entries
     }
 }
 
-// MARK: - TimedOrderedSet (insertion-ordered with timestamps, O(1) lookup, TTL eviction)
+/// Seen store with a replay horizon (06-security § Replay Protection).
+///
+/// Holds `(messageId, timestamp)` for every message whose signature verified.
+/// Rejects any message with `timestamp <= horizon`, so an entry can be removed
+/// once the horizon covers it: only the smallest-timestamp entry is removed,
+/// and the horizon moves up to its timestamp. Removal happens when the entry
+/// falls below the acceptance floor or the store exceeds `capacity`.
+///
+/// Thread-safe via NSLock. Callers MUST persist state via `export()` /
+/// `fromExport()` across restarts.
+public final class ReplayDetector: @unchecked Sendable {
+    private let capacity: Int
+    private var ids: Set<String> = []
+    /// Min-heap ordered by timestamp.
+    private var heap: [ReplayDetectorExport.Entry] = []
+    private var _horizon: Int
+    private let lock = NSLock()
 
-/// Ordered set with timestamps — supports both TTL-based and FIFO eviction.
-/// Uses Set for O(1) lookup + ring buffer for insertion order + timestamps.
-private struct TimedOrderedSet {
-    private var lookup: Set<String>
-    private var buffer: [(id: String, timestamp: TimeInterval)]
-    private var head: Int = 0
-
-    init(capacity: Int) {
-        lookup = Set(minimumCapacity: capacity)
-        buffer = []
-        buffer.reserveCapacity(capacity)
+    public convenience init(capacity: Int = 100_000) {
+        self.init(capacity: capacity, horizon: Int(Date().timeIntervalSince1970) - maxDriftSeconds)
     }
 
-    var count: Int { lookup.count }
-
-    var elements: [String] {
-        buffer[head...].compactMap { lookup.contains($0.id) ? $0.id : nil }
+    init(capacity: Int, horizon: Int) {
+        precondition(capacity > 0, "ReplayDetector capacity must be positive")
+        self.capacity = capacity
+        self._horizon = horizon
     }
 
-    func contains(_ element: String) -> Bool {
-        lookup.contains(element)
+    public var horizon: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _horizon
     }
 
-    mutating func insert(_ element: String, at timestamp: TimeInterval) {
-        if lookup.insert(element).inserted {
-            buffer.append((id: element, timestamp: timestamp))
+    /// Pipeline steps 2–3: true if `timestamp` is above the horizon and `messageId` is unseen.
+    public func accepts(_ messageId: String, timestamp: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return acceptsLocked(messageId, timestamp: timestamp)
+    }
+
+    /// Pipeline step 4: record a message whose signature has verified.
+    /// Returns false if it is a duplicate or at/below the horizon.
+    /// `floor` is the acceptance floor (default `now - 5 min`).
+    public func commit(_ messageId: String, timestamp: Int, floor: Int? = nil) -> Bool {
+        let floor = floor ?? Int(Date().timeIntervalSince1970) - maxDriftSeconds
+        lock.lock()
+        defer { lock.unlock() }
+        guard acceptsLocked(messageId, timestamp: timestamp) else { return false }
+        ids.insert(messageId)
+        push(.init(messageId: messageId, timestamp: timestamp))
+        evict(below: floor)
+        return true
+    }
+
+    public func export() -> ReplayDetectorExport {
+        lock.lock()
+        defer { lock.unlock() }
+        return ReplayDetectorExport(horizon: _horizon, entries: heap)
+    }
+
+    public static func fromExport(_ data: ReplayDetectorExport, capacity: Int = 100_000) throws -> ReplayDetector {
+        guard data.horizon >= 0 else {
+            throw ACEError.invalidMessage("fromExport: invalid replay state")
         }
-    }
-
-    mutating func remove(_ element: String) {
-        lookup.remove(element)
-        compactIfNeeded()
-    }
-
-    mutating func removeFirst() {
-        while head < buffer.count {
-            let element = buffer[head].id
-            head += 1
-            if lookup.remove(element) != nil {
-                break
+        let detector = ReplayDetector(capacity: capacity, horizon: data.horizon)
+        for entry in data.entries {
+            try validateMessageId(entry.messageId)
+            guard entry.timestamp > data.horizon, detector.ids.insert(entry.messageId).inserted else {
+                throw ACEError.invalidMessage("fromExport: invalid entry")
             }
+            detector.push(entry)
         }
-        compactIfNeeded()
+        detector.evict(below: 0)
+        return detector
     }
 
-    /// Evict all entries with timestamp <= cutoff.
-    mutating func evictBefore(_ cutoff: TimeInterval) {
-        while head < buffer.count {
-            let entry = buffer[head]
-            if entry.timestamp <= cutoff {
-                head += 1
-                lookup.remove(entry.id)
-            } else {
-                break
-            }
-        }
-        compactIfNeeded()
+    private func acceptsLocked(_ messageId: String, timestamp: Int) -> Bool {
+        timestamp > _horizon && !ids.contains(messageId)
     }
 
-    private mutating func compactIfNeeded() {
-        if head > 1024 && head > buffer.count / 2 {
-            buffer = Array(buffer[head...])
-            head = 0
+    /// Remove smallest-timestamp entries while below `floor` or over capacity.
+    private func evict(below floor: Int) {
+        while let top = heap.first, top.timestamp < floor || heap.count > capacity {
+            pop()
+            ids.remove(top.messageId)
+            _horizon = top.timestamp
+        }
+    }
+
+    private func push(_ entry: ReplayDetectorExport.Entry) {
+        heap.append(entry)
+        var i = heap.count - 1
+        while i > 0 {
+            let parent = (i - 1) / 2
+            if heap[parent].timestamp <= heap[i].timestamp { break }
+            heap.swapAt(parent, i)
+            i = parent
+        }
+    }
+
+    private func pop() {
+        let last = heap.removeLast()
+        guard !heap.isEmpty else { return }
+        heap[0] = last
+        var i = 0
+        while true {
+            let l = 2 * i + 1, r = l + 1
+            var min = i
+            if l < heap.count && heap[l].timestamp < heap[min].timestamp { min = l }
+            if r < heap.count && heap[r].timestamp < heap[min].timestamp { min = r }
+            if min == i { break }
+            heap.swapAt(min, i)
+            i = min
         }
     }
 }

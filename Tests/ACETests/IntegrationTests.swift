@@ -40,6 +40,7 @@ struct IntegrationTests {
             opts: ParseMessageOptions(
                 stateMachine: sm,
                 expectedScheme: .ed25519,
+                replayDetector: ReplayDetector(),
                 senderEncryptionPubKey: alice.getEncryptionPublicKey()
             )
         )
@@ -229,7 +230,7 @@ struct IntegrationTests {
         #expect(throws: ACEError.self) {
             _ = try parseMessage(
                 msg, receiver: eve, senderSigningPubKey: alice.getSigningPublicKey(),
-                opts: ParseMessageOptions(stateMachine: sm)
+                opts: ParseMessageOptions(stateMachine: sm, replayDetector: ReplayDetector())
             )
         }
     }
@@ -258,7 +259,8 @@ struct IntegrationTests {
             msg,
             receiver: receiver,
             senderRegistration: reg,
-            stateMachine: sm
+            stateMachine: sm,
+            replayDetector: ReplayDetector()
         )
 
         #expect(parsed.body["message"] as? String == "via registration")

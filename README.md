@@ -116,6 +116,7 @@ encryption key via a new registration file if that is a concern.
 
 ```swift
 let stateMachine = ThreadStateMachine()
+let replayDetector = ReplayDetector()
 
 // Create an encrypted, signed message
 let message = try createMessage(CreateMessageOptions(
@@ -133,9 +134,12 @@ let parsed = try parseMessage(
     message,
     receiver: recipientIdentity,
     senderSigningPubKey: senderSigningPub,
-    opts: ParseMessageOptions(stateMachine: stateMachine)
+    opts: ParseMessageOptions(stateMachine: stateMachine, replayDetector: replayDetector)
 )
 ```
+
+`replayDetector` is the seen store with a replay horizon; persist it across restarts with
+`export()` / `ReplayDetector.fromExport(_:)`.
 
 ### Verify Signatures
 

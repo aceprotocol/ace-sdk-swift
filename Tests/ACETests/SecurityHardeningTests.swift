@@ -18,103 +18,39 @@ struct SecurityHardeningTests {
 
     @Suite("ReplayDetector thread safety")
     struct ReplayDetectorConcurrency {
+        static let t = 1_800_000_000
 
-        @Test("handles multiple concurrent accesses without crash")
+        @Test("handles multiple concurrent commits without crash")
         func concurrentAccess() {
-            let detector = ReplayDetector(capacity: 10_000)
+            let detector = ReplayDetector(capacity: 10_000, horizon: Self.t - maxDriftSeconds)
             let iterations = 1000
 
             DispatchQueue.concurrentPerform(iterations: iterations) { i in
-                let id = "msg-\(i)"
-                _ = detector.checkAndReserve(id)
+                _ = detector.commit("msg-\(i)", timestamp: Self.t, floor: Self.t - maxDriftSeconds)
             }
 
-            // All should have been seen (no crash, no data corruption)
-            var seenCount = 0
-            for i in 0..<iterations {
-                if detector.hasSeen("msg-\(i)") {
-                    seenCount += 1
-                }
-            }
-            #expect(seenCount == iterations)
+            // All should have been committed (no crash, no data corruption)
+            let committed = (0..<iterations).filter { !detector.accepts("msg-\($0)", timestamp: Self.t) }
+            #expect(committed.count == iterations)
         }
 
-        @Test("concurrent check-and-reserve returns true exactly once per id")
-        func concurrentUniqueReservation() {
-            let detector = ReplayDetector(capacity: 10_000)
+        @Test("concurrent commit returns true exactly once per id")
+        func concurrentUniqueCommit() {
+            let detector = ReplayDetector(capacity: 10_000, horizon: Self.t - maxDriftSeconds)
             let id = "contested-msg"
             let iterations = 100
             var successCount = 0
             let lock = NSLock()
 
             DispatchQueue.concurrentPerform(iterations: iterations) { _ in
-                if detector.checkAndReserve(id) {
+                if detector.commit(id, timestamp: Self.t, floor: Self.t - maxDriftSeconds) {
                     lock.lock()
                     successCount += 1
                     lock.unlock()
                 }
             }
 
-            #expect(successCount == 1, "Only one thread should succeed in reserving")
-        }
-    }
-
-    // ============================================================
-    // ReplayDetector FIFO eviction
-    // ============================================================
-
-    @Suite("ReplayDetector FIFO eviction")
-    struct ReplayDetectorEviction {
-
-        @Test("evicts oldest entries at capacity")
-        func fifoEvictionAtCapacity() {
-            let capacity = 5
-            let detector = ReplayDetector(capacity: capacity)
-
-            // Fill to capacity
-            for i in 0..<capacity {
-                #expect(detector.checkAndReserve("msg-\(i)"))
-            }
-
-            // All should be seen
-            for i in 0..<capacity {
-                #expect(detector.hasSeen("msg-\(i)"))
-            }
-
-            // Add one more — oldest should be evicted
-            #expect(detector.checkAndReserve("msg-\(capacity)"))
-            #expect(!detector.hasSeen("msg-0"), "msg-0 should have been evicted")
-            #expect(detector.hasSeen("msg-1"), "msg-1 should still be present")
-
-            // msg-0 can now be reserved again since it was evicted
-            #expect(detector.checkAndReserve("msg-0"))
-        }
-
-        @Test("release followed by eviction works correctly")
-        func releaseAndEviction() {
-            let detector = ReplayDetector(capacity: 3)
-
-            _ = detector.checkAndReserve("a")
-            _ = detector.checkAndReserve("b")
-            _ = detector.checkAndReserve("c")
-
-            // Release "b" — it's removed from lookup but lazy in buffer
-            detector.release("b")
-            #expect(!detector.hasSeen("b"))
-
-            // count is now 2 (a, c). Add "d" brings count to 3 (= capacity), no eviction yet.
-            _ = detector.checkAndReserve("d")
-            #expect(detector.hasSeen("a"), "a should still be present (count was below capacity)")
-            #expect(detector.hasSeen("c"))
-            #expect(detector.hasSeen("d"))
-
-            // Now at capacity (3). Add "e" triggers eviction of oldest ("a").
-            // Buffer is [a, b(released), c, d]. removeFirst skips released "b" but removes "a".
-            _ = detector.checkAndReserve("e")
-            #expect(!detector.hasSeen("a"), "a should have been evicted")
-            #expect(detector.hasSeen("c"))
-            #expect(detector.hasSeen("d"))
-            #expect(detector.hasSeen("e"))
+            #expect(successCount == 1, "Only one thread should succeed in committing")
         }
     }
 
@@ -190,7 +126,7 @@ struct SecurityHardeningTests {
                     msg,
                     receiver: bob,
                     senderSigningPubKey: mallory.getSigningPublicKey(),
-                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
             }
         }
@@ -230,7 +166,7 @@ struct SecurityHardeningTests {
                     tampered,
                     receiver: bob,
                     senderSigningPubKey: alice.getSigningPublicKey(),
-                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
             }
         }
@@ -257,7 +193,7 @@ struct SecurityHardeningTests {
                     msg,
                     receiver: charlie,
                     senderSigningPubKey: alice.getSigningPublicKey(),
-                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
             }
         }
@@ -297,7 +233,7 @@ struct SecurityHardeningTests {
                     msg,
                     receiver: receiver,
                     senderSigningPubKey: sender.getSigningPublicKey(),
-                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: ReplayDetector())
                 )
             }
         }
