@@ -52,7 +52,7 @@ public struct PullResult: Sendable {
     /// `retryable` outcome); nil when drained or stopped by `maxPages`. The cursor stops
     /// before the blocking entry, so the next pull retries it.
     public let blocked: ACEError?
-    /// `maxPages` stopped the pull after a full page; more entries may be waiting.
+    /// `maxPages` (or task cancellation) stopped the pull early; more entries may be waiting.
     public let hasMore: Bool
 
     public init(outcomes: [ReceiveOutcome], blocked: ACEError?, hasMore: Bool = false) {
@@ -78,6 +78,7 @@ public actor Inbox {
     public typealias MessageHandler = @Sendable (ParsedMessage) async throws -> Void
 
     static let quarantineCap = 1000
+    static let followBuffer = 64
     static let quarantineKeep = 900
     static let sweepEvery = 1024
 
@@ -95,6 +96,9 @@ public actor Inbox {
     private var failed = false
     private var closed = false
     private var deliveredSinceSweep = 0
+    /// `quarantine/` record count, listed once and then maintained (this instance holds
+    /// the `receive` lock, so it is the only writer).
+    private var quarantineCount: Int?
     private var heldThreadsLock: (any ACEStoreLock)?
 
     /// Open the inbox: take the `receive` lock (`receiver_busy` if held), load or create
@@ -320,8 +324,12 @@ public actor Inbox {
         let existed = ((try? store.read(key)) ?? nil) != nil
         try store.checkedWrite(key, quarantineData(env, error: error, fingerprint: fp, at: clock()))
         if existed { return }
+        // O(1) per insert; the listing and the read of every record happen only when the
+        // cap is crossed, which then trims to `quarantineKeep` (once per 100 inserts).
+        let count = try quarantineCount.map { $0 + 1 } ?? store.checkedList("quarantine/").count
+        quarantineCount = count
+        guard count > Self.quarantineCap else { return }
         let keys = try store.checkedList("quarantine/")
-        guard keys.count > Self.quarantineCap else { return }
         var aged: [(Int, String, String)] = []
         for k in keys {
             let at = (try? store.readJSON(k))??["quarantinedAt"]?.wireInt ?? -1
@@ -329,6 +337,7 @@ public actor Inbox {
         }
         aged.sort { ($0.0, $0.1) < ($1.0, $1.1) }
         for entry in aged.prefix(aged.count - Self.quarantineKeep) { try store.checkedDelete(entry.2) }
+        quarantineCount = min(keys.count, Self.quarantineKeep)
     }
 
     /// Steps 4–5 for a stored pending delivery.
@@ -501,12 +510,15 @@ public actor Inbox {
     /// relay inbox is drained, a `retryable` outcome or fetch failure blocks it, or
     /// `maxPages` full pages were fetched (`hasMore`). Never throws: argument errors
     /// (`limit` outside 1…100, `maxPages` < 1) are reported in `blocked`.
+    ///
+    /// `outcomes` holds every entry fetched, so memory grows with the backlog; pass
+    /// `maxPages` to bound it (or use `follow`, which streams with backpressure).
     public func pull(_ relay: RelayClient, limit: Int = ACELimits.maxInboxPage, maxPages: Int? = nil) async -> PullResult {
         await pull(relay, limit: limit, maxPages: maxPages, yield: nil)
     }
 
     private func pull(_ relay: RelayClient, limit: Int, maxPages: Int?,
-                      yield: (@Sendable (ReceiveOutcome) -> Void)?) async -> PullResult {
+                      yield: (@Sendable (ReceiveOutcome) async -> Void)?) async -> PullResult {
         if let maxPages, maxPages < 1 {
             return PullResult(outcomes: [], blocked: ACEError(.invalidArgument, "maxPages must be >= 1"))
         }
@@ -522,10 +534,11 @@ public actor Inbox {
                 return PullResult(outcomes: outcomes, blocked: error as? ACEError ?? ACEError(.relayUnavailable, "\(error)"))
             }
             for entry in page.entries {
+                // A cancelled caller stops before the next entry; the cursor marks the spot.
+                if Task.isCancelled { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
                 let outcome = await receive(entry.envelope, source: .relay(url: relay.baseURLString, streamId: entry.streamId))
                 if case .retryable(let e) = outcome { return PullResult(outcomes: outcomes, blocked: e) }
-                outcomes.append(outcome)
-                yield?(outcome)
+                if let yield { await yield(outcome) } else { outcomes.append(outcome) }
             }
             if page.entries.count < limit { return PullResult(outcomes: outcomes, blocked: nil) }
         }
@@ -543,18 +556,22 @@ public actor Inbox {
     /// the stream's task and must not block. Outcomes may still be buffered in the stream
     /// when it is called. Cancelling the consuming task or dropping the stream closes the
     /// connection promptly.
+    ///
+    /// Backpressure: at most `followBuffer` (64) outcomes wait in the stream; while it is
+    /// full, receiving pauses (and so does reading the relay), so a slow consumer never
+    /// grows memory.
     public nonisolated func follow(_ relay: RelayClient, onLive: (@Sendable () -> Void)? = nil) -> AsyncThrowingStream<ReceiveOutcome, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(Self.followBuffer)) { continuation in
             let task = Task {
                 do {
                     let result = await self.pull(relay, limit: ACELimits.maxInboxPage, maxPages: nil,
-                                                 yield: { continuation.yield($0) })
+                                                 yield: { try? await continuation.yieldWaiting($0) })
                     if let blocked = result.blocked { throw blocked }
                     try Task.checkCancellation()
                     let events = relay.listen(self.identity, since: await self.cursor(for: relay), onConnect: onLive)
                     for try await event in events {
                         let outcome = await self.receive(event.envelope, source: .relay(url: relay.baseURLString, streamId: event.streamId))
-                        continuation.yield(outcome)
+                        try await continuation.yieldWaiting(outcome)
                         if case .retryable(let e) = outcome { throw e }
                     }
                     continuation.finish()
@@ -581,4 +598,23 @@ func compareStreamIds(_ a: String, _ b: String) -> Int {
         return x < y ? -1 : 1
     }
     return 0
+}
+
+extension AsyncThrowingStream.Continuation where Element: Sendable {
+    /// Yield on a `.bufferingOldest` stream, waiting while its buffer is full instead of
+    /// dropping. Throws `CancellationError` when the stream terminated or the task is
+    /// cancelled.
+    func yieldWaiting(_ value: Element) async throws {
+        var delay: UInt64 = 1_000_000
+        while true {
+            switch yield(value) {
+            case .enqueued: return
+            case .terminated: throw CancellationError()
+            case .dropped:
+                try await Task.sleep(nanoseconds: delay)
+                delay = min(delay * 2, 50_000_000)
+            @unknown default: return
+            }
+        }
+    }
 }

@@ -86,6 +86,8 @@ public actor RelayClient {
     static let maxConnectFailures = 10
     static let maxBackoffSeconds = 30.0
     static let idleTimeoutSeconds = 90.0
+    /// Events buffered for a slow consumer; when full, reading the socket pauses.
+    static let listenBuffer = 64
 
     /// `session` carries every request-response call. `listen` does not use it directly:
     /// it opens a dedicated session from a copy of `session.configuration` (same
@@ -261,6 +263,9 @@ public actor RelayClient {
     /// with the mapped error; a frame larger than `MAX_ENVELOPE_BYTES + 512` ends it with
     /// `relay_protocol_error`.
     ///
+    /// At most 64 events wait for the consumer; while the buffer is full the socket is not
+    /// read (TCP backpressure), so memory stays bounded.
+    ///
     /// `onConnect` is called each time a connection is established (HTTP 200,
     /// `text/event-stream`), before its first event. Cancelling the consuming task or
     /// dropping the stream cancels the HTTP request at once, also while the stream only
@@ -268,7 +273,7 @@ public actor RelayClient {
     /// described in `init`.
     public nonisolated func listen(_ identity: any ACEIdentity, since: String? = nil,
                                    onConnect: (@Sendable () -> Void)? = nil) -> AsyncThrowingStream<Event, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(Self.listenBuffer)) { continuation in
             let task = Task {
                 do {
                     try await self.runListen(identity, since: since, onConnect: onConnect, continuation)
@@ -381,7 +386,7 @@ public actor RelayClient {
                 guard let id = frame.id, isStreamCursor(id), !frame.data.isEmpty else { continue }
                 cursor = id
                 onProgress()
-                out.yield(Event(streamId: id, envelope: Data(frame.data), catchup: frame.event == "catchup"))
+                try await out.yieldWaiting(Event(streamId: id, envelope: Data(frame.data), catchup: frame.event == "catchup"))
             case "drain":
                 return
             default:

@@ -340,4 +340,62 @@ struct DXTests {
         let open = try store.readJSON(ThreadStore.indexKey(peerAceId: peer))!["open"]!.arrayValue!
         #expect(open.count == 2)
     }
+
+    // MARK: bounded resources
+
+    @Test func quarantineIsCappedWithoutListingOnEveryInsert() async throws {
+        final class CountingStore: ACEStore, @unchecked Sendable {
+            let inner = MemoryStore()
+            let lists = Locked(0)
+            func read(_ key: String) throws -> Data? { try inner.read(key) }
+            func write(_ key: String, _ value: Data) throws { try inner.write(key, value) }
+            func delete(_ key: String) throws { try inner.delete(key) }
+            func list(prefix: String) throws -> [String] {
+                if prefix == "quarantine/" { lists.mutate { $0 += 1 } }
+                return try inner.list(prefix: prefix)
+            }
+            func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock { try inner.lock(name, timeout: timeout) }
+        }
+        let store = CountingStore()
+        let p = try await Pair(bobStore: store)
+        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
+        let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "x"],
+                                    threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
+        let bIn = try await p.inbox(p.bob, Sink())
+        for n in 0..<(Inbox.quarantineCap + 1) {
+            // A fresh messageId under the old signature: invalid_signature, a new fingerprint.
+            let forged = ACEMessage(messageId: "00000000-0000-4000-8000-\(String(format: "%012d", n))", from: env.from, to: env.to,
+                                    conversationId: env.conversationId, type: env.type, timestamp: env.timestamp,
+                                    encryption: env.encryption, signature: env.signature)
+            let o = await bIn.receive(forged.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-\(n)"))
+            #expect(o.error == ACEError(.invalidSignature))
+        }
+        #expect(try store.list(prefix: "quarantine/").count == Inbox.quarantineKeep)
+        #expect(store.lists.value <= 3)  // the first insert, the trim, and this check
+        await bIn.close()
+    }
+
+    @Test func followAppliesBackpressure() async throws {
+        let p = try await Pair()
+        let fake = FakeRelay()
+        let relay = try makeRelay(fake.handle, clock: p.clock.fn)
+        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
+        let total = Inbox.followBuffer * 3
+        for i in 0..<total {
+            let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": .string("m\(i)")],
+                                        threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
+            _ = fake.enqueue(env)
+        }
+        let sink = Sink()
+        let bIn = try await p.inbox(p.bob, sink)
+        var iterator = bIn.follow(relay).makeAsyncIterator()
+        _ = try await iterator.next()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        // Receiving paused with the buffer full (plus the one being yielded).
+        #expect(sink.count <= Inbox.followBuffer + 3)
+        var seen = 1
+        while seen < total, try await iterator.next() != nil { seen += 1 }
+        #expect(seen == total && sink.count == total)
+        await bIn.close()
+    }
 }
