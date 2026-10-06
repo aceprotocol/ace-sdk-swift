@@ -1,27 +1,56 @@
 import ACE
 import Foundation
 
+// MARK: 1. Pure local: create and parse one message
+
 let alice = try SoftwareIdentity.generate(scheme: .ed25519)
 let bob = try SoftwareIdentity.generate(scheme: .ed25519)
-let message = try createMessage(CreateMessageOptions(
-    sender: alice,
-    recipientPubKey: bob.getEncryptionPublicKey(),
-    recipientACEId: bob.getACEId(),
-    type: .rfq,
-    body: ["need": "Translate 500 words EN→FR", "maxPrice": "10", "currency": "USDC"],
-    stateMachine: ThreadStateMachine(),
-    threadId: "translation-1"
-))
 
-// The keys are trusted here because both identities were created locally.
+// Keys are trusted here because both identities were created locally; in production a
+// VerifiedPeer comes from PeerStore / RelayClient / verifyRegistrationFile.
+let bobPeer = try verifyRegistrationFile(bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example/ace"))
+let alicePeer = try verifyRegistrationFile(alice.toRegistrationFile(name: "Alice", endpoint: "https://alice.example/ace"))
+
+let rfq = try createMessage(
+    sender: alice, recipient: bobPeer, type: .rfq,
+    body: ["need": "Translate 500 words EN→FR", "maxPrice": "10", "currency": "USDC"],
+    threads: ThreadStateMachine(localAceId: alice.getACEId()),
+    threadId: "translation-1"
+)
 let parsed = try parseMessage(
-    message, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
-    opts: ParseMessageOptions(
-        stateMachine: ThreadStateMachine(),
-        expectedScheme: alice.getSigningScheme(),
-        replayDetector: ReplayDetector(),
-        senderEncryptionPubKey: alice.getEncryptionPublicKey()
-    )
+    rfq, receiver: bob, sender: alicePeer,
+    threads: ThreadStateMachine(localAceId: bob.getACEId()),
+    replay: ReplayDetector()
 )
 precondition(parsed.body["need"] as? String == "Translate 500 words EN→FR")
-print(parsed.body)
+print("local:", parsed.type, parsed.body)
+
+// MARK: 2. Pipeline: Outbox → transport → Inbox, with durable state
+
+// Each agent keeps its state in an ACEStore (FileStore(directory:) on disk).
+let aliceStore = MemoryStore()
+let bobStore = MemoryStore()
+// With a relay: `let relay = try RelayClient(baseURL: URL(string: "https://relay.aceprotocol.org")!)`
+// and `PeerStore(store:relay:)`; peers are then resolved and pinned from the relay.
+let alicePeers = try PeerStore(store: aliceStore)
+let bobPeers = try PeerStore(store: bobStore)
+let bobPinned = try await alicePeers.pinRegistrationFile(bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example/ace"))
+try await bobPeers.pinRegistrationFile(alice.toRegistrationFile(name: "Alice", endpoint: "https://alice.example/ace"))
+
+// onMessage must persist the host effect idempotently, keyed by (from, messageId).
+let inbox = try await Inbox.open(identity: bob, store: bobStore, peers: bobPeers) { message in
+    print("bob received:", message.type, message.body)
+}
+let outbox = try await Outbox.open(identity: alice, store: aliceStore)
+
+let staged = try await outbox.stage(recipient: bobPinned, type: .rfq, body: ["need": "Summarize a PDF"], threadId: "job-42")
+// With a relay: `try await outbox.deliver(staged.requestId) { try await relay.send($0) }`
+// and on the receiving side `await inbox.pull(relay)` or `for try await o in inbox.follow(relay)`.
+try await outbox.deliver(staged.requestId) { envelope in
+    let outcome = await inbox.receive(envelope.jsonData(), source: .direct)
+    guard case .delivered = outcome else { throw outcome.error ?? ACEError(.relayRejected) }
+}
+let threads = try ThreadStore(store: bobStore, localAceId: bob.getACEId())
+let state = try threads.get(conversationId: staged.message.conversationId, threadId: "job-42")?.state
+print("bob's thread state:", state?.rawValue ?? "none")
+await inbox.close()

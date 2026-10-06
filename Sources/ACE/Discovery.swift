@@ -2,448 +2,533 @@
 //  Discovery.swift
 //  ACE SDK
 //
-//  Registration file validation and well-known URL fetching.
+//  Peers: relay peer records, registration files, well-known fetch, profiles.
 //
 
 import Foundation
 
-// MARK: - ACE ID Validation
+// MARK: - VerifiedPeer
 
-private let aceIdPattern = try! NSRegularExpression(
-    pattern: "^ace:sha256:[a-f0-9]{64}$"
-)
-
-/// Validate ACE ID format: ace:sha256:<64 hex chars>
-public func validateACEId(_ id: String) -> Bool {
-    aceIdPattern.fullMatch(id)
+/// Where a peer binding came from.
+public enum PeerSource: String, Codable, Sendable {
+    /// A relay `PeerRecord` with a verified `registrationSignature`.
+    case relay
+    /// A registration file (no signed timestamp; `registeredAt` is the pin time).
+    case registration
 }
 
-// MARK: - Registration File Validation
-
-/// Decoded public keys of a validated registration file.
-public struct RegistrationKeys: Sendable {
-    public let signingPublicKey: Data
-    public let encryptionPublicKey: Data
-}
-
-/// Validate a registration file has all required fields and correct format.
-/// Returns the decoded keys so callers need not decode them a second time.
-@discardableResult
-public func validateRegistrationFile(_ reg: RegistrationFile) throws -> RegistrationKeys {
-    guard reg.ace == "1.0" else {
-        throw ACEError.invalidRegistration("Invalid ace version: expected '1.0', got '\(reg.ace)'")
-    }
-    guard validateACEId(reg.id) else {
-        throw ACEError.invalidRegistration("Invalid or missing ACE id: '\(reg.id)'")
-    }
-    guard !reg.name.isEmpty else {
-        throw ACEError.invalidRegistration("Missing required field: name")
-    }
-    guard controlCharPattern.firstMatch(in: reg.name, range: NSRange(reg.name.startIndex..., in: reg.name)) == nil else {
-        throw ACEError.invalidRegistration("Registration name must not contain control characters")
-    }
-    guard isHTTPSURL(reg.endpoint) else {
-        throw ACEError.invalidRegistration("endpoint must be a valid HTTPS URL")
-    }
-    // IdentityTier enum enforces valid values (0, 1) at decode time
-    guard !reg.signing.address.isEmpty else {
-        throw ACEError.invalidRegistration("Missing required field: signing.address")
-    }
-    guard !reg.signing.encryptionPublicKey.isEmpty else {
-        throw ACEError.invalidRegistration("Missing required field: signing.encryptionPublicKey")
-    }
-    let encryptionPublicKey = try getRegistrationEncryptionPublicKey(reg)
-    let signingPublicKey = try getRegistrationSigningPublicKey(reg)
-    if reg.signing.scheme == .secp256k1, try reg.signing.address != secp256k1Address(signingPublicKey) {
-        throw ACEError.invalidRegistration("signing.address does not match signing.signingPublicKey")
-    }
-    return RegistrationKeys(signingPublicKey: signingPublicKey, encryptionPublicKey: encryptionPublicKey)
-}
-
-/// Verify that a registration file's ACE ID matches its signing key.
-public func verifyRegistrationId(_ reg: RegistrationFile) throws -> Bool {
-    let signingPubKeyBytes = try getRegistrationSigningPublicKey(reg)
-    let expectedId = computeACEId(signingPubKeyBytes)
-    guard reg.id == expectedId else { return false }
-
-    if reg.signing.scheme == .secp256k1 {
-        let derivedAddress = try secp256k1Address(signingPubKeyBytes)
-        return reg.signing.address == derivedAddress
-    }
-    return true
-}
-
-/// Extract the signing public key from a validated registration file.
-public func getRegistrationSigningPublicKey(_ reg: RegistrationFile) throws -> Data {
-    if reg.signing.scheme == .ed25519 {
-        let addressPubKey = try Base58.decode(reg.signing.address)
-        guard addressPubKey.count == 32 else {
-            throw ACEError.invalidRegistration("ed25519 signing.address must decode to 32 bytes")
-        }
-        if let sigPubB64 = reg.signing.signingPublicKey, !sigPubB64.isEmpty {
-            let signingPubKeyBytes = try ACEBase64.decode(sigPubB64)
-            guard constantTimeEqual(addressPubKey, signingPubKeyBytes) else {
-                throw ACEError.invalidRegistration("ed25519 signing.signingPublicKey does not match signing.address")
-            }
-        }
-        return addressPubKey
-    }
-    if let sigPubB64 = reg.signing.signingPublicKey, !sigPubB64.isEmpty {
-        return try ACEBase64.decode(sigPubB64)
-    }
-    throw ACEError.invalidRegistration("\(reg.signing.scheme.rawValue) scheme requires signing.signingPublicKey")
-}
-
-/// Extract the X-Wing encryption public key (1216 bytes) from a validated registration file.
-public func getRegistrationEncryptionPublicKey(_ reg: RegistrationFile) throws -> Data {
-    // `ACEEncryption` owns the length rule; re-label its error for this field.
-    do {
-        return try ACEEncryption.decodePublicKey(base64: reg.signing.encryptionPublicKey)
-    } catch ACEError.invalidKey(let reason) {
-        throw ACEError.invalidRegistration("signing.encryptionPublicKey: \(reason)")
-    }
-}
-
-// MARK: - Encryption-Key Binding (relay-sourced peer keys)
-//
-// `aceId` self-certifies only the SIGNING key (aceId == sha256(signingKey)). The
-// X-Wing ENCRYPTION key is separate — on its own an unauthenticated claim. A relay
-// routes ciphertext and is untrusted by design, so it could hand a client its own
-// X-Wing key and read messages the client believes are end-to-end encrypted. The
-// binding below is the proof that closes that gap: the exact signature the relay
-// already requires at registration, verifiable with the identity's signing key alone.
-
-/// A `GET /v1/peer` response or a `/v1/discover` agent entry.
-public struct RelayPeerResponse: Codable, Sendable {
+/// A peer whose keys were verified. Obtain only from `verifyPeerRecord`,
+/// `verifyRegistrationFile`, `verifyRegistrationRequest`, `PeerStore` or `RelayClient`.
+public struct VerifiedPeer: Sendable, Equatable {
     public let aceId: String
     public let scheme: SigningScheme
-    public let encryptionPublicKey: String
-    public let signingPublicKey: String
+    public let signingPublicKey: Data
+    public let encryptionPublicKey: Data
+    public let registeredAt: Int
+    /// The relay binding signature; `nil` for a registration-file peer.
     public let registrationSignature: String?
-    public let registeredAt: Int?
+    public let source: PeerSource
+    /// Discovery profile as served by the relay. **Unverified** metadata: it is
+    /// self-asserted and not covered by the binding signature. Never use it for trust decisions.
+    public let profile: AgentProfile?
 
-    public init(
-        aceId: String, scheme: SigningScheme,
-        encryptionPublicKey: String, signingPublicKey: String,
-        registrationSignature: String?, registeredAt: Int?
-    ) {
+    init(aceId: String, scheme: SigningScheme, signingPublicKey: Data, encryptionPublicKey: Data, registeredAt: Int,
+         registrationSignature: String?, source: PeerSource, profile: AgentProfile?) {
         self.aceId = aceId
         self.scheme = scheme
-        self.encryptionPublicKey = encryptionPublicKey
         self.signingPublicKey = signingPublicKey
-        self.registrationSignature = registrationSignature
+        self.encryptionPublicKey = encryptionPublicKey
         self.registeredAt = registeredAt
+        self.registrationSignature = registrationSignature
+        self.source = source
+        self.profile = profile
+    }
+
+    /// ed25519: Base58 of the signing key; secp256k1: EIP-55 address.
+    public var address: String {
+        signingAddress(scheme: scheme, signingPublicKey: signingPublicKey)
     }
 }
 
-/// A peer's public keys AFTER the identity + encryption-key binding are verified.
-/// Obtain ONLY via `verifyPeerResponse`; the memberwise initializer bypasses checks.
-public struct VerifiedPeer: Sendable {
-    public let registeredAt: Int
-    public let aceId: String
-    public let scheme: SigningScheme
-    public let signingPublicKey: Data
-    public let encryptionPublicKey: Data
+// MARK: - Strict JSON readers
+
+private func optString(_ o: [String: JValue], _ key: String, _ code: ACEError.Code, _ what: String) throws -> String? {
+    guard let v = o[key], !v.isNull else { return nil }
+    guard let s = v.stringValue else { throw ACEError(code, "\(what).\(key) must be a string") }
+    return s
 }
 
-/// Verify that `encryptionPublicKey` was authorized by `aceId`.
-///
-/// The binding is identical to what `POST /v1/register` signs:
-///   buildSignData("register", aceId, timestamp,
-///                 encodePayload(encryptionPublicKey, signingPublicKey))
-/// signed by the identity's signing key. This also re-checks
-/// `aceId == sha256(signingPublicKey)`, so `true` means this exact X-Wing key was
-/// signed by the key that defines this identity. Inputs MUST be the Base64 wire
-/// strings (the signature commits to those strings). Returns `false` on bad input.
-public func verifyEncryptionKeyBinding(
-    aceId: String,
-    scheme: SigningScheme,
-    encryptionPublicKey: String,
-    signingPublicKey: String,
-    timestamp: Int,
-    signature: String
-) -> Bool {
-    verifyBinding(
-        aceId: aceId, scheme: scheme,
-        encryptionPublicKey: encryptionPublicKey, signingPublicKey: signingPublicKey,
-        timestamp: timestamp, signature: signature
-    ) != nil
+private func reqString(_ o: [String: JValue], _ key: String, _ code: ACEError.Code, _ what: String) throws -> String {
+    guard let s = try optString(o, key, code, what) else { throw ACEError(code, "\(what).\(key) is required") }
+    return s
 }
 
-/// `verifyEncryptionKeyBinding`, returning the decoded keys on success.
-private func verifyBinding(
-    aceId: String,
-    scheme: SigningScheme,
-    encryptionPublicKey: String,
-    signingPublicKey: String,
-    timestamp: Int,
-    signature: String
-) -> RegistrationKeys? {
-    guard timestamp >= 0 else { return nil }
-    // The bound key must be a well-formed X-Wing public key.
-    guard let encryptionPubBytes = try? ACEEncryption.decodePublicKey(base64: encryptionPublicKey) else { return nil }
-    guard let signingPubBytes = try? ACEBase64.decode(signingPublicKey) else { return nil }
-    // The signing key must be the one that defines this identity.
-    guard computeACEId(signingPubBytes) == aceId else { return nil }
-    let payload = ACESigning.encodePayload([.string(encryptionPublicKey), .string(signingPublicKey)])
-    let signData = ACESigning.buildSignData(action: "register", aceId: aceId, timestamp: timestamp, payload: payload)
-    guard let sigBytes = try? ACESigning.decodeSignature(signature, scheme: scheme),
-          ACESigning.verifySignature(signData: signData, signature: sigBytes, scheme: scheme, signingPublicKey: signingPubBytes)
-    else { return nil }
-    return RegistrationKeys(signingPublicKey: signingPubBytes, encryptionPublicKey: encryptionPubBytes)
-}
-
-/// Build a ``VerifiedPeer`` from a relay `GET /v1/peer` or `/v1/discover` entry.
-///
-/// Throws if the binding signature is absent or fails — a relay that substitutes an
-/// X-Wing key cannot produce a passing binding, and neither can a key that is not a
-/// well-formed 1216-byte X-Wing public key. Use the keys with `parseMessageFromPeer`.
-public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer {
-    guard validateACEId(data.aceId) else {
-        throw ACEError.invalidRegistration("Invalid peer aceId: '\(String(data.aceId.prefix(80)))'")
+private func optStringList(_ o: [String: JValue], _ key: String, _ code: ACEError.Code, _ what: String) throws -> [String]? {
+    guard let v = o[key], !v.isNull else { return nil }
+    guard let a = v.arrayValue else { throw ACEError(code, "\(what).\(key) must be an array of strings") }
+    return try a.map {
+        guard let s = $0.stringValue else { throw ACEError(code, "\(what).\(key) must be an array of strings") }
+        return s
     }
-    guard let signature = data.registrationSignature, let registeredAt = data.registeredAt else {
-        throw ACEError.invalidRegistration(
-            "Peer response is missing the encryption-key binding (registrationSignature/registeredAt); " +
-            "its encryptionPublicKey cannot be trusted. Without the binding a relay could substitute " +
-            "its own X-Wing key and read messages meant to be end-to-end encrypted."
+}
+
+private func optObject(_ o: [String: JValue], _ key: String, _ code: ACEError.Code, _ what: String) throws -> [String: JValue]? {
+    guard let v = o[key], !v.isNull else { return nil }
+    guard let d = v.objectValue else { throw ACEError(code, "\(what).\(key) must be an object") }
+    return d
+}
+
+extension AgentProfile {
+    /// Parse the wire shape; type errors are `invalid_profile`. Unknown top-level fields
+    /// are dropped; `pricing` may contain only `currency` and `maxAmount`.
+    static func parse(_ v: JValue) throws -> AgentProfile {
+        let code = ACEError.Code.invalidProfile
+        guard let o = v.objectValue else { throw ACEError(code, "profile must be a JSON object") }
+        var pricing: ProfilePricing?
+        if let p = try optObject(o, "pricing", code, "profile") {
+            let extra = Set(p.keys).subtracting(["currency", "maxAmount"])
+            guard extra.isEmpty else { throw ACEError(code, "profile.pricing has unknown fields: \(extra.sorted().prefix(3))") }
+            pricing = ProfilePricing(
+                currency: try reqString(p, "currency", code, "profile.pricing"),
+                maxAmount: try optString(p, "maxAmount", code, "profile.pricing")
+            )
+        }
+        return AgentProfile(
+            name: try optString(o, "name", code, "profile"),
+            description: try optString(o, "description", code, "profile"),
+            image: try optString(o, "image", code, "profile"),
+            tags: try optStringList(o, "tags", code, "profile"),
+            capabilities: try optStringList(o, "capabilities", code, "profile"),
+            chains: try optStringList(o, "chains", code, "profile"),
+            endpoint: try optString(o, "endpoint", code, "profile"),
+            pricing: pricing
         )
     }
-    guard let keys = verifyBinding(
-        aceId: data.aceId, scheme: data.scheme,
-        encryptionPublicKey: data.encryptionPublicKey, signingPublicKey: data.signingPublicKey,
-        timestamp: registeredAt, signature: signature
-    ) else {
-        throw ACEError.signatureVerificationFailed(
-            "Peer encryption-key binding failed verification: the encryptionPublicKey is not a well-formed " +
-            "X-Wing key signed by this identity's signing key (possible key substitution / relay MITM)."
+
+    var jvalue: JValue {
+        var o: [String: JValue] = [:]
+        if let name { o["name"] = .string(name) }
+        if let description { o["description"] = .string(description) }
+        if let image { o["image"] = .string(image) }
+        if let tags { o["tags"] = .array(tags.map { .string($0) }) }
+        if let capabilities { o["capabilities"] = .array(capabilities.map { .string($0) }) }
+        if let chains { o["chains"] = .array(chains.map { .string($0) }) }
+        if let endpoint { o["endpoint"] = .string(endpoint) }
+        if let pricing {
+            var p: [String: JValue] = ["currency": .string(pricing.currency)]
+            if let m = pricing.maxAmount { p["maxAmount"] = .string(m) }
+            o["pricing"] = .object(p)
+        }
+        return .object(o)
+    }
+}
+
+extension RegistrationFile {
+    /// Parse the wire JSON shape; type errors are `invalid_registration`.
+    static func parse(_ v: JValue) throws -> RegistrationFile {
+        let code = ACEError.Code.invalidRegistration
+        guard let d = v.objectValue else { throw ACEError(code, "registration file must be a JSON object") }
+        guard let signing = try optObject(d, "signing", code, "registration") else {
+            throw ACEError(code, "registration.signing is required")
+        }
+        guard let tierValue = d["tier"]?.wireInt, let tier = IdentityTier(rawValue: tierValue) else {
+            throw ACEError(code, "registration.tier must be 0 or 1")
+        }
+        var capabilities: [Capability]?
+        if let v = d["capabilities"], !v.isNull {
+            guard let caps = v.arrayValue else { throw ACEError(code, "registration.capabilities must be an array") }
+            capabilities = try caps.map { c in
+                guard let c = c.objectValue else { throw ACEError(code, "registration.capabilities entries must be objects") }
+                var pricing: PricingInfo?
+                if let p = try optObject(c, "pricing", code, "capability") {
+                    pricing = PricingInfo(
+                        model: try reqString(p, "model", code, "capability.pricing"),
+                        amount: try reqString(p, "amount", code, "capability.pricing"),
+                        currency: try reqString(p, "currency", code, "capability.pricing")
+                    )
+                }
+                return Capability(
+                    id: try reqString(c, "id", code, "capability"),
+                    description: try reqString(c, "description", code, "capability"),
+                    input: try optString(c, "input", code, "capability"),
+                    output: try optString(c, "output", code, "capability"),
+                    pricing: pricing
+                )
+            }
+        }
+        var chains: [ChainInfo]?
+        if let v = d["chains"], !v.isNull {
+            guard let list = v.arrayValue else { throw ACEError(code, "registration.chains must be an array") }
+            chains = try list.map { c in
+                guard let c = c.objectValue else { throw ACEError(code, "registration.chains entries must be objects") }
+                return ChainInfo(network: try reqString(c, "network", code, "chain"), address: try reqString(c, "address", code, "chain"))
+            }
+        }
+        var hardwareBacking: HardwareBacking?
+        if let hb = try optString(d, "hardwareBacking", code, "registration") {
+            guard let parsed = HardwareBacking(rawValue: hb) else { throw ACEError(code, "registration.hardwareBacking is unknown") }
+            hardwareBacking = parsed
+        }
+        let schemeText = try reqString(signing, "scheme", code, "signing")
+        guard let scheme = SigningScheme(rawValue: schemeText) else { throw ACEError(code, "unsupported signing.scheme") }
+        return RegistrationFile(
+            ace: try reqString(d, "ace", code, "registration"),
+            id: try reqString(d, "id", code, "registration"),
+            name: try reqString(d, "name", code, "registration"),
+            description: try optString(d, "description", code, "registration"),
+            endpoint: try reqString(d, "endpoint", code, "registration"),
+            tier: tier,
+            hardwareBacking: hardwareBacking,
+            signing: SigningConfig(
+                scheme: scheme,
+                address: try reqString(signing, "address", code, "signing"),
+                signingPublicKey: try optString(signing, "signingPublicKey", code, "signing"),
+                encryptionPublicKey: try reqString(signing, "encryptionPublicKey", code, "signing")
+            ),
+            capabilities: capabilities,
+            settlement: try optStringList(d, "settlement", code, "registration"),
+            chains: chains
         )
     }
-    return VerifiedPeer(
-        registeredAt: registeredAt,
-        aceId: data.aceId,
-        scheme: data.scheme,
-        signingPublicKey: keys.signingPublicKey,
-        encryptionPublicKey: keys.encryptionPublicKey
-    )
 }
 
-// MARK: - URL Validation
-
-/// Absolute URL with scheme `https` (case-insensitive) and a non-empty host.
-/// SSRF host checks belong to the fetcher (`fetchRegistrationFile`), not here.
-private func isHTTPSURL(_ string: String) -> Bool {
-    guard let url = URL(string: string), url.scheme?.lowercased() == "https",
-          let host = url.host, !host.isEmpty else { return false }
-    return true
-}
-
-// MARK: - URL Host Validation
-
-/// Reject URL hosts that resolve to private/reserved addresses.
-/// Prevents SSRF via literal IPs (127.0.0.1, ::1, 169.254.x.x, 10.x.x.x, etc).
-private let ipv4Pattern = try! NSRegularExpression(pattern: #"^\d{1,3}(\.\d{1,3}){3}$"#)
-private let blockedDomainSuffixes = [".local", ".localhost", ".internal", ".intranet", ".lan", ".home.arpa"]
-private let blockedDomainExact = ["localhost"]
-
-func validateURLHost(_ host: String) throws {
-    let lower = host.lowercased()
-
-    // Block IPv6 literals (bracketed or bare)
-    if lower.contains(":") || lower.hasPrefix("[") {
-        throw ACEError.invalidRegistration("URL host must not be an IPv6 literal: '\(String(host.prefix(100)))'")
-    }
-
-    // Block IPv4 literals (any dotted decimal)
-    if ipv4Pattern.fullMatch(host) {
-        throw ACEError.invalidRegistration("URL host must not be an IP address: '\(String(host.prefix(100)))'")
-    }
-
-    // Block numeric-only hosts (hex/decimal IP forms like 0x7f000001, 2130706433)
-    if lower.allSatisfy({ $0.isHexDigit || $0 == "x" }) && !lower.isEmpty {
-        throw ACEError.invalidRegistration("URL host must not be a numeric address: '\(String(host.prefix(100)))'")
-    }
-
-    // Block reserved domain suffixes
-    if blockedDomainExact.contains(lower) || blockedDomainSuffixes.contains(where: { lower.hasSuffix($0) }) {
-        throw ACEError.invalidRegistration("URL host is a reserved/private domain: '\(String(host.prefix(100)))'")
+extension PeerRecord {
+    /// Strict parse of the wire shape; every failure is `invalid_peer`.
+    static func parse(_ v: JValue) throws -> PeerRecord {
+        let code = ACEError.Code.invalidPeer
+        guard let o = v.objectValue else { throw ACEError(code, "peer record must be an object") }
+        guard let aceId = o["aceId"]?.stringValue else { throw ACEError(code, "aceId is not an ACE ID") }
+        guard let scheme = o["scheme"]?.stringValue else { throw ACEError(code, "unsupported scheme") }
+        guard let enc = o["encryptionPublicKey"]?.stringValue, let sig = o["signingPublicKey"]?.stringValue else {
+            throw ACEError(code, "keys must be Base64 strings")
+        }
+        guard let registeredAt = o["registeredAt"]?.wireInt else { throw ACEError(code, "registeredAt must be an integer") }
+        guard let signature = o["registrationSignature"]?.stringValue else { throw ACEError(code, "registrationSignature must be a string") }
+        var profile: AgentProfile?
+        if let p = o["profile"], !p.isNull {
+            do { profile = try AgentProfile.parse(p) } catch let e as ACEError { throw ACEError(code, e.message) }
+        }
+        return PeerRecord(aceId: aceId, scheme: scheme, encryptionPublicKey: enc, signingPublicKey: sig,
+                          registrationSignature: signature, registeredAt: registeredAt, profile: profile)
     }
 }
 
-// MARK: - Domain Validation
+// MARK: - Profile
 
-private let validDomainPattern = try! NSRegularExpression(
-    pattern: #"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$"#
+private let tagRegex = try! NSRegularExpression(pattern: "^[a-z0-9][a-z0-9-]*$")
+private let caip2Regex = try! NSRegularExpression(pattern: "^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$")
+private let amountRegex = try! NSRegularExpression(pattern: "^[0-9]+(\\.[0-9]+)?$")
+
+private func regexFull(_ re: NSRegularExpression, _ s: String) -> Bool {
+    guard !s.contains("\n") else { return false }
+    let r = NSRange(location: 0, length: (s as NSString).length)
+    return re.firstMatch(in: s, range: r)?.range == r
+}
+
+/// Validate a discovery profile; failures are `invalid_profile`.
+public func validateProfile(_ p: AgentProfile) throws {
+    let code = ACEError.Code.invalidProfile
+    func text(_ value: String?, _ name: String, _ lo: Int, _ hi: Int) throws {
+        guard let value else { return }
+        let n = value.unicodeScalars.count
+        guard n >= lo, n <= hi, !hasControlCharacter(value) else {
+            throw ACEError(code, "profile.\(name) must be \(lo)-\(hi) characters without control characters")
+        }
+    }
+    func tagList(_ items: [String]?, _ name: String, _ maxCount: Int) throws {
+        guard let items else { return }
+        guard items.count <= maxCount else { throw ACEError(code, "profile.\(name) has more than \(maxCount) items") }
+        for item in items where item.unicodeScalars.count > 32 || !regexFull(tagRegex, item) {
+            throw ACEError(code, "profile.\(name) items must be 1-32 of [a-z0-9-]")
+        }
+    }
+    try text(p.name, "name", 1, 64)
+    try text(p.description, "description", 0, 256)
+    if let image = p.image, image.unicodeScalars.count > 512 || !isHTTPSURL(image) {
+        throw ACEError(code, "profile.image must be an HTTPS URL of at most 512 characters")
+    }
+    try tagList(p.tags, "tags", 10)
+    try tagList(p.capabilities, "capabilities", 20)
+    if let chains = p.chains, chains.count > 10 || !chains.allSatisfy({ regexFull(caip2Regex, $0) }) {
+        throw ACEError(code, "profile.chains must be at most 10 CAIP-2 identifiers")
+    }
+    if let endpoint = p.endpoint, !isHTTPSURL(endpoint) {
+        throw ACEError(code, "profile.endpoint must be an HTTPS URL")
+    }
+    if let pricing = p.pricing {
+        try text(pricing.currency, "pricing.currency", 1, 16)
+        if let m = pricing.maxAmount, m.unicodeScalars.count > 32 || !regexFull(amountRegex, m) {
+            throw ACEError(code, "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)")
+        }
+    }
+}
+
+// MARK: - Keys / binding
+
+func decodeSigningKey(scheme: SigningScheme, _ text: String, code: ACEError.Code) throws -> Data {
+    let raw = try decodeB64(text, code: code, what: "signingPublicKey", maxBytes: 64)
+    guard ACESigning.isValidSigningPublicKey(scheme, raw) else {
+        throw ACEError(code, "signingPublicKey is not a valid key for the scheme")
+    }
+    return raw
+}
+
+func bindingSignData(aceId: String, timestamp: Int, encryptionPublicKey: String, signingPublicKey: String) throws -> Data {
+    try ACESigning.buildSignData(action: "register", aceId: aceId, timestamp: timestamp,
+                                 payload: ACESigning.encodePayload(encryptionPublicKey, signingPublicKey))
+}
+
+/// Verify a relay `PeerRecord`: ID format, `aceId == sha256(signing key)`, a 1216-byte
+/// encryption key, an integer `registeredAt`, the binding signature and the profile.
+/// Every failure is `invalid_peer`.
+public func verifyPeerRecord(_ record: PeerRecord) throws -> VerifiedPeer {
+    let code = ACEError.Code.invalidPeer
+    guard isACEId(record.aceId) else { throw ACEError(code, "aceId is not an ACE ID") }
+    guard let scheme = SigningScheme(rawValue: record.scheme) else { throw ACEError(code, "unsupported scheme") }
+    let signingKey = try decodeSigningKey(scheme: scheme, record.signingPublicKey, code: code)
+    guard computeACEId(signingKey) == record.aceId else { throw ACEError(code, "aceId does not match the signing key") }
+    let encKey = try ACEEncryption.decodeKemPublicKey(record.encryptionPublicKey, code: code)
+    guard record.registeredAt >= 0, record.registeredAt <= maxSafeInteger else {
+        throw ACEError(code, "registeredAt must be an integer")
+    }
+    let sig = try decodeSignature(record.registrationSignature, scheme: scheme, code: code)
+    let signData = try bindingSignData(aceId: record.aceId, timestamp: record.registeredAt,
+                                       encryptionPublicKey: record.encryptionPublicKey, signingPublicKey: record.signingPublicKey)
+    guard ACESigning.verify(signData: signData, signature: sig, scheme: scheme, publicKey: signingKey) else {
+        throw ACEError(code, "registrationSignature does not verify")
+    }
+    if let profile = record.profile {
+        do { try validateProfile(profile) } catch let e as ACEError { throw ACEError(code, e.message) }
+    }
+    return VerifiedPeer(aceId: record.aceId, scheme: scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
+                        registeredAt: record.registeredAt, registrationSignature: record.registrationSignature,
+                        source: .relay, profile: record.profile)
+}
+
+/// Run all 01 rules (including the ID hash); failures are `invalid_registration`.
+///
+/// The peer's `registeredAt` is `pinnedAt` or now (a file has no signed timestamp).
+public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil, clock: @Sendable () -> Int = systemClock) throws -> VerifiedPeer {
+    let code = ACEError.Code.invalidRegistration
+    if let pinnedAt, pinnedAt < 0 || pinnedAt > maxSafeInteger {
+        throw ACEError(.invalidArgument, "pinnedAt must be an integer in [0, 2^53-1]")
+    }
+    guard reg.ace == "1.0" else { throw ACEError(code, "ace must be '1.0'") }
+    guard isACEId(reg.id) else { throw ACEError(code, "id is not an ACE ID") }
+    guard !reg.name.isEmpty, !hasControlCharacter(reg.name) else {
+        throw ACEError(code, "name must be non-empty without control characters")
+    }
+    guard isHTTPSURL(reg.endpoint) else { throw ACEError(code, "endpoint must match the ACE HTTPS URL grammar") }
+    let s = reg.signing
+    let signingKey: Data
+    switch s.scheme {
+    case .ed25519:
+        guard let key = Base58.decode(s.address), key.count == 32, Base58.encode(key) == s.address else {
+            throw ACEError(code, "signing.address must be the Base58 of a 32-byte key")
+        }
+        if let spk = s.signingPublicKey {
+            guard try decodeB64(spk, code: code, what: "signing.signingPublicKey") == key else {
+                throw ACEError(code, "signing.signingPublicKey must equal Base58Decode(signing.address)")
+            }
+        }
+        signingKey = key
+    case .secp256k1:
+        guard let spk = s.signingPublicKey else { throw ACEError(code, "secp256k1 requires signing.signingPublicKey") }
+        signingKey = try decodeSigningKey(scheme: .secp256k1, spk, code: code)
+        guard s.address.lowercased() == signingAddress(scheme: .secp256k1, signingPublicKey: signingKey).lowercased() else {
+            throw ACEError(code, "signing.address does not match signing.signingPublicKey")
+        }
+    }
+    guard computeACEId(signingKey) == reg.id else { throw ACEError(code, "id does not match the signing key") }
+    let encKey = try ACEEncryption.decodeKemPublicKey(s.encryptionPublicKey, code: code)
+    return VerifiedPeer(aceId: reg.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
+                        registeredAt: pinnedAt ?? clock(), registrationSignature: nil, source: .registration, profile: nil)
+}
+
+// MARK: - Rollback barrier (02)
+
+/// Outcome of adopting a candidate binding.
+public enum AdoptOutcome: String, Sendable {
+    case adopted, unchanged, rotated
+}
+
+/// Pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
+///
+/// Rotation to a different encryption key requires a signed (relay) binding with a
+/// strictly newer `registeredAt`; an unsigned registration-file candidate is adopted only
+/// without a pin, or as `unchanged` when its key equals the pin (pin kept as is).
+func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws -> (VerifiedPeer, AdoptOutcome) {
+    if candidate.registeredAt > now + ACELimits.timestampWindowSeconds {
+        throw ACEError(.invalidPeer, "registeredAt is in the future")
+    }
+    guard let pin else { return (candidate, .adopted) }
+    guard pin.signingPublicKey == candidate.signingPublicKey, pin.scheme == candidate.scheme else {
+        throw ACEError(.invalidPeer, "signing key or scheme differs from the pinned binding")
+    }
+    let unsigned = candidate.registrationSignature == nil
+    if pin.encryptionPublicKey == candidate.encryptionPublicKey {
+        if unsigned { return (pin, .unchanged) }
+        let newer = candidate.registeredAt > pin.registeredAt ? candidate : pin
+        let merged = VerifiedPeer(
+            aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
+            encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
+            registrationSignature: newer.registrationSignature, source: newer.source,
+            profile: candidate.source == .relay ? candidate.profile : pin.profile
+        )
+        return (merged, .unchanged)
+    }
+    if unsigned {
+        throw ACEError(.stalePeerBinding, "an unsigned source cannot rotate a pinned encryption key")
+    }
+    if candidate.registeredAt > pin.registeredAt { return (candidate, .rotated) }
+    throw ACEError(.stalePeerBinding, "a different encryption key requires a newer registeredAt")
+}
+
+// MARK: - Well-known fetch
+
+private let domainRegex = try! NSRegularExpression(
+    pattern: "^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\\.[a-zA-Z]{2,}$"
 )
 
-public let defaultRegistrationFetchTimeout: TimeInterval = 10.0
-public let defaultMaxRegistrationBytes = 1_048_576
+/// 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.0.2/24, 192.168/16,
+/// 198.18/15, 198.51.100/24, 203.0.113/24, 224/4, 240/4.
+func isBlockedIPv4(_ a: [UInt8]) -> Bool {
+    let (b0, b1, b2) = (a[0], a[1], a[2])
+    switch b0 {
+    case 0, 10, 127: return true
+    case 100: return b1 & 0xC0 == 64
+    case 169: return b1 == 254
+    case 172: return b1 & 0xF0 == 16
+    case 192: return (b1 == 0 && (b2 == 0 || b2 == 2)) || b1 == 168
+    case 198: return b1 & 0xFE == 18 || (b1 == 51 && b2 == 100)
+    case 203: return b1 == 0 && b2 == 113
+    default: return b0 >= 224
+    }
+}
 
-/// Fetch and validate a registration file from a well-known URL.
+/// ::/128, ::1/128, ::ffff:0:0/96 and 64:ff9b::/96 (embedded IPv4 judged), 100::/64,
+/// 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8.
+func isBlockedIPv6(_ a: [UInt8]) -> Bool {
+    let prefix96 = Array(a[0..<12])
+    if prefix96 == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF]
+        || prefix96 == [0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return isBlockedIPv4(Array(a[12..<16]))
+    }
+    if a.allSatisfy({ $0 == 0 }) { return true }
+    if a[0..<15].allSatisfy({ $0 == 0 }) && a[15] == 1 { return true }
+    if a[0] == 0x01 && a[1] == 0x00 && a[2..<8].allSatisfy({ $0 == 0 }) { return true }
+    if a[0] == 0x20 && a[1] == 0x01 && a[2] == 0x0D && a[3] == 0xB8 { return true }
+    if a[0] & 0xFE == 0xFC { return true }
+    if a[0] == 0xFE && a[1] & 0xC0 == 0x80 { return true }
+    return a[0] == 0xFF
+}
+
+/// Resolve `domain` with `getaddrinfo` and reject if any address is in a blocked range.
+func resolveAndCheck(_ domain: String, allowPrivate: Bool) throws {
+    var hints = addrinfo()
+    hints.ai_socktype = SOCK_STREAM
+    hints.ai_protocol = IPPROTO_TCP
+    var res: UnsafeMutablePointer<addrinfo>?
+    let rc = getaddrinfo(domain, "443", &hints, &res)
+    guard rc == 0, let first = res else {
+        throw ACEError(.fetchFailed, "DNS resolution failed for \(String(domain.prefix(100)))")
+    }
+    defer { freeaddrinfo(first) }
+    var count = 0
+    var p: UnsafeMutablePointer<addrinfo>? = first
+    while let ai = p {
+        defer { p = ai.pointee.ai_next }
+        guard let sa = ai.pointee.ai_addr else { continue }
+        var blocked = false
+        if ai.pointee.ai_family == AF_INET {
+            let addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+            blocked = withUnsafeBytes(of: addr) { isBlockedIPv4(Array($0)) }
+        } else if ai.pointee.ai_family == AF_INET6 {
+            let addr = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+            blocked = withUnsafeBytes(of: addr) { isBlockedIPv6(Array($0)) }
+        } else {
+            continue
+        }
+        count += 1
+        if blocked && !allowPrivate {
+            throw ACEError(.blockedAddress, "\(String(domain.prefix(100))) resolves to a blocked address")
+        }
+    }
+    guard count > 0 else { throw ACEError(.fetchFailed, "no addresses resolved") }
+}
+
+private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest) async -> URLRequest? {
+        nil
+    }
+}
+
+/// GET `https://<domain>/.well-known/ace.json` with SSRF protection, then verify it.
+///
+/// - The domain must match the strict domain grammar (`invalid_argument`).
+/// - `getaddrinfo` resolves the domain; any address in a private / reserved range is
+///   `blocked_address` unless `allowPrivateAddresses`.
+/// - Redirects are never followed; the content type must be `application/json`; at most
+///   `maxBytes + 1` bytes are read (`URLSession.bytes`, counting abort).
+/// - Network errors, timeouts, 5xx and 429 are `fetch_failed`; everything else
+///   (other statuses, size, JSON, rule violations) is `invalid_registration`.
+///
+/// Residual risk: URLSession re-resolves the domain when connecting, so a resolver that
+/// answers differently after the check (DNS rebinding) is not excluded by the address
+/// check alone. Because only HTTPS with certificate validation is used, a rebind to an
+/// internal address fails the TLS handshake (no valid certificate for `domain`) before
+/// any HTTP bytes are sent, so no IP pinning is done here.
 public func fetchRegistrationFile(
     _ domain: String,
-    timeout: TimeInterval = defaultRegistrationFetchTimeout,
-    maxBytes: Int = defaultMaxRegistrationBytes
+    timeout: TimeInterval = 10,
+    maxBytes: Int = ACELimits.maxRegistrationFileBytes,
+    allowPrivateAddresses: Bool = false
 ) async throws -> RegistrationFile {
-    guard validDomainPattern.fullMatch(domain) else {
-        throw ACEError.invalidRegistration("Invalid domain: '\(String(domain.prefix(100)))'")
-    }
-    // Block reserved/private domains to prevent SSRF via DNS rebinding
-    try validateURLHost(domain)
-    guard timeout > 0 else {
-        throw ACEError.invalidRegistration("Invalid timeout: expected positive seconds, got \(timeout)")
-    }
-    guard maxBytes > 0 else {
-        throw ACEError.invalidRegistration("Invalid maxBytes: expected positive integer, got \(maxBytes)")
-    }
-
+    guard regexFull(domainRegex, domain) else { throw ACEError(.invalidArgument, "invalid domain") }
+    guard timeout > 0, timeout.isFinite else { throw ACEError(.invalidArgument, "timeout must be positive") }
+    guard maxBytes >= 1 else { throw ACEError(.invalidArgument, "maxBytes must be a positive integer") }
+    try resolveAndCheck(domain, allowPrivate: allowPrivateAddresses)
     guard let url = URL(string: "https://\(domain)/.well-known/ace.json") else {
-        throw ACEError.invalidRegistration("Failed to construct URL for domain: '\(String(domain.prefix(100)))'")
+        throw ACEError(.invalidArgument, "invalid domain")
     }
     var request = URLRequest(url: url)
     request.timeoutInterval = timeout
     request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-    // Use a custom URLSession that rejects redirects to prevent SSRF via
-    // server-controlled redirects to private IPs (DNS rebinding mitigation).
-    let sessionDelegate = SSRFSafeDelegate()
-    let session = URLSession(configuration: .default, delegate: sessionDelegate, delegateQueue: nil)
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = timeout
+    config.timeoutIntervalForResource = timeout
+    let session = URLSession(configuration: config, delegate: NoRedirectDelegate(), delegateQueue: nil)
     defer { session.finishTasksAndInvalidate() }
 
-    let (data, response): (Data, URLResponse)
+    var body = Data()
     do {
-        (data, response) = try await session.data(for: request)
-    } catch let error as URLError where error.code == .timedOut {
-        throw ACEError.invalidRegistration("Timed out fetching registration file from https://\(domain)/.well-known/ace.json after \(timeout)s")
-    }
-
-    guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        throw ACEError.invalidRegistration("Failed to fetch registration file: HTTP \(status)")
-    }
-
-    guard let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
-          contentType.contains("application/json") else {
-        let ct = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "missing"
-        throw ACEError.invalidRegistration("Invalid content-type: expected application/json, got '\(ct)'")
-    }
-
-    let declaredLength = httpResponse.expectedContentLength
-    if declaredLength > Int64(maxBytes) {
-        throw ACEError.invalidRegistration("Registration file too large: \(declaredLength) bytes exceeds max \(maxBytes)")
-    }
-    guard data.count <= maxBytes else {
-        throw ACEError.invalidRegistration("Registration file too large: \(data.count) bytes exceeds max \(maxBytes)")
-    }
-
-    let reg: RegistrationFile
-    do {
-        reg = try JSONDecoder().decode(RegistrationFile.self, from: data)
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ACEError(.fetchFailed, "not an HTTP response") }
+        if http.statusCode >= 500 || http.statusCode == 429 {
+            throw ACEError(.fetchFailed, "HTTP \(http.statusCode)", status: http.statusCode)
+        }
+        guard http.statusCode == 200 else {
+            throw ACEError(.invalidRegistration, "HTTP \(http.statusCode) (redirects are not followed)", status: http.statusCode)
+        }
+        let media = (http.value(forHTTPHeaderField: "Content-Type") ?? "")
+            .split(separator: ";", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        guard media == "application/json" else {
+            throw ACEError(.invalidRegistration, "content-type must be application/json")
+        }
+        for try await byte in bytes {
+            body.append(byte)
+            if body.count > maxBytes { break }
+        }
+    } catch let e as ACEError {
+        throw e
     } catch {
-        throw ACEError.invalidRegistration("Failed to parse registration JSON: \(error)")
+        throw ACEError(.fetchFailed, "fetch failed: \(error.localizedDescription)")
     }
-
-    let keys = try validateRegistrationFile(reg)
-    guard computeACEId(keys.signingPublicKey) == reg.id else {
-        throw ACEError.invalidRegistration("Registration ACE ID does not match signing key")
+    guard body.count <= maxBytes else {
+        throw ACEError(.invalidRegistration, "registration file exceeds \(maxBytes) bytes")
     }
-
+    let reg = try RegistrationFile(json: body)
+    _ = try verifyRegistrationFile(reg)
     return reg
-}
-
-// MARK: - Profile Validation
-
-private let tagPattern = try! NSRegularExpression(pattern: "^[a-z0-9][a-z0-9-]*$")
-private let caip2Pattern = try! NSRegularExpression(pattern: "^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$")
-private let controlCharPattern = try! NSRegularExpression(pattern: "[\\x00-\\x1f\\x7f]")
-
-private func validateTagLikeArray(_ items: [String], fieldName: String, maxCount: Int) throws {
-    guard items.count <= maxCount else {
-        throw ACEError.invalidRegistration("Invalid profile: \(fieldName) must have at most \(maxCount) items")
-    }
-    for item in items {
-        guard item.unicodeScalars.count <= 32, tagPattern.fullMatch(item) else {
-            throw ACEError.invalidRegistration("Invalid profile: each \(fieldName.dropLast(1)) must be 1-32 lowercase alphanumeric chars or hyphens (\(fieldName))")
-        }
-    }
-}
-
-public func validateProfile(_ profile: AgentProfile) throws {
-    if let name = profile.name {
-        guard !name.isEmpty, name.unicodeScalars.count <= 64 else {
-            throw ACEError.invalidRegistration("Invalid profile: name must be 1-64 characters")
-        }
-        let nameRange = NSRange(name.startIndex..., in: name)
-        if controlCharPattern.firstMatch(in: name, range: nameRange) != nil {
-            throw ACEError.invalidRegistration("Invalid profile: name must not contain control characters")
-        }
-    }
-
-    if let description = profile.description {
-        guard description.unicodeScalars.count <= 256 else {
-            throw ACEError.invalidRegistration("Invalid profile: description must be at most 256 characters")
-        }
-        let range = NSRange(description.startIndex..., in: description)
-        if controlCharPattern.firstMatch(in: description, range: range) != nil {
-            throw ACEError.invalidRegistration("Invalid profile: description must not contain control characters")
-        }
-    }
-
-    if let image = profile.image {
-        guard image.unicodeScalars.count <= 512 else {
-            throw ACEError.invalidRegistration("Invalid profile: image must be at most 512 characters")
-        }
-        guard isHTTPSURL(image) else {
-            throw ACEError.invalidRegistration("Invalid profile: image must be a valid HTTPS URL (image)")
-        }
-    }
-
-    if let tags = profile.tags {
-        try validateTagLikeArray(tags, fieldName: "tags", maxCount: 10)
-    }
-
-    if let capabilities = profile.capabilities {
-        try validateTagLikeArray(capabilities, fieldName: "capabilities", maxCount: 20)
-    }
-
-    if let chains = profile.chains {
-        guard chains.count <= 10 else {
-            throw ACEError.invalidRegistration("Invalid profile: chains must have at most 10 items")
-        }
-        for chain in chains {
-            guard caip2Pattern.fullMatch(chain) else {
-                throw ACEError.invalidRegistration("Invalid profile: each chain must be a CAIP-2 identifier (chains)")
-            }
-        }
-    }
-
-    if let endpoint = profile.endpoint {
-        guard isHTTPSURL(endpoint) else {
-            throw ACEError.invalidRegistration("Invalid profile: endpoint must be a valid HTTPS URL (endpoint)")
-        }
-    }
-
-    if let pricing = profile.pricing {
-        guard !pricing.currency.isEmpty else {
-            throw ACEError.invalidRegistration("Invalid profile: pricing.currency is required (pricing)")
-        }
-    }
-}
-
-// MARK: - SSRF-Safe URL Session Delegate
-
-/// Rejects HTTP redirects to prevent SSRF via server-controlled redirects
-/// to private/reserved IP addresses. Used by `fetchRegistrationFile`.
-private final class SSRFSafeDelegate: NSObject, URLSessionTaskDelegate {
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        // Reject all redirects — the well-known URL should respond directly.
-        // This prevents DNS rebinding and open-redirect SSRF attacks.
-        completionHandler(nil)
-    }
 }

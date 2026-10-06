@@ -1,15 +1,16 @@
 # ACE Protocol Swift SDK
 
-Swift implementation of the [ACE Protocol](https://aceprotocol.org) — a secure, end-to-end encrypted communication protocol for autonomous AI agents.
+Swift implementation of the [ACE Protocol](https://aceprotocol.org): end-to-end encrypted, signed messaging and economic negotiation between autonomous AI agents.
 
 ## Features
 
-- **Identity** — Ed25519 and secp256k1 signing schemes, tiered identity (key-only / chain-registered), hardware backing (Secure Enclave, TPM, HSM, TEE)
-- **Encryption** — X-Wing (X25519 + ML-KEM-768) hybrid post-quantum KEM → HKDF-SHA256 → AES-256-GCM, per-message KEM encapsulation
-- **Messages** — Full economic message lifecycle (RFQ → Offer → Accept → Invoice → Receipt → Deliver → Confirm), plus system and social messages
-- **Security** — Timestamp freshness, replay detection, signature-before-decryption pipeline, payload size limits
-- **State Machine** — Thread-level state tracking for economic message flows
-- **Discovery** — Agent registration file validation and well-known URL discovery
+- **Identity**: Ed25519 and secp256k1 signing, `SoftwareIdentity` (Tier 0) and the `ACEIdentity` protocol for hardware-backed identities (Secure Enclave, HSM).
+- **Encryption**: X-Wing (X25519 + ML-KEM-768) hybrid post-quantum KEM → HKDF-SHA256 → AES-256-GCM.
+- **Strict wire rules**: canonical Base64, strict ed25519 / low-S secp256k1 verification, exact envelope decoding, size limits (`ACELimits`).
+- **State machine**: buyer / seller roles, fixed parties and reference positions per thread.
+- **Replay protection**: seen store with horizons, per-sender quota and canonical persistence.
+- **Pipeline**: `ACEStore` (`MemoryStore`, `FileStore`), `PeerStore` (rollback barrier), `ThreadStore`, `Outbox` (sender durability), `Inbox` (durable exactly-once hand-over), `RelayClient` (HTTP + SSE).
+- **Errors**: one `ACEError` type with a stable `code` and a `category` (`permanent` / `transient` / `local`).
 
 ## Requirements
 
@@ -18,166 +19,103 @@ Swift implementation of the [ACE Protocol](https://aceprotocol.org) — a secure
 
 ## Installation
 
-### Swift Package Manager
-
-Add to your `Package.swift`:
-
 ```swift
 dependencies: [
     .package(url: "https://github.com/aceprotocol/ace-sdk-swift.git", exact: "0.2.0"),
+],
+targets: [
+    .target(name: "YourTarget", dependencies: [.product(name: "ACE", package: "ace-sdk-swift")]),
 ]
 ```
 
-Then add `"ACE"` to your target's dependencies:
-
-```swift
-.target(
-    name: "YourTarget",
-    dependencies: [
-        .product(name: "ACE", package: "ace-sdk-swift"),
-    ]
-)
-```
-
-### Xcode
-
-File → Add Package Dependencies → Enter:
-
-```
-https://github.com/aceprotocol/ace-sdk-swift.git
-```
-
-## Quick Start
-
-### Create an Identity
+## Quick start: the pipeline
 
 ```swift
 import ACE
 
-// Create a software identity (Tier 0): Ed25519 signing key + 32-byte X-Wing seed
-let identity = try SoftwareIdentity.generate(scheme: .ed25519)
+let me = try SoftwareIdentity.generate(scheme: .ed25519)
+let store = try FileStore(directory: URL(fileURLWithPath: NSHomeDirectory() + "/.ace/state"))
+let relay = try RelayClient(baseURL: URL(string: "https://relay.example")!)
+try await relay.register(me, profile: .replace(AgentProfile(name: "My Agent")))
 
-print(identity.getACEId())                       // ace:sha256:...
-print(identity.getEncryptionPublicKey().count)   // 1216 (X-Wing public key)
+let peers = try PeerStore(store: store, relay: relay)
 
-// Export / import — `encryptionPrivateKey` is the Base64 32-byte X-Wing seed
-let export = identity.exportPrivateKey()
-let restored = try SoftwareIdentity.fromExport(export)
+// Receive: onMessage must persist its effect idempotently, keyed by (from, messageId).
+let inbox = try await Inbox.open(identity: me, store: store, peers: peers) { message in
+    try await myDatabase.saveOnce(from: message.from, id: message.messageId, body: message.body)
+}
+Task {
+    for try await outcome in inbox.follow(relay) {   // pull the backlog, then SSE
+        if case .quarantined(let error, _) = outcome { print("rejected:", error) }
+    }
+}
+
+// Send: stage durably, then deliver (retry deliver until it succeeds).
+let outbox = try await Outbox.open(identity: me, store: store)
+let seller = try await peers.resolve("ace:sha256:…")
+let pending = try await outbox.stage(recipient: seller, type: .rfq, body: ["need": "Translate 500 words"], threadId: "job-1")
+do {
+    try await outbox.deliver(pending.requestId) { try await relay.send($0) }
+} catch let e as ACEError where e.code == .envelopeExpired {
+    try await outbox.resign(pending.requestId)   // same messageId, fresh timestamp
+}
 ```
 
-### Encrypt & Decrypt
+- `Inbox.receive(_:source:)` also accepts directly delivered envelopes (`.direct`, e.g. from your own HTTP endpoint); it returns `.delivered`, `.duplicate`, `.quarantined` or `.retryable`.
+- `Inbox.pull(relay)` drains the relay inbox from the durable cursor.
+- A custom `ACEStore` (database, wallet-scoped storage) can replace `FileStore`.
+- `VerifiedPeer.profile` is unverified relay metadata; only the keys are verified.
+
+## Quick start: local, without storage
 
 ```swift
-let plaintext = Data("Hello, Agent!".utf8)
+let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+let bobPeer = try verifyRegistrationFile(bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example/ace"))
+let alicePeer = try verifyRegistrationFile(alice.toRegistrationFile(name: "Alice", endpoint: "https://alice.example/ace"))
 
-// Both keys are 1216-byte X-Wing public keys
-let conversationId = try ACEEncryption.computeConversationId(
-    pubA: senderEncPub,
-    pubB: recipientEncPub
-)
-
-// Encrypt: X-Wing encapsulate → HKDF-SHA256 → AES-256-GCM
-let (kemCiphertext, payload) = try ACEEncryption.encrypt(
-    plaintext,
-    recipientPublicKey: recipientEncPub,
-    conversationId: conversationId
-)
-// kemCiphertext: 1120 bytes; payload: nonce[12] || ciphertext || tag[16]
-
-// Decrypt with the recipient's 32-byte X-Wing seed
-let decrypted = try ACEEncryption.decrypt(
-    kemCiphertext: kemCiphertext,
-    payload: payload,
-    seed: recipientSeed,
-    conversationId: conversationId
-)
+let message = try createMessage(sender: alice, recipient: bobPeer, type: .rfq, body: ["need": "Translate"],
+                                threads: ThreadStateMachine(localAceId: alice.getACEId()), threadId: "t1")
+let parsed = try parseMessage(message, receiver: bob, sender: alicePeer,
+                              threads: ThreadStateMachine(localAceId: bob.getACEId()), replay: ReplayDetector())
 ```
 
-#### Encryption scheme
+See `Examples/Quickstart/main.swift` (`swift run ACEQuickstart`) for both flows.
+
+## Custom identities (Secure Enclave)
+
+```swift
+final class EnclaveIdentity: ACEIdentity {
+    func sign(_ data: Data) throws -> Data { … }                     // 64-byte ed25519 or 65-byte r‖s‖v
+    func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data {
+        let seed = try keychain.borrowSeed()                          // non-ACEError → identity_unavailable (retryable)
+        return try ACEEncryption.decrypt(kemCiphertext: kemCiphertext, payload: payload,
+                                         seed: seed, conversationId: conversationId) // crypto failure → decryption_failed
+    }
+    …
+}
+```
+
+`ACEEncryption` also exposes `publicKey(fromSeed:)`, `generateSeed()` and `computeConversationId(pubA:pubB:)`.
+
+## Persistence
+
+All pipeline state lives in the `ACEStore` under the keys of 06-security Appendix A (`replay.json`, `cursors.json`, `threads/`, `outbox/`, `deliveries/`, `quarantine/`, `peers/`). Records are compact JSON with sorted keys; `replay.json` is byte-identical across the TS, Python and Swift SDKs. `FileStore` writes atomically (temp file, fsync, rename) with 0600 files and 0700 directories, and uses `locks/<name>.lock` files for cross-process exclusion.
+
+## Encryption
 
 | Step | Primitive |
 |------|-----------|
-| KEM | X-Wing (X25519 + ML-KEM-768), draft-connolly-cfrg-xwing-kem-11 — public key 1216 B, ciphertext 1120 B, private key = 32-byte seed |
-| KDF | HKDF-SHA256, `ikm` = X-Wing shared secret, `salt` = SHA-256("ace.protocol.kem.v1"), `info` = conversationId, 32 B |
-| AEAD | AES-256-GCM, random 12-byte nonce, `aad` = conversationId |
-| Wire | `encryption: { kemCiphertext: Base64(1120 B), payload: Base64(nonce ‖ ciphertext ‖ tag) }` |
+| KEM | X-Wing (X25519 + ML-KEM-768), draft-connolly-cfrg-xwing-kem-11: public key 1216 B, ciphertext 1120 B, private key = 32-byte seed |
+| KDF | HKDF-SHA256, salt = SHA-256("ace.protocol.kem.v1"), info = conversationId |
+| AEAD | AES-256-GCM, random 12-byte nonce, aad = conversationId |
 
-The hybrid KEM protects message confidentiality against harvest-now-decrypt-later
-attacks by a future quantum adversary as long as *either* X25519 or ML-KEM-768 holds.
-Signatures (Ed25519 / secp256k1) remain classical by design.
+Each message uses a fresh encapsulation, but the recipient's static seed decrypts every message sent to it: rotate the encryption key with a new relay registration if that is a concern.
 
-**Forward secrecy — honest statement.** Each message uses a fresh KEM encapsulation,
-so compromising the *sender* reveals nothing about past messages. However, the
-*recipient's* static X-Wing seed decrypts every message ever sent to it: compromise
-of that seed reveals all past and future messages to that recipient. Rotate the
-encryption key via a new registration file if that is a concern.
+## Cross-language compatibility
 
-### Send & Receive Messages
-
-```swift
-let stateMachine = ThreadStateMachine()
-let replayDetector = ReplayDetector()
-
-// Create an encrypted, signed message
-let message = try createMessage(CreateMessageOptions(
-    sender: identity,
-    recipientPubKey: recipientEncPub,
-    recipientACEId: recipientACEId,
-    type: .rfq,
-    body: ["need": "Translate 500 words EN→JP"],
-    stateMachine: stateMachine,
-    threadId: UUID().uuidString.lowercased()
-))
-
-// Parse and verify an incoming message
-let parsed = try parseMessage(
-    message,
-    receiver: recipientIdentity,
-    senderSigningPubKey: senderSigningPub,
-    opts: ParseMessageOptions(stateMachine: stateMachine, replayDetector: replayDetector)
-)
-```
-
-`replayDetector` is the seen store with a replay horizon; persist it across restarts with
-`export()` / `ReplayDetector.fromExport(_:)`.
-
-### Verify Signatures
-
-```swift
-let signData = ACESigning.buildSignData(
-    action: "message",
-    aceId: aceId,
-    timestamp: timestamp,
-    payload: payload
-)
-
-let valid = ACESigning.verifySignature(
-    signData: signData,
-    signature: signatureBytes,
-    scheme: .ed25519,
-    signingPublicKey: publicKey
-)
-```
-
-## Architecture
-
-| Module | Description |
-|--------|-------------|
-| `Types.swift` | Core protocol types, enums, and error definitions |
-| `Identity.swift` | ACE identity management and ACE ID derivation |
-| `Signing.swift` | Domain-tagged sign data construction and signature verification |
-| `Encryption.swift` | X-Wing (X25519 + ML-KEM-768) + HKDF-SHA256 + AES-256-GCM encryption/decryption |
-| `Messages.swift` | Message creation and parsing pipeline |
-| `StateMachine.swift` | Thread-level economic state machine |
-| `Discovery.swift` | Registration file validation and agent discovery |
-| `Security.swift` | Replay detection, timestamp checks, security utilities |
-| `Keccak256.swift` | Keccak-256 hash for secp256k1 address derivation |
-| `Utils.swift` | Base64, hex encoding, and common helpers |
-
-## Cross-Language Compatibility
-
-This SDK produces wire-compatible output with the [TypeScript](https://github.com/aceprotocol/ace-sdk-ts) and [Python](https://github.com/aceprotocol/ace-sdk-python) implementations (all at 0.2.0). Interoperability is verified through the shared canonical test vectors (`ace-spec/test-vectors.json`), which include the X-Wing draft-11 KEM vector and a Python-encrypted message that this SDK decrypts.
+Wire-compatible with the TypeScript and Python SDKs (0.2.0). All sections of the shared `test-vectors.json` (version 2) run in `Tests/ACETests/VectorTests.swift`, including the three X-Wing draft KATs and byte-exact replay state. CryptoKit ed25519 signatures are randomized, so signature vectors are verified rather than reproduced byte for byte.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE).

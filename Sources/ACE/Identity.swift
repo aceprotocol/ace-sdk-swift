@@ -2,151 +2,123 @@
 //  Identity.swift
 //  ACE SDK
 //
-//  SoftwareIdentity — Tier 0 (software) implementation of ACEIdentity.
-//  Supports Ed25519 and secp256k1 signing schemes.
-//
-//  SECURITY NOTE: Private keys are held in process memory.
-//  For production use with high-value keys, implement ACEIdentity
-//  with hardware backing (Tier 1/2) — see TigerPass/SoulPass CLIs
-//  for Secure Enclave examples.
+//  SoftwareIdentity — Tier 0 (software) ACEIdentity. Keys are held in process memory;
+//  use a hardware-backed ACEIdentity (Secure Enclave, HSM) for high-value deployments.
 //
 
 import Foundation
 import CryptoKit
 import P256K
 
-public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
+/// Exported private key material: `{scheme, signingPrivateKey: b64, encryptionPrivateKey: b64}`.
+/// `encryptionPrivateKey` is the 32-byte X-Wing seed.
+public struct SoftwareIdentityExport: Codable, Sendable, Equatable {
+    public let scheme: SigningScheme
+    public let signingPrivateKey: String
+    public let encryptionPrivateKey: String
 
+    public init(scheme: SigningScheme, signingPrivateKey: String, encryptionPrivateKey: String) {
+        self.scheme = scheme
+        self.signingPrivateKey = signingPrivateKey
+        self.encryptionPrivateKey = encryptionPrivateKey
+    }
+}
+
+/// Software ACE identity. Caches its expanded X-Wing key in memory (never persisted).
+public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
     private let scheme: SigningScheme
     private let signingPrivateKey: Data
-    /// 32-byte X-Wing private key seed (expands to ML-KEM-768 + X25519 keys).
     private let encryptionSeed: Data
-    /// The seed expanded once, so each decrypt skips SHAKE256 + ML-KEM keygen.
     private let decapsulationKey: XWingMLKEM768X25519.PrivateKey
     private let signingPublicKey: Data
     private let encryptionPublicKey: Data
     private let aceId: String
-    private let address: String
-    // Cached typed private key to avoid per-call reconstruction
-    private let ed25519SigningKey: Curve25519.Signing.PrivateKey?
-    private let secp256k1SigningKey: P256K.Recovery.PrivateKey?
+    private let ed25519Key: Curve25519.Signing.PrivateKey?
+    private let secp256k1Key: P256K.Recovery.PrivateKey?
 
-    private init(scheme: SigningScheme, signingPrivateKey: Data, encryptionSeed: Data) throws {
+    /// Build from raw keys. A 32-byte signing private key and a 32-byte X-Wing seed are
+    /// required (`invalid_key`).
+    public init(scheme: SigningScheme, signingPrivateKey: Data, encryptionSeed: Data) throws {
+        guard signingPrivateKey.count == 32 else { throw ACEError(.invalidKey, "signing private key must be 32 bytes") }
         self.scheme = scheme
         self.signingPrivateKey = signingPrivateKey
         self.encryptionSeed = encryptionSeed
-        self.decapsulationKey = try ACEEncryption.privateKey(fromSeed: encryptionSeed)
+        self.decapsulationKey = try ACEEncryption.expandSeed(encryptionSeed)
         self.encryptionPublicKey = Data(decapsulationKey.publicKey.rawRepresentation)
-
         switch scheme {
         case .ed25519:
-            let privKey = try Curve25519.Signing.PrivateKey(rawRepresentation: signingPrivateKey)
-            self.signingPublicKey = Data(privKey.publicKey.rawRepresentation)
-            self.ed25519SigningKey = privKey
-            self.secp256k1SigningKey = nil
-            self.address = Base58.encode(Data(privKey.publicKey.rawRepresentation))
-
-        case .secp256k1:
-            let privKey = try P256K.Recovery.PrivateKey(dataRepresentation: [UInt8](signingPrivateKey))
-            let compressed = Data(privKey.publicKey.dataRepresentation)
-            self.signingPublicKey = compressed
-            self.ed25519SigningKey = nil
-            self.secp256k1SigningKey = privKey
-            self.address = try ACE.secp256k1Address(compressed)
-        }
-
-        self.aceId = computeACEId(self.signingPublicKey)
-    }
-
-    // MARK: - Factory Methods
-
-    /// Generate a new random identity.
-    public static func generate(scheme: SigningScheme) throws -> SoftwareIdentity {
-        let encSeed = ACEEncryption.generateSeed()
-        let sigPriv: Data
-
-        switch scheme {
-        case .ed25519:
-            let key = Curve25519.Signing.PrivateKey()
-            sigPriv = Data(key.rawRepresentation)
-        case .secp256k1:
-            let key = try P256K.Recovery.PrivateKey()
-            sigPriv = Data(key.dataRepresentation)
-        }
-
-        return try SoftwareIdentity(scheme: scheme, signingPrivateKey: sigPriv, encryptionSeed: encSeed)
-    }
-
-    /// Import from exported key material.
-    /// `encryptionPrivateKey` is the Base64 of the 32-byte X-Wing seed.
-    public static func fromExport(_ export: SoftwareIdentityExport) throws -> SoftwareIdentity {
-        let sigPriv = try ACEBase64.decode(export.signingPrivateKey)
-        let encSeed = try ACEBase64.decode(export.encryptionPrivateKey)
-        return try SoftwareIdentity(scheme: export.scheme, signingPrivateKey: sigPriv, encryptionSeed: encSeed)
-    }
-
-    // MARK: - ACEIdentity Conformance
-
-    public func getEncryptionPublicKey() -> Data {
-        encryptionPublicKey
-    }
-
-    public func getSigningPublicKey() -> Data {
-        signingPublicKey
-    }
-
-    public func sign(_ data: Data) throws -> (signature: Data, scheme: SigningScheme) {
-        switch scheme {
-        case .ed25519:
-            guard let key = ed25519SigningKey else {
-                throw ACEError.invalidKey("Ed25519 signing key not available")
+            let key: Curve25519.Signing.PrivateKey
+            do { key = try Curve25519.Signing.PrivateKey(rawRepresentation: signingPrivateKey) } catch {
+                throw ACEError(.invalidKey, "invalid ed25519 private key")
             }
-            let sig = try key.signature(for: data)
-            return (signature: Data(sig), scheme: .ed25519)
-
+            self.ed25519Key = key
+            self.secp256k1Key = nil
+            self.signingPublicKey = Data(key.publicKey.rawRepresentation)
         case .secp256k1:
-            guard let privKey = secp256k1SigningKey else {
-                throw ACEError.invalidKey("secp256k1 signing key not available")
+            let key: P256K.Recovery.PrivateKey
+            do { key = try P256K.Recovery.PrivateKey(dataRepresentation: [UInt8](signingPrivateKey)) } catch {
+                throw ACEError(.invalidKey, "secp256k1 private key out of range")
             }
-            // Sign pre-computed hash (signData is already SHA-256)
-            let digest = HashDigest([UInt8](data))
-            let ecdsaSig = privKey.signature(for: digest)
-            let compact = ecdsaSig.compactRepresentation
-
-            // r[32] || s[32] || v[1]. libsecp256k1 always emits low-S, as ACE verifiers require.
-            var sigBytes = Data(compact.signature)
-            sigBytes.append(UInt8(compact.recoveryId))
-
-            return (signature: sigBytes, scheme: .secp256k1)
+            self.ed25519Key = nil
+            self.secp256k1Key = key
+            self.signingPublicKey = Data(key.publicKey.dataRepresentation)
         }
+        self.aceId = computeACEId(signingPublicKey)
     }
 
-    public func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data {
-        return try ACEEncryption.decrypt(
-            kemCiphertext: kemCiphertext,
-            payload: payload,
-            privateKey: decapsulationKey,
-            conversationId: conversationId
+    /// Import exported key material (`invalid_key` on malformed Base64 or key sizes).
+    public convenience init(export: SoftwareIdentityExport) throws {
+        try self.init(
+            scheme: export.scheme,
+            signingPrivateKey: try decodeB64(export.signingPrivateKey, code: .invalidKey, what: "signingPrivateKey"),
+            encryptionSeed: try decodeB64(export.encryptionPrivateKey, code: .invalidKey, what: "encryptionPrivateKey")
         )
     }
 
+    /// Generate a new random identity.
+    public static func generate(scheme: SigningScheme) throws -> SoftwareIdentity {
+        let signing: Data
+        switch scheme {
+        case .ed25519:
+            signing = Curve25519.Signing.PrivateKey().rawRepresentation
+        case .secp256k1:
+            signing = Data(try P256K.Recovery.PrivateKey().dataRepresentation)
+        }
+        return try SoftwareIdentity(scheme: scheme, signingPrivateKey: signing, encryptionSeed: ACEEncryption.generateSeed())
+    }
+
+    // MARK: ACEIdentity
+
+    public func getACEId() -> String { aceId }
+    public func getSigningScheme() -> SigningScheme { scheme }
+    public func getSigningPublicKey() -> Data { signingPublicKey }
+    public func getEncryptionPublicKey() -> Data { encryptionPublicKey }
+
+    /// Sign a 32-byte signData digest. secp256k1 returns r‖s‖v (low-S, v ∈ {0,1}).
+    public func sign(_ data: Data) throws -> Data {
+        guard data.count == 32 else { throw ACEError(.invalidArgument, "signData must be 32 bytes") }
+        if let ed25519Key {
+            do { return try ed25519Key.signature(for: data) } catch {
+                throw ACEError(.invalidKey, "ed25519 signing failed")
+            }
+        }
+        guard let secp256k1Key else { throw ACEError(.invalidKey, "no signing key") }
+        let compact = secp256k1Key.signature(for: HashDigest([UInt8](data))).compactRepresentation
+        var out = Data(compact.signature)
+        out.append(UInt8(compact.recoveryId))
+        return out
+    }
+
+    public func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data {
+        try ACEEncryption.decrypt(kemCiphertext: kemCiphertext, payload: payload, privateKey: decapsulationKey, conversationId: conversationId)
+    }
+
+    // MARK: Convenience
+
+    /// ed25519: Base58 of the signing key. secp256k1: EIP-55 address.
     public func getAddress() -> String {
-        address
+        signingAddress(scheme: scheme, signingPublicKey: signingPublicKey)
     }
-
-    public func getSigningScheme() -> SigningScheme {
-        scheme
-    }
-
-    public func getTier() -> IdentityTier {
-        .keyOnly
-    }
-
-    public func getACEId() -> String {
-        aceId
-    }
-
-    // MARK: - Export
 
     /// Export private key material. Handle with extreme care.
     public func exportPrivateKey() -> SoftwareIdentityExport {
@@ -157,51 +129,36 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         )
     }
 
-    /// Generate a registration file for this identity.
+    /// Build this identity's registration file; throws `invalid_registration` if invalid.
     public func toRegistrationFile(
         name: String,
         endpoint: String,
         description: String? = nil,
+        tier: IdentityTier = .keyOnly,
         hardwareBacking: HardwareBacking? = nil,
         capabilities: [Capability]? = nil,
         settlement: [String]? = nil,
         chains: [ChainInfo]? = nil
-    ) -> RegistrationFile {
-        var signing = SigningConfig(
-            scheme: scheme,
-            address: address,
-            encryptionPublicKey: ACEBase64.encode(encryptionPublicKey)
-        )
-        if scheme == .secp256k1 {
-            signing.signingPublicKey = ACEBase64.encode(signingPublicKey)
-        }
-
-        return RegistrationFile(
+    ) throws -> RegistrationFile {
+        let reg = RegistrationFile(
             ace: "1.0",
             id: aceId,
             name: name,
             description: description,
             endpoint: endpoint,
-            tier: getTier(),
+            tier: tier,
             hardwareBacking: hardwareBacking,
-            signing: signing,
+            signing: SigningConfig(
+                scheme: scheme,
+                address: getAddress(),
+                signingPublicKey: scheme == .secp256k1 ? ACEBase64.encode(signingPublicKey) : nil,
+                encryptionPublicKey: ACEBase64.encode(encryptionPublicKey)
+            ),
             capabilities: capabilities,
             settlement: settlement,
             chains: chains
         )
-    }
-}
-
-// MARK: - Export Type
-
-public struct SoftwareIdentityExport: Codable, Sendable {
-    public let scheme: SigningScheme
-    public let signingPrivateKey: String // Base64
-    public let encryptionPrivateKey: String // Base64 (32-byte X-Wing seed)
-
-    public init(scheme: SigningScheme, signingPrivateKey: String, encryptionPrivateKey: String) {
-        self.scheme = scheme
-        self.signingPrivateKey = signingPrivateKey
-        self.encryptionPrivateKey = encryptionPrivateKey
+        _ = try verifyRegistrationFile(reg, pinnedAt: 0)
+        return reg
     }
 }

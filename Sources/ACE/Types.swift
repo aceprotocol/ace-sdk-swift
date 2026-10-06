@@ -7,9 +7,9 @@
 
 import Foundation
 
-// MARK: - Identity Types
+// MARK: - Identity
 
-public enum SigningScheme: String, Codable, Sendable {
+public enum SigningScheme: String, Codable, Sendable, CaseIterable {
     case ed25519
     case secp256k1
 }
@@ -26,27 +26,28 @@ public enum HardwareBacking: String, Codable, Sendable {
     case tee
 }
 
-// MARK: - ACEIdentity Protocol
-
-/// Interface that all ACE identity implementations must satisfy.
-/// Software keys (Tier 0), HSM (Tier 1), and TEE/SE (Tier 2) all conform to this protocol.
+/// What the SDK needs from an identity (software, Secure Enclave, HSM, ...).
+///
+/// `decrypt`: an `ACEError` passes through unchanged (`decryption_failed` is permanent);
+/// any other thrown error is reported by the SDK as `identity_unavailable` (local,
+/// retryable). A Keychain / Secure Enclave wrapper borrows its X-Wing seed inside
+/// `decrypt` and calls `ACEEncryption.decrypt(kemCiphertext:payload:seed:conversationId:)`.
 public protocol ACEIdentity: Sendable {
-    func getEncryptionPublicKey() -> Data
-    func getSigningPublicKey() -> Data
-    func sign(_ data: Data) throws -> (signature: Data, scheme: SigningScheme)
-    /// Decrypt a message body. `kemCiphertext` is the 1120-byte X-Wing ciphertext,
-    /// `payload` is nonce[12] || ciphertext || tag[16].
-    func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data
-    func getAddress() -> String
-    func getSigningScheme() -> SigningScheme
-    func getTier() -> IdentityTier
     func getACEId() -> String
+    func getSigningScheme() -> SigningScheme
+    func getSigningPublicKey() -> Data
+    func getEncryptionPublicKey() -> Data
+    /// Sign a 32-byte signData digest. ed25519: 64 bytes. secp256k1: r‖s‖v (65 bytes, low-S, v ∈ {0,1}).
+    func sign(_ data: Data) throws -> Data
+    /// `kemCiphertext` is the 1120-byte X-Wing ciphertext, `payload` is nonce[12] ‖ ct ‖ tag[16].
+    func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data
 }
 
-// MARK: - Registration File Types
+// MARK: - Registration file
 
-public struct PricingInfo: Codable, Sendable {
-    public let model: String // "per-call" | "per-token" | "per-hour" | "flat"
+public struct PricingInfo: Codable, Sendable, Equatable {
+    /// "per-call" | "per-token" | "per-hour" | "flat"
+    public let model: String
     public let amount: String
     public let currency: String
 
@@ -57,7 +58,7 @@ public struct PricingInfo: Codable, Sendable {
     }
 }
 
-public struct Capability: Codable, Sendable {
+public struct Capability: Codable, Sendable, Equatable {
     public let id: String
     public let description: String
     public let input: String?
@@ -73,8 +74,9 @@ public struct Capability: Codable, Sendable {
     }
 }
 
-public struct ChainInfo: Codable, Sendable {
-    public let network: String // CAIP-2 format
+public struct ChainInfo: Codable, Sendable, Equatable {
+    /// CAIP-2.
+    public let network: String
     public let address: String
 
     public init(network: String, address: String) {
@@ -83,90 +85,13 @@ public struct ChainInfo: Codable, Sendable {
     }
 }
 
-// MARK: - Discovery Profile
-
-public struct ProfilePricing: Codable, Sendable {
-    public let currency: String
-    public let maxAmount: String?
-
-    public init(currency: String, maxAmount: String? = nil) {
-        self.currency = currency
-        self.maxAmount = maxAmount
-    }
-}
-
-public struct AgentProfile: Codable, Sendable {
-    public var name: String?
-    public var description: String?
-    public var image: String?
-    public var tags: [String]?
-    public var capabilities: [String]?
-    public var chains: [String]?
-    public var endpoint: String?
-    public var pricing: ProfilePricing?
-
-    public init(
-        name: String? = nil,
-        description: String? = nil,
-        image: String? = nil,
-        tags: [String]? = nil,
-        capabilities: [String]? = nil,
-        chains: [String]? = nil,
-        endpoint: String? = nil,
-        pricing: ProfilePricing? = nil
-    ) {
-        self.name = name
-        self.description = description
-        self.image = image
-        self.tags = tags
-        self.capabilities = capabilities
-        self.chains = chains
-        self.endpoint = endpoint
-        self.pricing = pricing
-    }
-}
-
-public struct DiscoverQuery: Codable, Sendable {
-    public var q: String?
-    public var tags: String?
-    public var chain: String?
-    public var scheme: String?
-    public var online: Bool?
-    public var limit: Int?
-    public var cursor: String?
-
-    public init(
-        q: String? = nil, tags: String? = nil, chain: String? = nil,
-        scheme: String? = nil, online: Bool? = nil, limit: Int? = nil, cursor: String? = nil
-    ) {
-        self.q = q
-        self.tags = tags
-        self.chain = chain
-        self.scheme = scheme
-        self.online = online
-        self.limit = limit
-        self.cursor = cursor
-    }
-}
-
-public struct DiscoverAgent: Codable, Sendable {
-    public let aceId: String
-    public let encryptionPublicKey: String
-    public let signingPublicKey: String
-    public let scheme: SigningScheme
-    public let profile: AgentProfile
-}
-
-public struct DiscoverResult: Codable, Sendable {
-    public let agents: [DiscoverAgent]
-    public let cursor: String?
-}
-
-public struct SigningConfig: Codable, Sendable {
+public struct SigningConfig: Codable, Sendable, Equatable {
     public let scheme: SigningScheme
     public let address: String
-    public var signingPublicKey: String? // Base64, required for secp256k1
-    public let encryptionPublicKey: String // Base64, always required
+    /// Base64; required for secp256k1.
+    public var signingPublicKey: String?
+    /// Base64 of the 1216-byte X-Wing public key.
+    public let encryptionPublicKey: String
 
     public init(scheme: SigningScheme, address: String, signingPublicKey: String? = nil, encryptionPublicKey: String) {
         self.scheme = scheme
@@ -176,9 +101,10 @@ public struct SigningConfig: Codable, Sendable {
     }
 }
 
-public struct RegistrationFile: Codable, Sendable {
-    public let ace: String // "1.0"
-    public let id: String // ace:sha256:<fingerprint>
+/// `/.well-known/ace.json`. Semantic checks are in `verifyRegistrationFile`.
+public struct RegistrationFile: Codable, Sendable, Equatable {
+    public let ace: String
+    public let id: String
     public let name: String
     public var description: String?
     public let endpoint: String
@@ -214,39 +140,153 @@ public struct RegistrationFile: Codable, Sendable {
         self.settlement = settlement
         self.chains = chains
     }
+
+    /// Parse the wire JSON (strict types, unknown fields ignored, optional `null` = absent).
+    /// Failures are `invalid_registration`.
+    public init(json: Data) throws {
+        let v: JValue
+        do { v = try JSONParser.parse(json) } catch {
+            throw ACEError(.invalidRegistration, "registration file is not JSON")
+        }
+        self = try RegistrationFile.parse(v)
+    }
 }
 
-// MARK: - Message Types
+// MARK: - Discovery profile
 
-public enum MessageType: String, Codable, Sendable {
-    // Economic
-    case rfq, offer, accept, reject
-    case invoice, receipt
-    case deliver, confirm
-    // System
+public struct ProfilePricing: Codable, Sendable, Equatable {
+    public let currency: String
+    public let maxAmount: String?
+
+    public init(currency: String, maxAmount: String? = nil) {
+        self.currency = currency
+        self.maxAmount = maxAmount
+    }
+}
+
+/// Relay discovery profile (self-asserted metadata). All fields optional.
+public struct AgentProfile: Codable, Sendable, Equatable {
+    public var name: String?
+    public var description: String?
+    public var image: String?
+    public var tags: [String]?
+    public var capabilities: [String]?
+    public var chains: [String]?
+    public var endpoint: String?
+    public var pricing: ProfilePricing?
+
+    public init(
+        name: String? = nil,
+        description: String? = nil,
+        image: String? = nil,
+        tags: [String]? = nil,
+        capabilities: [String]? = nil,
+        chains: [String]? = nil,
+        endpoint: String? = nil,
+        pricing: ProfilePricing? = nil
+    ) {
+        self.name = name
+        self.description = description
+        self.image = image
+        self.tags = tags
+        self.capabilities = capabilities
+        self.chains = chains
+        self.endpoint = endpoint
+        self.pricing = pricing
+    }
+}
+
+/// Query parameters for `GET /v1/discover`.
+public struct DiscoverQuery: Codable, Sendable, Equatable {
+    public var q: String?
+    public var tags: String?
+    public var chain: String?
+    public var scheme: String?
+    public var online: Bool?
+    public var limit: Int?
+    public var cursor: String?
+
+    public init(
+        q: String? = nil, tags: String? = nil, chain: String? = nil,
+        scheme: String? = nil, online: Bool? = nil, limit: Int? = nil, cursor: String? = nil
+    ) {
+        self.q = q
+        self.tags = tags
+        self.chain = chain
+        self.scheme = scheme
+        self.online = online
+        self.limit = limit
+        self.cursor = cursor
+    }
+}
+
+/// Wire shape of `GET /v1/peer` and each `/v1/discover` entry. Verify with `verifyPeerRecord`.
+public struct PeerRecord: Codable, Sendable, Equatable {
+    public let aceId: String
+    /// Kept as a string so an unsupported scheme is reported as `invalid_peer`.
+    public let scheme: String
+    public let encryptionPublicKey: String
+    public let signingPublicKey: String
+    public let registrationSignature: String
+    public let registeredAt: Int
+    public let profile: AgentProfile?
+
+    public init(
+        aceId: String, scheme: String, encryptionPublicKey: String, signingPublicKey: String,
+        registrationSignature: String, registeredAt: Int, profile: AgentProfile? = nil
+    ) {
+        self.aceId = aceId
+        self.scheme = scheme
+        self.encryptionPublicKey = encryptionPublicKey
+        self.signingPublicKey = signingPublicKey
+        self.registrationSignature = registrationSignature
+        self.registeredAt = registeredAt
+        self.profile = profile
+    }
+
+    /// Parse the wire JSON strictly. Failures are `invalid_peer`.
+    public init(json: Data) throws {
+        let v: JValue
+        do { v = try JSONParser.parse(json) } catch {
+            throw ACEError(.invalidPeer, "peer record is not JSON")
+        }
+        self = try PeerRecord.parse(v)
+    }
+}
+
+// MARK: - Messages
+
+public enum MessageType: String, Codable, Sendable, CaseIterable {
+    case rfq, offer, accept, reject, invoice, receipt, deliver, confirm
     case info
-    // Social
     case text
+
+    /// The eight economic types (tracked by the thread state machine).
+    public var isEconomic: Bool {
+        switch self {
+        case .info, .text: return false
+        default: return true
+        }
+    }
 }
 
-public let economicTypes: Set<MessageType> = [
-    .rfq, .offer, .accept, .reject,
-    .invoice, .receipt,
-    .deliver, .confirm,
-]
+/// All ten message types, in protocol order.
+public let messageTypes: [MessageType] = MessageType.allCases
+/// The eight economic types, in protocol order.
+public let economicTypes: [MessageType] = MessageType.allCases.filter(\.isEconomic)
 
-public let systemTypes: Set<MessageType> = [.info]
-public let socialTypes: Set<MessageType> = [.text]
+public func isMessageType(_ value: String) -> Bool { MessageType(rawValue: value) != nil }
+public func isEconomicType(_ type: MessageType) -> Bool { type.isEconomic }
 
-public func isEconomicType(_ type: MessageType) -> Bool { economicTypes.contains(type) }
-public func isSystemType(_ type: MessageType) -> Bool { systemTypes.contains(type) }
-public func isSocialType(_ type: MessageType) -> Bool { socialTypes.contains(type) }
+/// A JSON object body as produced by `JSONSerialization`
+/// (`String`, `NSNumber`, `NSNull`, `[Any]`, `[String: Any]`).
+public typealias JSONObject = [String: Any]
 
-// MARK: - Message Envelope
-
-public struct EncryptionEnvelope: Codable, Sendable {
-    public let kemCiphertext: String // Base64(X-Wing ciphertext[1120])
-    public let payload: String // Base64(nonce || ciphertext || tag)
+public struct EncryptionEnvelope: Codable, Sendable, Equatable {
+    /// Base64(X-Wing ciphertext[1120]).
+    public let kemCiphertext: String
+    /// Base64(nonce ‖ ciphertext ‖ tag).
+    public let payload: String
 
     public init(kemCiphertext: String, payload: String) {
         self.kemCiphertext = kemCiphertext
@@ -254,9 +294,10 @@ public struct EncryptionEnvelope: Codable, Sendable {
     }
 }
 
-public struct SignatureEnvelope: Codable, Sendable {
+public struct SignatureEnvelope: Codable, Sendable, Equatable {
     public let scheme: SigningScheme
-    public let value: String // Base64 (ed25519) or 0x-hex (secp256k1)
+    /// Base64 (ed25519) or `0x` + 130 lowercase hex (secp256k1).
+    public let value: String
 
     public init(scheme: SigningScheme, value: String) {
         self.scheme = scheme
@@ -264,14 +305,17 @@ public struct SignatureEnvelope: Codable, Sendable {
     }
 }
 
-public struct ACEMessage: Codable, Sendable {
-    public let ace: String // "1.0"
+/// A decoded envelope. Obtain from `decodeEnvelope` or `createMessage`.
+///
+/// `Codable` decoding rejects `"threadId": null`; full validation is `decodeEnvelope`.
+public struct ACEMessage: Codable, Sendable, Equatable {
+    public let ace: String
     public let messageId: String
-    public let from: String // ACE ID
-    public let to: String // ACE ID
+    public let from: String
+    public let to: String
     public let conversationId: String
     public let type: MessageType
-    public var threadId: String?
+    public let threadId: String?
     public let timestamp: Int
     public let encryption: EncryptionEnvelope
     public let signature: SignatureEnvelope
@@ -299,36 +343,96 @@ public struct ACEMessage: Codable, Sendable {
         self.encryption = encryption
         self.signature = signature
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case ace, messageId, from, to, conversationId, type, threadId, timestamp, encryption, signature
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ace = try c.decode(String.self, forKey: .ace)
+        messageId = try c.decode(String.self, forKey: .messageId)
+        from = try c.decode(String.self, forKey: .from)
+        to = try c.decode(String.self, forKey: .to)
+        conversationId = try c.decode(String.self, forKey: .conversationId)
+        type = try c.decode(MessageType.self, forKey: .type)
+        if c.contains(.threadId) {
+            if try c.decodeNil(forKey: .threadId) {
+                throw DecodingError.dataCorruptedError(forKey: .threadId, in: c, debugDescription: "threadId must not be null")
+            }
+            threadId = try c.decode(String.self, forKey: .threadId)
+        } else {
+            threadId = nil
+        }
+        timestamp = try c.decode(Int.self, forKey: .timestamp)
+        encryption = try c.decode(EncryptionEnvelope.self, forKey: .encryption)
+        signature = try c.decode(SignatureEnvelope.self, forKey: .signature)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(ace, forKey: .ace)
+        try c.encode(messageId, forKey: .messageId)
+        try c.encode(from, forKey: .from)
+        try c.encode(to, forKey: .to)
+        try c.encode(conversationId, forKey: .conversationId)
+        try c.encode(type, forKey: .type)
+        try c.encodeIfPresent(threadId, forKey: .threadId)
+        try c.encode(timestamp, forKey: .timestamp)
+        try c.encode(encryption, forKey: .encryption)
+        try c.encode(signature, forKey: .signature)
+    }
+
+    /// The wire JSON (compact, keys sorted).
+    public func jsonData() -> Data {
+        JSONWriter.serialize(jvalue)
+    }
+
+    var jvalue: JValue {
+        var o: [String: JValue] = [
+            "ace": .string(ace),
+            "messageId": .string(messageId),
+            "from": .string(from),
+            "to": .string(to),
+            "conversationId": .string(conversationId),
+            "type": .string(type.rawValue),
+            "timestamp": .number(String(timestamp)),
+            "encryption": .object([
+                "kemCiphertext": .string(encryption.kemCiphertext),
+                "payload": .string(encryption.payload),
+            ]),
+            "signature": .object([
+                "scheme": .string(signature.scheme.rawValue),
+                "value": .string(signature.value),
+            ]),
+        ]
+        if let threadId { o["threadId"] = .string(threadId) }
+        return .object(o)
+    }
 }
 
-// MARK: - ACE Errors
+/// A verified, decrypted and validated inbound message.
+///
+/// `@unchecked Sendable`: `body` holds only immutable Foundation JSON values produced by
+/// the SDK's decoder.
+public struct ParsedMessage: @unchecked Sendable {
+    public let messageId: String
+    public let from: String
+    public let to: String
+    public let conversationId: String
+    public let type: MessageType
+    public let threadId: String?
+    public let timestamp: Int
+    public let body: JSONObject
 
-public enum ACEError: Error, CustomStringConvertible {
-    case invalidKey(String)
-    case encryptionFailed(String)
-    case decryptionFailed(String)
-    case signatureVerificationFailed(String)
-    case invalidMessage(String)
-    case invalidRegistration(String)
-    case timestampNotFresh(Int)
-    case replayDetected(String)
-    case payloadTooLarge(Int)
-    case invalidACEId(String)
-    case invalidTransition(String)
-
-    public var description: String {
-        switch self {
-        case .invalidKey(let msg): return "Invalid key: \(msg)"
-        case .encryptionFailed(let msg): return "Encryption failed: \(msg)"
-        case .decryptionFailed(let msg): return "Decryption failed: \(msg)"
-        case .signatureVerificationFailed(let msg): return "Signature verification failed: \(msg)"
-        case .invalidMessage(let msg): return "Invalid message: \(msg)"
-        case .invalidRegistration(let msg): return "Invalid registration: \(msg)"
-        case .timestampNotFresh(let drift): return "Timestamp not fresh: drift \(drift)s exceeds max 300s"
-        case .replayDetected(let id): return "Replay detected: messageId '\(id)' already processed or below replay horizon"
-        case .payloadTooLarge(let size): return "Payload too large: \(size) bytes exceeds max \(ACEEncryption.maxPayloadSize)"
-        case .invalidACEId(let id): return "Invalid ACE ID: '\(id)'"
-        case .invalidTransition(let msg): return "Invalid transition: \(msg)"
-        }
+    public init(messageId: String, from: String, to: String, conversationId: String, type: MessageType, threadId: String?, timestamp: Int, body: JSONObject) {
+        self.messageId = messageId
+        self.from = from
+        self.to = to
+        self.conversationId = conversationId
+        self.type = type
+        self.threadId = threadId
+        self.timestamp = timestamp
+        self.body = body
     }
 }

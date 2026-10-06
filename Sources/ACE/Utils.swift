@@ -2,112 +2,31 @@
 //  Utils.swift
 //  ACE SDK
 //
-//  Shared utility functions: Base64, hex, Base58, EIP-55, constant-time comparison.
+//  Base58, EIP-55, secp256k1 addresses, ACE IDs and constant-time comparison.
 //
 
 import Foundation
 import CryptoKit
 import P256K
 
-// MARK: - Base64
-
-public enum ACEBase64 {
-    public static func encode(_ data: Data) -> String {
-        data.base64EncodedString()
-    }
-
-    /// Strictly decode padded standard Base64.
-    ///
-    /// With `maxLength`, anything longer than the padded encoding of `maxLength`
-    /// bytes is refused before decoding (DoS guard).
-    public static func decode(_ string: String, maxLength: Int? = nil, what: String = "Base64 value") throws -> Data {
-        if let maxLength {
-            let maxEncoded = ((maxLength + 2) / 3) * 4
-            guard string.utf8.count <= maxEncoded else {
-                throw ACEError.invalidMessage("\(what) too large: \(string.utf8.count) Base64 chars exceeds max \(maxEncoded)")
-            }
-        }
-        guard let data = Data(base64Encoded: string) else {
-            throw ACEError.invalidMessage("Invalid Base64 string")
-        }
-        if let maxLength, data.count > maxLength {
-            throw ACEError.invalidMessage("\(what) too large: \(data.count) bytes exceeds max \(maxLength)")
-        }
-        return data
-    }
-}
-
-// MARK: - Hex
-
-public enum ACEHex {
-    private static let hexChars: [UInt8] = Array("0123456789abcdef".utf8)
-
-    public static func encode(_ data: Data) -> String {
-        var result = [UInt8](repeating: 0, count: data.count * 2)
-        for (i, byte) in data.enumerated() {
-            result[i * 2] = hexChars[Int(byte >> 4)]
-            result[i * 2 + 1] = hexChars[Int(byte & 0x0F)]
-        }
-        return String(bytes: result, encoding: .ascii)!
-    }
-
-    public static func decode(_ string: String) throws -> Data {
-        var hex = string
-        if hex.hasPrefix("0x") || hex.hasPrefix("0X") {
-            hex = String(hex.dropFirst(2))
-        }
-        guard hex.count % 2 == 0 else {
-            throw ACEError.invalidMessage("Hex string must have even length")
-        }
-        var data = Data(capacity: hex.count / 2)
-        var chars = hex.makeIterator()
-        while let hi = chars.next(), let lo = chars.next() {
-            guard let hNib = hexVal(hi), let lNib = hexVal(lo) else {
-                throw ACEError.invalidMessage("Invalid hex character")
-            }
-            data.append(hNib << 4 | lNib)
-        }
-        return data
-    }
-
-    private static func hexVal(_ c: Character) -> UInt8? {
-        switch c {
-        case "0"..."9": return UInt8(c.asciiValue! - Character("0").asciiValue!)
-        case "a"..."f": return UInt8(c.asciiValue! - Character("a").asciiValue!) + 10
-        case "A"..."F": return UInt8(c.asciiValue! - Character("A").asciiValue!) + 10
-        default: return nil
-        }
-    }
-}
-
 // MARK: - Base58 (Bitcoin alphabet)
 
-public enum Base58: Sendable {
+enum Base58 {
+    private static let alphabet = Array("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".utf8)
 
-    private static let alphabet = Array("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-
-    /// Reverse lookup table: ASCII value → alphabet index (0–57), or -1 for invalid.
     private static let decodeTable: [Int8] = {
         var table = [Int8](repeating: -1, count: 128)
-        for (i, ch) in alphabet.enumerated() {
-            table[Int(ch.asciiValue!)] = Int8(i)
-        }
+        for (i, ch) in alphabet.enumerated() { table[Int(ch)] = Int8(i) }
         return table
     }()
 
-    /// Encode raw bytes to a Base58 string.
-    public static func encode(_ data: Data) -> String {
-        guard !data.isEmpty else { return "" }
+    /// Inputs longer than this are refused (decoding is O(n²)).
+    static let maxDecodeLength = 128
 
+    static func encode(_ data: Data) -> String {
         let bytes = [UInt8](data)
-
-        // Count leading zeros → leading '1's
-        var leadingZeros = 0
-        for b in bytes {
-            if b == 0 { leadingZeros += 1 } else { break }
-        }
-
-        // Base conversion: big-endian bytes → base-58 digits
+        guard !bytes.isEmpty else { return "" }
+        let leadingZeros = bytes.prefix(while: { $0 == 0 }).count
         var digits: [UInt8] = [0]
         for byte in bytes {
             var carry = Int(byte)
@@ -121,49 +40,22 @@ public enum Base58: Sendable {
                 carry /= 58
             }
         }
-
-        // Strip trailing zeros in digits (= leading zeros in big-endian output).
-        while digits.count > 1 && digits.last == 0 {
-            digits.removeLast()
+        while digits.count > 1 && digits.last == 0 { digits.removeLast() }
+        var out = [UInt8](repeating: alphabet[0], count: leadingZeros)
+        if leadingZeros < bytes.count {
+            out.append(contentsOf: digits.reversed().map { alphabet[Int($0)] })
         }
-        var result = String(repeating: "1", count: leadingZeros)
-        if leadingZeros < data.count {
-            for d in digits.reversed() {
-                result.append(alphabet[Int(d)])
-            }
-        }
-        return result
+        return String(decoding: out, as: UTF8.self)
     }
 
-    /// Maximum Base58 input length. ed25519 keys (32 bytes) encode to ~44 chars.
-    /// 128 chars is generous enough for any key format while blocking DoS via O(n²) decode.
-    public static let maxDecodeLength = 128
-
-    /// Decode a Base58 string to raw bytes.
-    /// - Throws: `ACEError.invalidMessage` on illegal characters or oversized input.
-    public static func decode(_ string: String) throws -> Data {
-        guard !string.isEmpty else { return Data() }
-        guard string.count <= maxDecodeLength else {
-            throw ACEError.invalidMessage("Base58 input too long: \(string.count) chars exceeds max \(maxDecodeLength)")
-        }
-
-        // Count leading '1's → leading zero bytes
-        var leadingOnes = 0
-        for ch in string {
-            if ch == "1" { leadingOnes += 1 } else { break }
-        }
-
-        // Base conversion: base-58 digits → big-endian bytes (O(1) lookup per char)
+    static func decode(_ string: String) -> Data? {
+        let chars = Array(string.utf8)
+        guard !chars.isEmpty, chars.count <= maxDecodeLength else { return chars.isEmpty ? Data() : nil }
+        let leadingOnes = chars.prefix(while: { $0 == alphabet[0] }).count
         var bytes: [UInt8] = [0]
-        for ch in string {
-            guard let ascii = ch.asciiValue, ascii < 128 else {
-                throw ACEError.invalidMessage("Invalid Base58 character: \(ch)")
-            }
-            let value = decodeTable[Int(ascii)]
-            guard value >= 0 else {
-                throw ACEError.invalidMessage("Invalid Base58 character: \(ch)")
-            }
-            var carry = Int(value)
+        for ch in chars {
+            guard ch < 128, decodeTable[Int(ch)] >= 0 else { return nil }
+            var carry = Int(decodeTable[Int(ch)])
             for j in 0..<bytes.count {
                 carry += Int(bytes[j]) * 58
                 bytes[j] = UInt8(carry & 0xFF)
@@ -174,89 +66,60 @@ public enum Base58: Sendable {
                 carry >>= 8
             }
         }
-
-        // Strip trailing zeros (= leading zeros in big-endian)
-        while bytes.count > 1 && bytes.last == 0 {
-            bytes.removeLast()
-        }
-
-        let leadingZeros = Data(repeating: 0, count: leadingOnes)
-        // If all chars were leading '1's, bytes is just [0] — already covered by leadingZeros
-        if leadingOnes == string.count {
-            return leadingZeros
-        }
-        return leadingZeros + Data(bytes.reversed())
+        while bytes.count > 1 && bytes.last == 0 { bytes.removeLast() }
+        if leadingOnes == chars.count { return Data(repeating: 0, count: leadingOnes) }
+        return Data(repeating: 0, count: leadingOnes) + Data(bytes.reversed())
     }
 }
 
-// MARK: - EIP-55 Checksum Address
+// MARK: - EIP-55 / secp256k1 address
 
-enum EIP55 {
-    static func checksum(_ address: String) -> String {
-        let addr = address.lowercased().replacingOccurrences(of: "0x", with: "")
-        precondition(addr.count <= 64, "EIP55.checksum: address exceeds 64 hex chars")
-        let hash = ACEHex.encode(Data(Keccak256.hash(Data(addr.utf8))))
-        var result = "0x"
-        for (i, c) in addr.enumerated() {
-            let hashChar = hash[hash.index(hash.startIndex, offsetBy: i)]
-            if let v = hashChar.hexDigitValue, v >= 8 {
-                result.append(c.uppercased().first!)
-            } else {
-                result.append(c)
-            }
-        }
-        return result
+func eip55(_ addressHex40: String) -> String {
+    let addr = addressHex40.lowercased()
+    let hash = hexEncode(Keccak256.hash(Data(addr.utf8)))
+    var out = "0x"
+    for (c, h) in zip(addr, hash) {
+        if let v = h.hexDigitValue, v >= 8 { out += c.uppercased() } else { out.append(c) }
     }
+    return out
 }
 
-// MARK: - secp256k1 Address Derivation
+/// EIP-55 address of a 33-byte compressed secp256k1 public key.
+func secp256k1Address(_ compressedPublicKey: Data) throws -> String {
+    guard compressedPublicKey.count == 33 else {
+        throw ACEError(.invalidKey, "secp256k1 public key must be 33 bytes")
+    }
+    let key: P256K.Signing.PublicKey
+    do {
+        key = try P256K.Signing.PublicKey(dataRepresentation: compressedPublicKey, format: .compressed)
+    } catch {
+        throw ACEError(.invalidKey, "secp256k1 public key is not on the curve")
+    }
+    let uncompressed = key.uncompressedRepresentation
+    return eip55(hexEncode(Keccak256.hash(Data(uncompressed.dropFirst())).suffix(20)))
+}
 
-/// Derive Ethereum-style address from a secp256k1 compressed public key (33 bytes).
-/// keccak256(uncompressed[1:]) → last 20 bytes → EIP-55 hex
-public func secp256k1Address(_ compressedPubKey: Data) throws -> String {
-    guard compressedPubKey.count == 33 else {
-        throw ACEError.invalidKey("secp256k1 compressed public key must be 33 bytes, got \(compressedPubKey.count)")
+/// ed25519: Base58 of the key. secp256k1: EIP-55 address of the compressed key.
+func signingAddress(scheme: SigningScheme, signingPublicKey: Data) -> String {
+    switch scheme {
+    case .ed25519: return Base58.encode(signingPublicKey)
+    case .secp256k1: return (try? secp256k1Address(signingPublicKey)) ?? ""
     }
-    // Decompress using P256K.Signing.PublicKey (has uncompressedRepresentation)
-    let pubKey = try P256K.Signing.PublicKey(dataRepresentation: compressedPubKey, format: .compressed)
-    let uncompressed = pubKey.uncompressedRepresentation
-    guard uncompressed.count == 65, uncompressed[0] == 0x04 else {
-        throw ACEError.invalidKey("Failed to decompress secp256k1 public key")
-    }
-    // keccak256(uncompressed[1:]) → last 20 bytes
-    let hash = Keccak256.hash(uncompressed.dropFirst())
-    let addr = "0x" + ACEHex.encode(hash.suffix(20))
-    return EIP55.checksum(addr)
 }
 
 // MARK: - ACE ID
 
-/// Compute ACE ID from a signing public key.
-/// aceId = "ace:sha256:" + hex(SHA-256(signingPublicKeyBytes))
+/// `ace:sha256:` + hex(SHA-256(signingPublicKey)).
 public func computeACEId(_ signingPublicKey: Data) -> String {
-    let hash = Data(SHA256.hash(data: signingPublicKey))
-    return "ace:sha256:" + ACEHex.encode(hash)
+    "ace:sha256:" + sha256Hex(signingPublicKey)
 }
 
-// MARK: - Regex Full Match
+// MARK: - Constant-time comparison
 
-extension NSRegularExpression {
-    /// True only if the match covers the whole string (`$` alone also matches before a final "\n").
-    func fullMatch(_ string: String) -> Bool {
-        let range = NSRange(string.startIndex..., in: string)
-        return firstMatch(in: string, range: range)?.range == range
-    }
-}
-
-// MARK: - Constant-Time Comparison
-
-/// Constant-time byte comparison using system-level timingsafe_bcmp.
-/// Immune to Swift compiler optimizations that could break timing guarantees.
 func constantTimeEqual(_ a: Data, _ b: Data) -> Bool {
     guard a.count == b.count else { return false }
-    return a.withUnsafeBytes { aPtr in
-        b.withUnsafeBytes { bPtr in
-            timingsafe_bcmp(aPtr.baseAddress!, bPtr.baseAddress!, a.count) == 0
-        }
+    guard !a.isEmpty else { return true }
+    return a.withUnsafeBytes { ap in
+        b.withUnsafeBytes { bp in timingsafe_bcmp(ap.baseAddress!, bp.baseAddress!, a.count) == 0 }
     }
 }
