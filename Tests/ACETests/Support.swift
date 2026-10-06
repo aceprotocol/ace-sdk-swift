@@ -28,6 +28,11 @@ func json(_ object: Any) -> Data {
     try! JSONSerialization.data(withJSONObject: object, options: [.fragmentsAllowed])
 }
 
+/// A Foundation JSON object as a body.
+func jsonBody(_ object: Any) -> [String: JSONValue] {
+    try! JSONValue(json: json(object)).objectValue!
+}
+
 func jvalue(_ object: Any) -> JValue {
     try! JSONParser.parse(json(object))
 }

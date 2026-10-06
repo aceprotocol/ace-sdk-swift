@@ -278,10 +278,6 @@ public let economicTypes: [MessageType] = MessageType.allCases.filter(\.isEconom
 public func isMessageType(_ value: String) -> Bool { MessageType(rawValue: value) != nil }
 public func isEconomicType(_ type: MessageType) -> Bool { type.isEconomic }
 
-/// A JSON object body as produced by `JSONSerialization`
-/// (`String`, `NSNumber`, `NSNull`, `[Any]`, `[String: Any]`).
-public typealias JSONObject = [String: Any]
-
 public struct EncryptionEnvelope: Codable, Sendable, Equatable {
     /// Base64(X-Wing ciphertext[1120]).
     public let kemCiphertext: String
@@ -412,10 +408,7 @@ public struct ACEMessage: Codable, Sendable, Equatable {
 }
 
 /// A verified, decrypted and validated inbound message.
-///
-/// `@unchecked Sendable`: `body` holds only immutable Foundation JSON values produced by
-/// the SDK's decoder.
-public struct ParsedMessage: @unchecked Sendable {
+public struct ParsedMessage: Sendable, Equatable {
     public let messageId: String
     public let from: String
     public let to: String
@@ -423,9 +416,9 @@ public struct ParsedMessage: @unchecked Sendable {
     public let type: MessageType
     public let threadId: String?
     public let timestamp: Int
-    public let body: JSONObject
+    public let body: [String: JSONValue]
 
-    public init(messageId: String, from: String, to: String, conversationId: String, type: MessageType, threadId: String?, timestamp: Int, body: JSONObject) {
+    public init(messageId: String, from: String, to: String, conversationId: String, type: MessageType, threadId: String?, timestamp: Int, body: [String: JSONValue]) {
         self.messageId = messageId
         self.from = from
         self.to = to

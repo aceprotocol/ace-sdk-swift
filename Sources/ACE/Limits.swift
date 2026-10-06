@@ -25,6 +25,9 @@ public enum ACELimits {
     public static let maxRegistrationFileBytes = 1048576
     /// `/v1/inbox` `limit` maximum.
     public static let maxInboxPage = 100
+    /// Non-terminal economic threads one peer may hold open with this agent (04). A
+    /// message that would open one more is `limit_exceeded`.
+    public static let maxOpenThreadsPerPeer = 1000
 
     public static let kemSeedSize = 32
     public static let kemPublicKeySize = 1216

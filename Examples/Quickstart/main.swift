@@ -22,7 +22,7 @@ let parsed = try parseMessage(
     threads: ThreadStateMachine(localAceId: bob.getACEId()),
     replay: ReplayDetector()
 )
-precondition(parsed.body["need"] as? String == "Translate 500 words EN→FR")
+precondition(parsed.body["need"]?.stringValue == "Translate 500 words EN→FR")
 print("local:", parsed.type, parsed.body)
 
 // MARK: 2. Pipeline: Outbox → transport → Inbox, with durable state
@@ -45,7 +45,7 @@ let outbox = try await Outbox.open(identity: alice, store: aliceStore)
 
 let staged = try await outbox.stage(recipient: bobPinned, type: .rfq, body: ["need": "Summarize a PDF"], threadId: "job-42")
 // With a relay: `try await outbox.deliver(staged.requestId) { try await relay.send($0) }`
-// and on the receiving side `await inbox.pull(relay)` or `for try await o in inbox.follow(relay)`.
+// and on the receiving side `await inbox.pull(relay).messages` or `for try await o in inbox.follow(relay)`.
 try await outbox.deliver(staged.requestId) { envelope in
     let outcome = await inbox.receive(envelope.jsonData(), source: .direct)
     guard case .delivered = outcome else { throw outcome.error ?? ACEError(.relayRejected) }

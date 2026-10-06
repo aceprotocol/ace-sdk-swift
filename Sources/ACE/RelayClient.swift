@@ -70,8 +70,12 @@ public actor RelayClient {
 
     /// The normalized base URL (lowercase scheme and host, no trailing `/`).
     public nonisolated let baseURL: URL
-    nonisolated let baseURLString: String
+    /// `baseURL` as a string: the normalized relay key (lowercase scheme and host, no
+    /// trailing `/`). Use it for `ReceiveSource.relay(url:)`; `Inbox` keys cursors by it.
+    public nonisolated let baseURLString: String
     private let session: URLSession
+    /// `listen`'s own session (see `init`); created on first use.
+    private var streamSession: URLSession?
     private let timeout: TimeInterval
     private let maxResponseBytes: Int
     private let clock: @Sendable () -> Int
@@ -83,6 +87,13 @@ public actor RelayClient {
     static let maxBackoffSeconds = 30.0
     static let idleTimeoutSeconds = 90.0
 
+    /// `session` carries every request-response call. `listen` does not use it directly:
+    /// it opens a dedicated session from a copy of `session.configuration` (same
+    /// protocol classes, proxy, TLS and cookie settings, and the same delegate) with
+    /// `timeoutIntervalForResource = .infinity` and `timeoutIntervalForRequest = 90 s`,
+    /// the idle limit after which `listen` reconnects. A host session tuned for short
+    /// calls (a 60 s resource timeout, say) therefore cannot kill the SSE stream, and a
+    /// silent stream is still detected.
     public init(
         baseURL: URL,
         session: URLSession = .shared,
@@ -109,6 +120,21 @@ public actor RelayClient {
         self.maxResponseBytes = maxResponseBytes
         self.clock = clock
         self.sleeper = sleeper
+    }
+
+    deinit {
+        streamSession?.finishTasksAndInvalidate()
+    }
+
+    /// The session `listen` connects with (see `init`).
+    func listenSession() -> URLSession {
+        if let streamSession { return streamSession }
+        let config = session.configuration
+        config.timeoutIntervalForResource = .infinity
+        config.timeoutIntervalForRequest = Self.idleTimeoutSeconds
+        let made = URLSession(configuration: config, delegate: session.delegate, delegateQueue: nil)
+        streamSession = made
+        return made
     }
 
     // MARK: API
@@ -230,14 +256,22 @@ public actor RelayClient {
     ///
     /// Reconnects internally with backoff 1, 2, 4 … 30 s (honoring `Retry-After`), resuming
     /// after the last yielded `streamId`; `drain` reconnects at once; `connected` and
-    /// heartbeats are ignored. Ten consecutive failed connects end the stream with
-    /// `relay_unavailable`; a non-retryable status ends it with the mapped error; a frame
-    /// larger than `MAX_ENVELOPE_BYTES + 512` ends it with `relay_protocol_error`.
-    public nonisolated func listen(_ identity: any ACEIdentity, since: String? = nil) -> AsyncThrowingStream<Event, Error> {
+    /// heartbeats are ignored; 90 s without a byte reconnects. Ten consecutive failed
+    /// connects end the stream with `relay_unavailable`; a non-retryable status ends it
+    /// with the mapped error; a frame larger than `MAX_ENVELOPE_BYTES + 512` ends it with
+    /// `relay_protocol_error`.
+    ///
+    /// `onConnect` is called each time a connection is established (HTTP 200,
+    /// `text/event-stream`), before its first event. Cancelling the consuming task or
+    /// dropping the stream cancels the HTTP request at once, also while the stream only
+    /// carries heartbeats and during a backoff sleep. Uses the dedicated stream session
+    /// described in `init`.
+    public nonisolated func listen(_ identity: any ACEIdentity, since: String? = nil,
+                                   onConnect: (@Sendable () -> Void)? = nil) -> AsyncThrowingStream<Event, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.runListen(identity, since: since, continuation)
+                    try await self.runListen(identity, since: since, onConnect: onConnect, continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error is CancellationError ? nil : error)
@@ -249,7 +283,8 @@ public actor RelayClient {
 
     // MARK: Listen internals
 
-    private func runListen(_ identity: any ACEIdentity, since: String?, _ out: AsyncThrowingStream<Event, Error>.Continuation) async throws {
+    private func runListen(_ identity: any ACEIdentity, since: String?, onConnect: (@Sendable () -> Void)?,
+                           _ out: AsyncThrowingStream<Event, Error>.Continuation) async throws {
         var cursor = since ?? "-"
         guard cursor == "-" || isStreamCursor(cursor) else { throw ACEError(.invalidArgument, "since must be a stream ID") }
         var failures = 0
@@ -257,7 +292,7 @@ public actor RelayClient {
             try Task.checkCancellation()
             do {
                 // A clean end (drain or EOF) reconnects at once.
-                try await connectOnce(identity, cursor: &cursor, out, onProgress: { failures = 0 })
+                try await connectOnce(identity, cursor: &cursor, onConnect: onConnect, out, onProgress: { failures = 0 })
                 failures = 0
                 continue
             } catch let e as ACEError where e.code == .relayUnavailable {
@@ -271,13 +306,14 @@ public actor RelayClient {
     }
 
     /// One connection; returns after `drain` or a clean end of stream.
-    private func connectOnce(_ identity: any ACEIdentity, cursor: inout String,
+    private func connectOnce(_ identity: any ACEIdentity, cursor: inout String, onConnect: (@Sendable () -> Void)?,
                              _ out: AsyncThrowingStream<Event, Error>.Continuation,
                              onProgress: () -> Void) async throws {
         var q: [(String, String)] = []
         if cursor != "-" { q.append(("since", cursor)) }
         var bytes: URLSession.AsyncBytes?
         var http: HTTPURLResponse?
+        let session = listenSession()
         for attempt in 0..<2 {
             var request = try makeRequest("GET", "/v1/listen", query: q, body: nil)
             // URLSession's request timeout is an idle timeout: a silent stream is dropped.
@@ -288,9 +324,10 @@ public actor RelayClient {
             let b: URLSession.AsyncBytes
             do {
                 (b, response) = try await session.bytes(for: request)
-            } catch is CancellationError {
-                throw CancellationError()
             } catch {
+                if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
+                    throw CancellationError()
+                }
                 throw ACEError(.relayUnavailable, "listen connect failed: \(error.localizedDescription)")
             }
             guard let h = response as? HTTPURLResponse else { throw ACEError(.relayProtocolError, "not an HTTP response") }
@@ -306,30 +343,50 @@ public actor RelayClient {
         guard let bytes, let http else { throw ACEError(.relayProtocolError, "listen connect failed") }
         let media = (http.value(forHTTPHeaderField: "Content-Type") ?? "")
             .split(separator: ";", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
-        guard media == "text/event-stream" else { throw ACEError(.relayProtocolError, "listen response is not text/event-stream") }
+        guard media == "text/event-stream" else {
+            bytes.task.cancel()
+            throw ACEError(.relayProtocolError, "listen response is not text/event-stream")
+        }
         onProgress()
+        onConnect?()
         var parser = SSEParser(maxLine: ACELimits.maxEnvelopeBytes + 512)
+        // Cancel the data task itself on task cancellation, so a stream that only carries
+        // heartbeats (or nothing) is torn down at once; every exit path cancels it too.
+        let dataTask = bytes.task
+        defer { dataTask.cancel() }
         do {
-            for try await byte in bytes {
-                guard let frame = try parser.feed(byte) else { continue }
-                switch frame.event {
-                case "catchup", "message":
-                    guard let id = frame.id, isStreamCursor(id), !frame.data.isEmpty else { continue }
-                    cursor = id
-                    onProgress()
-                    out.yield(Event(streamId: id, envelope: Data(frame.data), catchup: frame.event == "catchup"))
-                case "drain":
-                    return
-                default:
-                    onProgress()
-                }
+            try await withTaskCancellationHandler {
+                try await readEvents(bytes, &parser, cursor: &cursor, out, onProgress: onProgress)
+            } onCancel: {
+                dataTask.cancel()
             }
         } catch let e as ACEError {
             throw e
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
+            if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
+                throw CancellationError()
+            }
             throw ACEError(.relayUnavailable, "listen stream failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Feed the stream to `parser`; returns at `drain` or end of stream.
+    private func readEvents(_ bytes: URLSession.AsyncBytes, _ parser: inout SSEParser, cursor: inout String,
+                            _ out: AsyncThrowingStream<Event, Error>.Continuation, onProgress: () -> Void) async throws {
+        for try await byte in bytes {
+            guard let frame = try parser.feed(byte) else { continue }
+            try Task.checkCancellation()
+            switch frame.event {
+            case "catchup", "message":
+                guard let id = frame.id, isStreamCursor(id), !frame.data.isEmpty else { continue }
+                cursor = id
+                onProgress()
+                out.yield(Event(streamId: id, envelope: Data(frame.data), catchup: frame.event == "catchup"))
+            case "drain":
+                return
+            default:
+                onProgress()
+            }
         }
     }
 
@@ -393,9 +450,10 @@ public actor RelayClient {
             return (http, try await readBounded(bytes))
         } catch let e as ACEError {
             throw e
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
+            if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
+                throw CancellationError()
+            }
             throw ACEError(.relayUnavailable, "relay request failed: \(error.localizedDescription)")
         }
     }
@@ -411,9 +469,10 @@ public actor RelayClient {
             }
         } catch let e as ACEError {
             throw e
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
+            if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
+                throw CancellationError()
+            }
             throw ACEError(.relayUnavailable, "relay read failed: \(error.localizedDescription)")
         }
         return data

@@ -8,6 +8,10 @@
 import Foundation
 
 /// Every SDK-originated failure. `category` is a fixed function of `code`.
+///
+/// Equality compares `code` only (message, status, relayCode and retryAfterSeconds are
+/// diagnostics), so `#expect(throws: ACEError(.replay)) { … }` and `error == ACEError(.replay)`
+/// match any `replay` failure.
 public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
 
     /// Stable, cross-language error codes (identical strings in the TS and Python SDKs).
@@ -96,6 +100,9 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
 
     /// `category != .permanent`.
     public var isTransient: Bool { category != .permanent }
+
+    /// Same `code`; the other fields are ignored.
+    public static func == (lhs: ACEError, rhs: ACEError) -> Bool { lhs.code == rhs.code }
 
     public var description: String {
         message == code.rawValue ? code.rawValue : "\(code.rawValue): \(message)"

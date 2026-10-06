@@ -71,14 +71,17 @@ struct CoreTests {
             try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x"],
                               threads: try ThreadStateMachine(localAceId: bob.getACEId()))
         }
-        expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": Double.nan], threads: threads) }
-        expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": Date()], threads: threads) }
+        expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": .number(.nan)], threads: threads) }
+        expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x", "n": .number(.infinity)], threads: threads) }
         expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": 1], threads: threads) }
-        var deep: Any = ["a": 1]
-        for _ in 0..<33 { deep = ["a": deep] }
+        var deep: JSONValue = ["a": 1]
+        for _ in 0..<31 { deep = ["a": deep] }
+        // Depth 32 (body object = 0) is accepted, 33 is not.
+        _ = try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x", "d": deep], threads: threads)
+        deep = ["a": deep]
         expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x", "d": deep], threads: threads) }
         expectCode(.limitExceeded) {
-            try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": String(repeating: "a", count: 65500)], threads: threads)
+            try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": .string(String(repeating: "a", count: 65500))], threads: threads)
         }
         expectCode(.transitionNotAllowed) {
             let t = try ThreadStateMachine(localAceId: alice.getACEId())
@@ -97,7 +100,7 @@ struct CoreTests {
                              threads: try ThreadStateMachine(localAceId: receiver.getACEId()),
                              replay: try replay ?? ReplayDetector(horizon: now - 300), floor: floor, clock: { 1741000000 })
         }
-        #expect(try parse(env).body["message"] as? String == "x")
+        #expect(try parse(env).body["message"]?.stringValue == "x")
         expectCode(.wrongRecipient) { try parse(env, receiver: Fixtures.agent("alice")) }
         expectCode(.invalidEnvelope) { try parse(env, sender: peerB) }
         expectCode(.invalidArgument) { try parse(env, floor: now + 1) }

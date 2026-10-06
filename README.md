@@ -45,7 +45,8 @@ let inbox = try await Inbox.open(identity: me, store: store, peers: peers) { mes
     try await myDatabase.saveOnce(from: message.from, id: message.messageId, body: message.body)
 }
 Task {
-    for try await outcome in inbox.follow(relay) {   // pull the backlog, then SSE
+    // The backlog's outcomes first, then live SSE outcomes; onLive fires once connected.
+    for try await outcome in inbox.follow(relay, onLive: { print("live") }) {
         if case .quarantined(let error, _) = outcome { print("rejected:", error) }
     }
 }
@@ -62,7 +63,12 @@ do {
 ```
 
 - `Inbox.receive(_:source:)` also accepts directly delivered envelopes (`.direct`, e.g. from your own HTTP endpoint); it returns `.delivered`, `.duplicate`, `.quarantined` or `.retryable`.
-- `Inbox.pull(relay)` drains the relay inbox from the durable cursor.
+- `Inbox.pull(relay, limit:maxPages:)` drains the relay inbox from the durable cursor and returns a `PullResult`: `outcomes` (delivered / duplicate / quarantined, in relay order; `messages`, `delivered`, `duplicates`, `quarantined` are derived), `blocked` (the retryable error that stopped it) and `hasMore` (stopped by `maxPages`). `inbox.cursor(for: relay)` is the durable cursor.
+- Hand-fed relay entries use `.relay(url: relay.baseURLString, streamId:)`: `baseURLString` is the normalized cursor key.
+- `RelayClient.listen` runs on its own session derived from the injected one (`timeoutIntervalForResource = .infinity`, 90 s idle request timeout), so a short host timeout cannot kill the SSE stream. Cancelling the consumer closes the connection immediately.
+- Bodies are `[String: JSONValue]` (Sendable, literal-friendly: `["need": "x", "ttl": 60]`). Numbers are `Double`; integers up to 2^53−1 round-trip exactly and are written without a fraction.
+- `ACEError` equality compares `code` only: `#expect(throws: ACEError(.replay)) { … }`.
+- A peer may hold at most `ACELimits.maxOpenThreadsPerPeer` (1000) non-terminal threads; one more is `limit_exceeded`.
 - A custom `ACEStore` (database, wallet-scoped storage) can replace `FileStore`.
 - `VerifiedPeer.profile` is unverified relay metadata; only the keys are verified.
 
@@ -95,6 +101,8 @@ final class EnclaveIdentity: ACEIdentity {
     …
 }
 ```
+
+`createRegistrationFile(for: enclave, name:endpoint:…)` builds and verifies its registration file, so `verifyRegistrationFile(try createRegistrationFile(for: enclave, …))` yields a `VerifiedPeer` (`SoftwareIdentity.toRegistrationFile` is the same function).
 
 `ACEEncryption` also exposes `publicKey(fromSeed:)`, `generateSeed()` and `computeConversationId(pubA:pubB:)`.
 

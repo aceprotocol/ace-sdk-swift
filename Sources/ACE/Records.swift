@@ -121,15 +121,17 @@ struct DeliveryRecord {
 
     func data() throws -> Data {
         let m = message
-        let messageObject: [String: Any] = [
-            "body": m.body, "conversationId": m.conversationId, "from": m.from, "messageId": m.messageId,
-            "threadId": m.threadId as Any? ?? NSNull(), "timestamp": m.timestamp, "to": m.to, "type": m.type.rawValue,
-        ]
-        let threadObject: Any = thread.map { snapshotFoundation($0) } ?? NSNull()
-        return try persistedJSON([
-            "fingerprint": fingerprint, "message": messageObject, "receivedAt": receivedAt, "source": source,
-            "status": status.rawValue, "thread": threadObject, "version": 1,
-        ] as [String: Any])
+        guard let body = JSONValue.object(m.body).jvalue else { throw ACEError(.storageFailed, "delivery body is not finite JSON") }
+        let messageObject: JValue = .object([
+            "body": body, "conversationId": .string(m.conversationId), "from": .string(m.from),
+            "messageId": .string(m.messageId), "threadId": m.threadId.map { .string($0) } ?? .null,
+            "timestamp": num(m.timestamp), "to": .string(m.to), "type": .string(m.type.rawValue),
+        ])
+        return JSONWriter.serialize(.object([
+            "fingerprint": .string(fingerprint), "message": messageObject, "receivedAt": num(receivedAt),
+            "source": .string(source), "status": .string(status.rawValue), "thread": thread?.jvalue ?? .null,
+            "version": num(1),
+        ]))
     }
 
     static func parse(_ v: JValue, key: String) throws -> DeliveryRecord {
@@ -138,7 +140,7 @@ struct DeliveryRecord {
         guard let fingerprint = o["fingerprint"]?.stringValue, let receivedAt = o["receivedAt"]?.wireInt,
               let source = o["source"]?.stringValue, source == "relay" || source == "direct",
               let statusText = o["status"]?.stringValue, let status = DeliveryStatus(rawValue: statusText),
-              let m = o["message"]?.objectValue, let body = m["body"], case .object = body,
+              let m = o["message"]?.objectValue, let rawBody = m["body"], let body = JSONValue(rawBody)?.objectValue,
               let c = m["conversationId"]?.stringValue, let from = m["from"]?.stringValue,
               let mid = m["messageId"]?.stringValue, let ts = m["timestamp"]?.wireInt, let to = m["to"]?.stringValue,
               let typeText = m["type"]?.stringValue, let type = MessageType(rawValue: typeText) else {
@@ -152,18 +154,10 @@ struct DeliveryRecord {
         var thread: ThreadSnapshot?
         if let t = o["thread"], !t.isNull { thread = try ThreadSnapshot.parse(t, key: key) }
         let message = ParsedMessage(messageId: mid, from: from, to: to, conversationId: c, type: type, threadId: threadId,
-                                    timestamp: ts, body: body.foundation as! JSONObject)
+                                    timestamp: ts, body: body)
         return DeliveryRecord(fingerprint: fingerprint, message: message, receivedAt: receivedAt, source: source,
                               status: status, thread: thread)
     }
-}
-
-func snapshotFoundation(_ s: ThreadSnapshot) -> [String: Any] {
-    [
-        "conversationId": s.conversationId,
-        "history": s.history.map { ["from": $0.from, "messageId": $0.messageId, "timestamp": $0.timestamp, "type": $0.type.rawValue] as [String: Any] },
-        "localAceId": s.localAceId, "peerAceId": s.peerAceId, "state": s.state.rawValue, "threadId": s.threadId,
-    ]
 }
 
 // MARK: - Quarantine

@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "ace-sdk",
+    name: "ace-sdk-swift",
     platforms: [.macOS(.v26), .iOS(.v26)],
     products: [
         .library(name: "ACE", targets: ["ACE"]),

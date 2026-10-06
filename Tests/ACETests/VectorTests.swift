@@ -72,14 +72,13 @@ struct VectorTests {
         let parsed = try parseMessage(env, receiver: bob, sender: try peerOf(alice),
                                       threads: try ThreadStateMachine(localAceId: bob.getACEId()),
                                       replay: try ReplayDetector(horizon: ts - 1), clock: { ts })
-        #expect(NSDictionary(dictionary: parsed.body).isEqual(to: em["expectedBody"] as! [String: Any]))
+        #expect(parsed.body == jsonBody(em["expectedBody"]!))
         let seed = Data(base64Encoded: Fixtures.agentInfo("bob")["encryptionPrivateKey"] as! String)!
         let enc = envObj["encryption"] as! [String: String]
         let raw = try ACEEncryption.decrypt(kemCiphertext: Data(base64Encoded: enc["kemCiphertext"]!)!,
                                             payload: Data(base64Encoded: enc["payload"]!)!, seed: seed,
                                             conversationId: envObj["conversationId"] as! String)
-        let obj = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
-        #expect(NSDictionary(dictionary: obj).isEqual(to: em["expectedBody"] as! [String: Any]))
+        #expect(try JSONValue(json: raw).objectValue == jsonBody(em["expectedBody"]!))
     }
 
     // MARK: envelopes / bodies
@@ -140,7 +139,7 @@ struct VectorTests {
                             type: MessageType(rawValue: type)!, messageId: mid(i), timestamp: 1741000000 + i,
                             from: role(from), to: role(to))
         do {
-            return try sm.apply(e, body: body).rawValue
+            return try sm.apply(e, body: jsonBody(body)).rawValue
         } catch let e as ACEError {
             return "error:" + e.code.rawValue
         } catch {

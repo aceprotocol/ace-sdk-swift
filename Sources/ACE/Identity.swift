@@ -129,7 +129,7 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         )
     }
 
-    /// Build this identity's registration file; throws `invalid_registration` if invalid.
+    /// `createRegistrationFile(for: self, …)`.
     public func toRegistrationFile(
         name: String,
         endpoint: String,
@@ -140,25 +140,51 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         settlement: [String]? = nil,
         chains: [ChainInfo]? = nil
     ) throws -> RegistrationFile {
-        let reg = RegistrationFile(
-            ace: "1.0",
-            id: aceId,
-            name: name,
-            description: description,
-            endpoint: endpoint,
-            tier: tier,
-            hardwareBacking: hardwareBacking,
-            signing: SigningConfig(
-                scheme: scheme,
-                address: getAddress(),
-                signingPublicKey: scheme == .secp256k1 ? ACEBase64.encode(signingPublicKey) : nil,
-                encryptionPublicKey: ACEBase64.encode(encryptionPublicKey)
-            ),
-            capabilities: capabilities,
-            settlement: settlement,
-            chains: chains
-        )
-        _ = try verifyRegistrationFile(reg, pinnedAt: 0)
-        return reg
+        try createRegistrationFile(for: self, name: name, endpoint: endpoint, description: description, tier: tier,
+                                   hardwareBacking: hardwareBacking, capabilities: capabilities, settlement: settlement,
+                                   chains: chains)
     }
+}
+
+/// The registration file (01) of any identity, built from its public keys and verified
+/// with `verifyRegistrationFile` before it is returned (`invalid_registration` /
+/// `invalid_key` when a field or key is invalid). Works for custom identities
+/// (Secure Enclave, HSM): `verifyRegistrationFile(createRegistrationFile(for: id, …))` yields
+/// a `VerifiedPeer` without hand-building the file.
+///
+/// `signing.address` is Base58(signing key) for ed25519 and the EIP-55 address for
+/// secp256k1, which also carries `signingPublicKey`.
+public func createRegistrationFile(
+    for identity: any ACEIdentity,
+    name: String,
+    endpoint: String,
+    description: String? = nil,
+    tier: IdentityTier = .keyOnly,
+    hardwareBacking: HardwareBacking? = nil,
+    capabilities: [Capability]? = nil,
+    settlement: [String]? = nil,
+    chains: [ChainInfo]? = nil
+) throws -> RegistrationFile {
+    let scheme = identity.getSigningScheme()
+    let signingPublicKey = identity.getSigningPublicKey()
+    let reg = RegistrationFile(
+        ace: "1.0",
+        id: identity.getACEId(),
+        name: name,
+        description: description,
+        endpoint: endpoint,
+        tier: tier,
+        hardwareBacking: hardwareBacking,
+        signing: SigningConfig(
+            scheme: scheme,
+            address: signingAddress(scheme: scheme, signingPublicKey: signingPublicKey),
+            signingPublicKey: scheme == .secp256k1 ? ACEBase64.encode(signingPublicKey) : nil,
+            encryptionPublicKey: ACEBase64.encode(identity.getEncryptionPublicKey())
+        ),
+        capabilities: capabilities,
+        settlement: settlement,
+        chains: chains
+    )
+    _ = try verifyRegistrationFile(reg, pinnedAt: 0)
+    return reg
 }

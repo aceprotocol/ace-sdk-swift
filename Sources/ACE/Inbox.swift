@@ -9,7 +9,9 @@ import Foundation
 
 /// Where an envelope came from.
 public enum ReceiveSource: Sendable, Equatable {
-    /// Fetched from a relay. `streamId` advances the durable cursor for `url`.
+    /// Fetched from a relay. `streamId` advances the durable cursor keyed by `url`
+    /// normalized (lowercase scheme and host, no trailing `/`). Pass
+    /// `relayClient.baseURLString` — the key `pull`, `follow` and `cursor(for:)` use.
     case relay(url: String, streamId: String?)
     /// Delivered directly (unauthenticated until verified; rejections are not persisted).
     case direct
@@ -32,14 +34,38 @@ public enum ReceiveOutcome: Sendable {
         default: return nil
         }
     }
+
+    /// The message of a `delivered` outcome.
+    public var message: ParsedMessage? {
+        if case .delivered(let m) = self { return m }
+        return nil
+    }
 }
 
-/// Totals of `Inbox.pull`. `blocked` is the error that stopped it, if any.
+/// The result of `Inbox.pull`.
 public struct PullResult: Sendable {
-    public let delivered: Int
-    public let duplicates: Int
-    public let quarantined: Int
+    /// Every `delivered`, `duplicate` and `quarantined` outcome, in relay order. The
+    /// cursor has passed all of them. Never contains `retryable`: that stops the pull
+    /// and is reported in `blocked`.
+    public let outcomes: [ReceiveOutcome]
+    /// The error that stopped the pull before the inbox was drained (a fetch failure or a
+    /// `retryable` outcome); nil when drained or stopped by `maxPages`. The cursor stops
+    /// before the blocking entry, so the next pull retries it.
     public let blocked: ACEError?
+    /// `maxPages` stopped the pull after a full page; more entries may be waiting.
+    public let hasMore: Bool
+
+    public init(outcomes: [ReceiveOutcome], blocked: ACEError?, hasMore: Bool = false) {
+        self.outcomes = outcomes
+        self.blocked = blocked
+        self.hasMore = hasMore
+    }
+
+    /// The delivered messages, in relay order.
+    public var messages: [ParsedMessage] { outcomes.compactMap(\.message) }
+    public var delivered: Int { outcomes.count(where: { if case .delivered = $0 { true } else { false } }) }
+    public var duplicates: Int { outcomes.count(where: { if case .duplicate = $0 { true } else { false } }) }
+    public var quarantined: Int { outcomes.count(where: { if case .quarantined = $0 { true } else { false } }) }
 }
 
 /// Durable, exactly-once-to-the-host receive engine.
@@ -138,9 +164,9 @@ public actor Inbox {
         receiveLock.release()
     }
 
-    /// The durable cursor for a relay URL (normalized), or nil.
-    public func cursor(_ relayURL: String) -> String? {
-        normalizeRelayURL(relayURL).flatMap { cursors[$0] }
+    /// The durable cursor (last passed stream ID) for `relay`, or nil before the first entry.
+    public func cursor(for relay: RelayClient) -> String? {
+        cursors[relay.baseURLString]
     }
 
     // MARK: Open
@@ -418,6 +444,8 @@ public actor Inbox {
         let parsed: ParsedMessage
         do {
             parsed = try parseMessage(env, receiver: identity, sender: peer, threads: machine, replay: tr, floor: floor, clock: clock)
+            // A verified message that opens a thread counts against the peer's open threads.
+            if env.type.isEconomic && rec == nil { try threads.checkCanOpenThread(peer: env.from) }
         } catch let e as ACEError {
             if e.code == .replay { return .done(.duplicate(from: env.from, messageId: env.messageId)) }
             if e.category != .permanent { return .done(.retryable(e)) }
@@ -469,46 +497,63 @@ public actor Inbox {
 
     // MARK: Relay drivers
 
-    /// Fetch and receive queued messages from the cursor; stops at the first retryable outcome.
-    public func pull(_ relay: RelayClient, limit: Int = ACELimits.maxInboxPage) async -> PullResult {
-        let url = relay.baseURLString
-        var delivered = 0, duplicates = 0, quarantined = 0
-        var since = cursors[url]
+    /// Fetch and receive queued entries from the durable cursor, page by page, until the
+    /// relay inbox is drained, a `retryable` outcome or fetch failure blocks it, or
+    /// `maxPages` full pages were fetched (`hasMore`). Never throws: argument errors
+    /// (`limit` outside 1…100, `maxPages` < 1) are reported in `blocked`.
+    public func pull(_ relay: RelayClient, limit: Int = ACELimits.maxInboxPage, maxPages: Int? = nil) async -> PullResult {
+        await pull(relay, limit: limit, maxPages: maxPages, yield: nil)
+    }
+
+    private func pull(_ relay: RelayClient, limit: Int, maxPages: Int?,
+                      yield: (@Sendable (ReceiveOutcome) -> Void)?) async -> PullResult {
+        if let maxPages, maxPages < 1 {
+            return PullResult(outcomes: [], blocked: ACEError(.invalidArgument, "maxPages must be >= 1"))
+        }
+        var outcomes: [ReceiveOutcome] = []
+        var pages = 0
         while true {
+            if let maxPages, pages >= maxPages { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
+            pages += 1
             let page: RelayClient.InboxPage
             do {
-                page = try await relay.fetchInbox(identity, since: since, limit: limit)
+                page = try await relay.fetchInbox(identity, since: cursors[relay.baseURLString], limit: limit)
             } catch {
-                return PullResult(delivered: delivered, duplicates: duplicates, quarantined: quarantined,
-                                  blocked: error as? ACEError ?? ACEError(.relayUnavailable, "\(error)"))
+                return PullResult(outcomes: outcomes, blocked: error as? ACEError ?? ACEError(.relayUnavailable, "\(error)"))
             }
             for entry in page.entries {
-                switch await receive(entry.envelope, source: .relay(url: url, streamId: entry.streamId)) {
-                case .delivered: delivered += 1
-                case .duplicate: duplicates += 1
-                case .quarantined: quarantined += 1
-                case .retryable(let e):
-                    return PullResult(delivered: delivered, duplicates: duplicates, quarantined: quarantined, blocked: e)
-                }
+                let outcome = await receive(entry.envelope, source: .relay(url: relay.baseURLString, streamId: entry.streamId))
+                if case .retryable(let e) = outcome { return PullResult(outcomes: outcomes, blocked: e) }
+                outcomes.append(outcome)
+                yield?(outcome)
             }
-            if page.entries.count < limit {
-                return PullResult(delivered: delivered, duplicates: duplicates, quarantined: quarantined, blocked: nil)
-            }
-            since = page.entries.last?.streamId
+            if page.entries.count < limit { return PullResult(outcomes: outcomes, blocked: nil) }
         }
     }
 
-    /// `pull`, then receive live SSE events and yield each outcome. Throws the blocking
-    /// error of the initial pull, or a `retryable` outcome's error right after yielding it.
-    public nonisolated func follow(_ relay: RelayClient) -> AsyncThrowingStream<ReceiveOutcome, Error> {
+    /// Receive everything queued, then live events, as one stream of outcomes:
+    ///
+    /// 1. A full `pull`, yielding each of its outcomes as it happens. If it is blocked,
+    ///    the stream throws the blocking error.
+    /// 2. `relay.listen` from the durable cursor; each event is received and its outcome
+    ///    yielded. After yielding a `retryable` outcome the stream throws its error.
+    ///
+    /// `onLive` is called once the initial pull has finished and the SSE connection is
+    /// open, and again after every reconnect — use it for a "live" indicator. It runs on
+    /// the stream's task and must not block. Outcomes may still be buffered in the stream
+    /// when it is called. Cancelling the consuming task or dropping the stream closes the
+    /// connection promptly.
+    public nonisolated func follow(_ relay: RelayClient, onLive: (@Sendable () -> Void)? = nil) -> AsyncThrowingStream<ReceiveOutcome, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let result = await self.pull(relay)
+                    let result = await self.pull(relay, limit: ACELimits.maxInboxPage, maxPages: nil,
+                                                 yield: { continuation.yield($0) })
                     if let blocked = result.blocked { throw blocked }
-                    let url = relay.baseURLString
-                    for try await event in relay.listen(self.identity, since: await self.cursor(url)) {
-                        let outcome = await self.receive(event.envelope, source: .relay(url: url, streamId: event.streamId))
+                    try Task.checkCancellation()
+                    let events = relay.listen(self.identity, since: await self.cursor(for: relay), onConnect: onLive)
+                    for try await event in events {
+                        let outcome = await self.receive(event.envelope, source: .relay(url: relay.baseURLString, streamId: event.streamId))
                         continuation.yield(outcome)
                         if case .retryable(let e) = outcome { throw e }
                     }

@@ -82,7 +82,7 @@ public actor Outbox {
     public func stage(
         recipient: VerifiedPeer,
         type: MessageType,
-        body: sending JSONObject,
+        body: [String: JSONValue],
         threadId: String? = nil,
         requestId: String? = nil
     ) throws -> PendingSend {
@@ -98,6 +98,7 @@ public actor Outbox {
                 if rec?.pending != nil {
                     throw ACEError(.pendingSendConflict, "the thread already has a pending send")
                 }
+                if rec == nil { try threads.checkCanOpenThread(peer: recipient.aceId) }
                 let machine = try threads.machine(for: rec)
                 let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
                                             threads: machine, threadId: threadId, timestamp: now)

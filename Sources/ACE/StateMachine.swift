@@ -157,7 +157,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
 
     // MARK: Core rules (caller holds the lock or is the initializer)
 
-    private func decide(_ e: ThreadEvent, body: JSONObject?, checkRefs: Bool) throws -> ThreadState {
+    private func decide(_ e: ThreadEvent, body: [String: JSONValue]?, checkRefs: Bool) throws -> ThreadState {
         guard let threadId = e.threadId, isThreadId(threadId) else {
             throw ACEError(.invalidEnvelope, "economic messages require a valid threadId")
         }
@@ -179,7 +179,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
             }
         }
         if checkRefs, let field = referenceFields[e.type] {
-            guard let ref = body?[field] as? String, !isJSONBool(body?[field] as Any) else {
+            guard let ref = body?[field]?.stringValue else {
                 throw ACEError(.invalidBody, "\(e.type.rawValue).\(field) is required")
             }
             let history = thread?.history ?? []
@@ -214,7 +214,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
     // MARK: Public API
 
     /// Throw the deterministic error `apply` would throw; never mutates. Non-economic: no-op.
-    public func check(_ e: ThreadEvent, body: JSONObject) throws {
+    public func check(_ e: ThreadEvent, body: [String: JSONValue]) throws {
         guard e.type.isEconomic else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -224,7 +224,7 @@ public final class ThreadStateMachine: @unchecked Sendable {
     /// Check and apply; returns the resulting state (non-economic: the current state, or
     /// `idle` without a threadId).
     @discardableResult
-    public func apply(_ e: ThreadEvent, body: JSONObject) throws -> ThreadState {
+    public func apply(_ e: ThreadEvent, body: [String: JSONValue]) throws -> ThreadState {
         lock.lock()
         defer { lock.unlock() }
         guard e.type.isEconomic else {

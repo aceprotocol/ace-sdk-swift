@@ -14,7 +14,14 @@ struct StoredThread {
 
 /// Persistent economic thread state. Every load replays the history through
 /// `ThreadStateMachine`; a record that fails to replay is `storage_failed` and is never
-/// reset. Terminal threads without a pending send are deleted 30 days after their last entry.
+/// reset.
+///
+/// Retention (at most hourly): terminal threads without a pending send, and non-terminal
+/// threads with no entry from `localAceId`, are deleted 30 days after their last entry.
+///
+/// A per-peer index of non-terminal threads (`threads/index/<sha256hex(peerAceId)>.json`,
+/// `{"open":[<thread record key>…sorted],"version":1}`) bounds how many threads one peer
+/// can hold open: `ACELimits.maxOpenThreadsPerPeer`.
 public final class ThreadStore: Sendable {
     /// 30 days (04 retention, > OFFLINE_WINDOW_SECONDS).
     static let retentionSeconds = 2_592_000
@@ -42,6 +49,15 @@ public final class ThreadStore: Sendable {
         "threads/" + sha256Hex(conversationId, threadId) + ".json"
     }
 
+    static func indexKey(peerAceId: String) -> String {
+        "threads/index/" + sha256Hex(Data(peerAceId.utf8)) + ".json"
+    }
+
+    /// Thread record keys (`threads/<hex>.json`), excluding the peer index.
+    private func recordKeys() throws -> [String] {
+        try store.checkedList("threads/").filter { !$0.dropFirst("threads/".count).contains("/") }
+    }
+
     // MARK: Public
 
     public func get(conversationId: String, threadId: String) throws -> ThreadSnapshot? {
@@ -50,14 +66,12 @@ public final class ThreadStore: Sendable {
 
     /// Every stored thread, sorted by (conversationId, threadId).
     public func list() throws -> [ThreadSnapshot] {
-        try store.checkedList("threads/").compactMap { try load(key: $0)?.snapshot }
+        try recordKeys().compactMap { try load(key: $0)?.snapshot }
             .sorted { ($0.conversationId, $0.threadId) < ($1.conversationId, $1.threadId) }
     }
 
     public func remove(conversationId: String, threadId: String) throws {
-        try store.withLock("threads") {
-            try store.checkedDelete(Self.key(conversationId: conversationId, threadId: threadId))
-        }
+        try store.withLock("threads") { try delete(conversationId: conversationId, threadId: threadId) }
     }
 
     /// Economic types `senderAceId` may send next (`[.rfq]` for an unknown thread).
@@ -108,7 +122,55 @@ public final class ThreadStore: Sendable {
         fields["version"] = .number("1")
         let key = Self.key(conversationId: record.snapshot.conversationId, threadId: record.snapshot.threadId)
         try store.checkedWrite(key, JSONWriter.serialize(.object(fields)))
+        try updateIndex(peer: record.snapshot.peerAceId, key: key, open: !record.snapshot.state.isTerminal)
         try pruneIfDue(except: key)
+    }
+
+    // MARK: Per-peer open-thread index (caller holds `threads`)
+
+    private func readIndex(_ peer: String) throws -> Set<String> {
+        let key = Self.indexKey(peerAceId: peer)
+        guard let v = try store.readJSON(key) else { return [] }
+        guard let o = v.objectValue, let open = o["open"]?.arrayValue else { throw storageError(key, "malformed thread index") }
+        try checkVersion(o, key)
+        var out = Set<String>()
+        for e in open {
+            guard let s = e.stringValue else { throw storageError(key, "malformed thread index") }
+            out.insert(s)
+        }
+        return out
+    }
+
+    private func writeIndex(_ peer: String, _ open: Set<String>) throws {
+        let key = Self.indexKey(peerAceId: peer)
+        if open.isEmpty { try store.checkedDelete(key); return }
+        try store.checkedWrite(key, JSONWriter.serialize(.object([
+            "open": .array(open.sorted().map { .string($0) }), "version": .number("1"),
+        ])))
+    }
+
+    private func updateIndex(peer: String, key: String, open: Bool) throws {
+        var index = try readIndex(peer)
+        let changed = open ? index.insert(key).inserted : index.remove(key) != nil
+        if changed { try writeIndex(peer, index) }
+    }
+
+    /// `limit_exceeded` when `peer` already holds `ACELimits.maxOpenThreadsPerPeer`
+    /// non-terminal threads. A full index is re-verified against the records first, so a
+    /// stale entry (crash between record and index writes) never blocks a peer.
+    func checkCanOpenThread(peer: String) throws {
+        var index = try readIndex(peer)
+        guard index.count >= ACELimits.maxOpenThreadsPerPeer else { return }
+        let verified = try index.filter { key in
+            guard let rec = try load(key: key) else { return false }
+            return rec.snapshot.peerAceId == peer && !rec.snapshot.state.isTerminal
+        }
+        if verified != index {
+            index = verified
+            try writeIndex(peer, index)
+        }
+        guard index.count >= ACELimits.maxOpenThreadsPerPeer else { return }
+        throw ACEError(.limitExceeded, "peer has \(ACELimits.maxOpenThreadsPerPeer) open threads")
     }
 
     /// Re-derive the state of `history` (no reference checks: bodies are not stored).
@@ -129,11 +191,15 @@ public final class ThreadStore: Sendable {
     }
 
     func delete(conversationId: String, threadId: String) throws {
-        try store.checkedDelete(Self.key(conversationId: conversationId, threadId: threadId))
+        let key = Self.key(conversationId: conversationId, threadId: threadId)
+        let existing: StoredThread? = try? load(key: key)
+        let peer = existing?.snapshot.peerAceId
+        try store.checkedDelete(key)
+        if let peer { try updateIndex(peer: peer, key: key, open: false) }
     }
 
     func records() throws -> [StoredThread] {
-        try store.checkedList("threads/").compactMap { try load(key: $0) }
+        try recordKeys().compactMap { try load(key: $0) }
     }
 
     /// The stored pending send, or nil when `snap` proves its delivery (it is followed by
@@ -174,7 +240,7 @@ public final class ThreadStore: Sendable {
 
     /// Pending sends held in thread records.
     func pendingSends() throws -> [PendingSend] {
-        try store.checkedList("threads/").compactMap { try load(key: $0)?.pending }
+        try recordKeys().compactMap { try load(key: $0)?.pending }
     }
 
     private func pruneIfDue(except current: String) throws {
@@ -184,11 +250,13 @@ public final class ThreadStore: Sendable {
         if due { pruneState.last = now }
         pruneState.lock.unlock()
         guard due else { return }
-        for key in try store.checkedList("threads/") where key != current {
-            guard let record = try? load(key: key) else { continue }
-            guard record.pending == nil, record.snapshot.state.isTerminal,
+        for key in try recordKeys() where key != current {
+            guard let record = try? load(key: key), record.pending == nil,
                   let last = record.snapshot.history.last, last.timestamp < now - Self.retentionSeconds else { continue }
+            let snap = record.snapshot
+            guard snap.state.isTerminal || !snap.history.contains(where: { $0.from == localAceId }) else { continue }
             try store.checkedDelete(key)
+            if !snap.state.isTerminal { try updateIndex(peer: snap.peerAceId, key: key, open: false) }
         }
     }
 }
