@@ -39,6 +39,9 @@ public func validateRegistrationFile(_ reg: RegistrationFile) throws -> Registra
     guard !reg.name.isEmpty else {
         throw ACEError.invalidRegistration("Missing required field: name")
     }
+    guard controlCharPattern.firstMatch(in: reg.name, range: NSRange(reg.name.startIndex..., in: reg.name)) == nil else {
+        throw ACEError.invalidRegistration("Registration name must not contain control characters")
+    }
     guard isHTTPSURL(reg.endpoint) else {
         throw ACEError.invalidRegistration("endpoint must be a valid HTTPS URL")
     }

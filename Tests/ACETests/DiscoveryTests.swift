@@ -102,6 +102,15 @@ struct DiscoveryTests {
             #expect(keys.encryptionPublicKey == identity.getEncryptionPublicKey())
         }
 
+        @Test("rejects control characters in name but imposes no length limit")
+        func nameControlCharacters() throws {
+            let identity = try SoftwareIdentity.generate(scheme: .ed25519)
+            #expect(throws: ACEError.self) {
+                try validateRegistrationFile(identity.toRegistrationFile(name: "Agent\u{1b}[2J", endpoint: "https://a.example.com"))
+            }
+            try validateRegistrationFile(identity.toRegistrationFile(name: String(repeating: "a", count: 1000), endpoint: "https://a.example.com"))
+        }
+
         @Test("rejects invalid ACE version")
         func invalidVersion() throws {
             let identity = try SoftwareIdentity.generate(scheme: .ed25519)
