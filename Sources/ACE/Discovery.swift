@@ -46,6 +46,7 @@ public func validateRegistrationFile(_ reg: RegistrationFile) throws {
     guard !reg.signing.encryptionPublicKey.isEmpty else {
         throw ACEError.invalidRegistration("Missing required field: signing.encryptionPublicKey")
     }
+    _ = try getRegistrationEncryptionPublicKey(reg)
 
     if reg.signing.scheme == .ed25519 {
         let addressPubKey = try Base58.decode(reg.signing.address)
@@ -103,17 +104,28 @@ public func getRegistrationSigningPublicKey(_ reg: RegistrationFile) throws -> D
     throw ACEError.invalidRegistration("Cannot derive signing public key from registration file")
 }
 
-/// Extract the X25519 encryption public key from a validated registration file.
+/// Extract the X-Wing encryption public key (1216 bytes) from a validated registration file.
 public func getRegistrationEncryptionPublicKey(_ reg: RegistrationFile) throws -> Data {
-    return try ACEBase64.decode(reg.signing.encryptionPublicKey)
+    try decodeEncryptionPublicKey(reg.signing.encryptionPublicKey, field: "signing.encryptionPublicKey")
+}
+
+/// Decode a Base64 X-Wing public key carried in a registration file or peer
+/// response. `ACEEncryption` owns the length rule; this only re-labels its
+/// `invalidKey` as `invalidRegistration` for the named field.
+private func decodeEncryptionPublicKey(_ base64: String, field: String) throws -> Data {
+    do {
+        return try ACEEncryption.decodePublicKey(base64: base64)
+    } catch ACEError.invalidKey(let reason) {
+        throw ACEError.invalidRegistration("\(field): \(reason)")
+    }
 }
 
 // MARK: - Encryption-Key Binding (relay-sourced peer keys)
 //
 // `aceId` self-certifies only the SIGNING key (aceId == sha256(signingKey)). The
-// X25519 ENCRYPTION key is separate — on its own an unauthenticated claim. A relay
+// X-Wing ENCRYPTION key is separate — on its own an unauthenticated claim. A relay
 // routes ciphertext and is untrusted by design, so it could hand a client its own
-// X25519 key and read messages the client believes are end-to-end encrypted. The
+// X-Wing key and read messages the client believes are end-to-end encrypted. The
 // binding below is the proof that closes that gap: the exact signature the relay
 // already requires at registration, verifiable with the identity's signing key alone.
 
@@ -155,7 +167,7 @@ public struct VerifiedPeer: Sendable {
 ///   buildSignData("register", aceId, timestamp,
 ///                 encodePayload(encryptionPublicKey, signingPublicKey))
 /// signed by the identity's signing key. This also re-checks
-/// `aceId == sha256(signingPublicKey)`, so `true` means this exact X25519 key was
+/// `aceId == sha256(signingPublicKey)`, so `true` means this exact X-Wing key was
 /// signed by the key that defines this identity. Inputs MUST be the Base64 wire
 /// strings (the signature commits to those strings). Returns `false` on bad input.
 public func verifyEncryptionKeyBinding(
@@ -167,6 +179,8 @@ public func verifyEncryptionKeyBinding(
     signature: String
 ) -> Bool {
     guard timestamp >= 0 else { return false }
+    // The bound key must be a well-formed X-Wing public key.
+    guard (try? ACEEncryption.decodePublicKey(base64: encryptionPublicKey)) != nil else { return false }
     guard let signingPubBytes = try? ACEBase64.decode(signingPublicKey) else { return false }
     // The signing key must be the one that defines this identity.
     guard computeACEId(signingPubBytes) == aceId else { return false }
@@ -179,7 +193,8 @@ public func verifyEncryptionKeyBinding(
 /// Build a ``VerifiedPeer`` from a relay `GET /v1/peer` or `/v1/discover` entry.
 ///
 /// Throws if the binding signature is absent or fails — a relay that substitutes an
-/// X25519 key cannot produce a passing binding. Use the keys with `parseMessageFromPeer`.
+/// X-Wing key cannot produce a passing binding, and neither can a key that is not a
+/// well-formed 1216-byte X-Wing public key. Use the keys with `parseMessageFromPeer`.
 public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer {
     guard validateACEId(data.aceId) else {
         throw ACEError.invalidRegistration("Invalid peer aceId: '\(String(data.aceId.prefix(80)))'")
@@ -188,7 +203,7 @@ public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer
         throw ACEError.invalidRegistration(
             "Peer response is missing the encryption-key binding (registrationSignature/registeredAt); " +
             "its encryptionPublicKey cannot be trusted. Without the binding a relay could substitute " +
-            "its own X25519 key and read messages meant to be end-to-end encrypted."
+            "its own X-Wing key and read messages meant to be end-to-end encrypted."
         )
     }
     guard verifyEncryptionKeyBinding(
@@ -197,15 +212,16 @@ public func verifyPeerResponse(_ data: RelayPeerResponse) throws -> VerifiedPeer
         timestamp: registeredAt, signature: signature
     ) else {
         throw ACEError.signatureVerificationFailed(
-            "Peer encryption-key binding failed verification: the encryptionPublicKey is not signed by " +
-            "this identity's signing key (possible key substitution / relay MITM)."
+            "Peer encryption-key binding failed verification: the encryptionPublicKey is not a well-formed " +
+            "X-Wing key signed by this identity's signing key (possible key substitution / relay MITM)."
         )
     }
+    // The binding check already validated both keys; decode them once for the caller.
     return VerifiedPeer(
         aceId: data.aceId,
         scheme: data.scheme,
         signingPublicKey: try ACEBase64.decode(data.signingPublicKey),
-        encryptionPublicKey: try ACEBase64.decode(data.encryptionPublicKey)
+        encryptionPublicKey: try decodeEncryptionPublicKey(data.encryptionPublicKey, field: "Peer encryptionPublicKey")
     )
 }
 

@@ -34,7 +34,9 @@ public protocol ACEIdentity: Sendable {
     func getEncryptionPublicKey() -> Data
     func getSigningPublicKey() -> Data
     func sign(_ data: Data) throws -> (signature: Data, scheme: SigningScheme)
-    func decrypt(ephemeralPubKey: Data, payload: Data, conversationId: String) throws -> Data
+    /// Decrypt a message body. `kemCiphertext` is the 1120-byte X-Wing ciphertext,
+    /// `payload` is nonce[12] || ciphertext || tag[16].
+    func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data
     func getAddress() -> String
     func getSigningScheme() -> SigningScheme
     func getTier() -> IdentityTier
@@ -243,11 +245,11 @@ public func isSocialType(_ type: MessageType) -> Bool { socialTypes.contains(typ
 // MARK: - Message Envelope
 
 public struct EncryptionEnvelope: Codable, Sendable {
-    public let ephemeralPubKey: String // Base64
+    public let kemCiphertext: String // Base64(X-Wing ciphertext[1120])
     public let payload: String // Base64(nonce || ciphertext || tag)
 
-    public init(ephemeralPubKey: String, payload: String) {
-        self.ephemeralPubKey = ephemeralPubKey
+    public init(kemCiphertext: String, payload: String) {
+        self.kemCiphertext = kemCiphertext
         self.payload = payload
     }
 }

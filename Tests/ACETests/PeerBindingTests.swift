@@ -2,7 +2,7 @@
 //  PeerBindingTests.swift
 //  ACE SDK
 //
-//  Encryption-key binding: a relay must not be able to substitute an X25519 key.
+//  Encryption-key binding: a relay must not be able to substitute an X-Wing key.
 //
 
 import Testing
@@ -44,7 +44,7 @@ struct PeerBindingTests {
         let attacker = try SoftwareIdentity.generate(scheme: scheme)
         let genuine = try relayPeerResponse(victim)
 
-        // Relay keeps the real signing key/aceId but swaps the X25519 key.
+        // Relay keeps the real signing key/aceId but swaps the X-Wing key.
         let poisoned = RelayPeerResponse(
             aceId: genuine.aceId,
             scheme: genuine.scheme,

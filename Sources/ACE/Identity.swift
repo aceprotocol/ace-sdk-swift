@@ -19,7 +19,8 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
 
     private let scheme: SigningScheme
     private let signingPrivateKey: Data
-    private let encryptionPrivateKey: Curve25519.KeyAgreement.PrivateKey
+    /// 32-byte X-Wing private key seed (expands to ML-KEM-768 + X25519 keys).
+    private let encryptionSeed: Data
     private let signingPublicKey: Data
     private let encryptionPublicKey: Data
     private let aceId: String
@@ -28,11 +29,11 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
     private let ed25519SigningKey: Curve25519.Signing.PrivateKey?
     private let secp256k1SigningKey: P256K.Recovery.PrivateKey?
 
-    private init(scheme: SigningScheme, signingPrivateKey: Data, encryptionPrivateKey: Curve25519.KeyAgreement.PrivateKey) throws {
+    private init(scheme: SigningScheme, signingPrivateKey: Data, encryptionSeed: Data) throws {
         self.scheme = scheme
         self.signingPrivateKey = signingPrivateKey
-        self.encryptionPrivateKey = encryptionPrivateKey
-        self.encryptionPublicKey = Data(encryptionPrivateKey.publicKey.rawRepresentation)
+        self.encryptionSeed = encryptionSeed
+        self.encryptionPublicKey = try ACEEncryption.publicKey(fromSeed: encryptionSeed)
 
         switch scheme {
         case .ed25519:
@@ -58,7 +59,7 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
 
     /// Generate a new random identity.
     public static func generate(scheme: SigningScheme) throws -> SoftwareIdentity {
-        let encPriv = Curve25519.KeyAgreement.PrivateKey()
+        let encSeed = ACEEncryption.generateSeed()
         let sigPriv: Data
 
         switch scheme {
@@ -70,15 +71,16 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
             sigPriv = Data(key.dataRepresentation)
         }
 
-        return try SoftwareIdentity(scheme: scheme, signingPrivateKey: sigPriv, encryptionPrivateKey: encPriv)
+        return try SoftwareIdentity(scheme: scheme, signingPrivateKey: sigPriv, encryptionSeed: encSeed)
     }
 
     /// Import from exported key material.
+    /// `encryptionPrivateKey` is the Base64 of the 32-byte X-Wing seed.
     public static func fromExport(_ export: SoftwareIdentityExport) throws -> SoftwareIdentity {
         let sigPriv = try ACEBase64.decode(export.signingPrivateKey)
-        let encPrivBytes = try ACEBase64.decode(export.encryptionPrivateKey)
-        let encPriv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: encPrivBytes)
-        return try SoftwareIdentity(scheme: export.scheme, signingPrivateKey: sigPriv, encryptionPrivateKey: encPriv)
+        let encSeed = try ACEBase64.decode(export.encryptionPrivateKey)
+        try ACEEncryption.validateSeed(encSeed)
+        return try SoftwareIdentity(scheme: export.scheme, signingPrivateKey: sigPriv, encryptionSeed: encSeed)
     }
 
     // MARK: - ACEIdentity Conformance
@@ -131,11 +133,11 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         }
     }
 
-    public func decrypt(ephemeralPubKey: Data, payload: Data, conversationId: String) throws -> Data {
+    public func decrypt(kemCiphertext: Data, payload: Data, conversationId: String) throws -> Data {
         return try ACEEncryption.decrypt(
-            ephemeralPubKey: ephemeralPubKey,
+            kemCiphertext: kemCiphertext,
             payload: payload,
-            recipientPrivateKey: encryptionPrivateKey,
+            seed: encryptionSeed,
             conversationId: conversationId
         )
     }
@@ -163,7 +165,7 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
         SoftwareIdentityExport(
             scheme: scheme,
             signingPrivateKey: ACEBase64.encode(signingPrivateKey),
-            encryptionPrivateKey: ACEBase64.encode(Data(encryptionPrivateKey.rawRepresentation))
+            encryptionPrivateKey: ACEBase64.encode(encryptionSeed)
         )
     }
 
@@ -207,7 +209,7 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
 public struct SoftwareIdentityExport: Codable, Sendable {
     public let scheme: SigningScheme
     public let signingPrivateKey: String // Base64
-    public let encryptionPrivateKey: String // Base64
+    public let encryptionPrivateKey: String // Base64 (32-byte X-Wing seed)
 
     public init(scheme: SigningScheme, signingPrivateKey: String, encryptionPrivateKey: String) {
         self.scheme = scheme

@@ -120,7 +120,7 @@ struct SecurityTests {
             type: .text,
             timestamp: Int(Date().timeIntervalSince1970),
             encryption: EncryptionEnvelope(
-                ephemeralPubKey: ACEBase64.encode(Data(repeating: 1, count: 32)),
+                kemCiphertext: ACEBase64.encode(Data(repeating: 1, count: 1120)),
                 payload: oversizedPayload
             ),
             signature: SignatureEnvelope(

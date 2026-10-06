@@ -310,7 +310,7 @@ struct DiscoveryTests {
 
             let encKey = try getRegistrationEncryptionPublicKey(reg)
             #expect(encKey == identity.getEncryptionPublicKey())
-            #expect(encKey.count == 32)
+            #expect(encKey.count == 1216) // X-Wing
         }
 
         @Test("works with secp256k1 identity")
@@ -323,7 +323,7 @@ struct DiscoveryTests {
 
             let encKey = try getRegistrationEncryptionPublicKey(reg)
             #expect(encKey == identity.getEncryptionPublicKey())
-            #expect(encKey.count == 32)
+            #expect(encKey.count == 1216) // X-Wing
         }
     }
 }

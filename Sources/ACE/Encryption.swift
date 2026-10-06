@@ -2,14 +2,25 @@
 //  Encryption.swift
 //  ACE SDK
 //
-//  X25519 ECDH + HKDF-SHA256 + AES-256-GCM encryption/decryption.
+//  X-Wing hybrid KEM (X25519 + ML-KEM-768) + HKDF-SHA256 + AES-256-GCM.
 //
 //  Encryption flow:
-//    1. Generate ephemeral X25519 key pair (forward secrecy)
-//    2. ECDH(ephemeralPriv, recipientPub) → SharedSecret
-//    3. HKDF-SHA256(sharedSecret, salt=ACE_DH_SALT, info=conversationId) → AES-256 key
-//    4. AES-256-GCM(key, nonce=random12, plaintext, aad=conversationId) → ciphertext
-//    5. Output: nonce[12] || ciphertext || tag[16]
+//    1. X-Wing encapsulate to the recipient's static public key → (sharedSecret, kemCiphertext)
+//    2. HKDF-SHA256(sharedSecret, salt=ACE_KEM_SALT, info=conversationId) → AES-256 key
+//    3. AES-256-GCM(key, nonce=random12, plaintext, aad=conversationId) → ciphertext
+//    4. Output: kemCiphertext[1120], payload = nonce[12] || ciphertext || tag[16]
+//
+//  X-Wing (draft-connolly-cfrg-xwing-kem-11) is provided by CryptoKit's
+//  `XWingMLKEM768X25519` (macOS 26 / iOS 26). Public key = pk_M[1184] || pk_X[32],
+//  ciphertext = ct_M[1088] || ct_X[32], private key = 32-byte seed.
+//
+//  Note: no small-order-point or all-zero shared-secret checks are needed.
+//  The X-Wing combiner binds pk_X and ct_X into the shared secret, and ML-KEM
+//  decapsulation uses implicit rejection.
+//
+//  This type is the single owner of X-Wing byte-length validation. Every other
+//  layer (registration files, peer responses, message envelopes, identity import)
+//  goes through `validate*` / `decode*` below rather than comparing lengths itself.
 //
 
 import Foundation
@@ -19,12 +30,18 @@ public enum ACEEncryption {
 
     // MARK: - Constants
 
-    /// ACE Protocol DH HKDF salt: SHA-256("ace.protocol.dh.v1")
+    /// ACE Protocol KEM HKDF salt: SHA-256("ace.protocol.kem.v1").
     /// Shared across all implementations (TS, PY, Swift).
-    static let dhSalt = Data(SHA256.hash(data: Data("ace.protocol.dh.v1".utf8)))
+    public static let aceKemSalt = Data(SHA256.hash(data: Data("ace.protocol.kem.v1".utf8)))
 
-    /// Public getter for the DH salt (read-only).
-    public static func getDHSalt() -> Data { dhSalt }
+    /// X-Wing public key size: pk_M[1184] || pk_X[32]
+    public static let publicKeySize = 1216
+
+    /// X-Wing ciphertext size: ct_M[1088] || ct_X[32]
+    public static let kemCiphertextSize = 1120
+
+    /// X-Wing private key seed size
+    public static let seedSize = 32
 
     /// Maximum payload size (10 MB)
     public static let maxPayloadSize = 10 * 1024 * 1024
@@ -35,16 +52,38 @@ public enum ACEEncryption {
     /// Maximum plaintext size
     public static let maxPlaintextSize = maxPayloadSize - minPayloadLength
 
+    /// Padded Base64 length of a `publicKeySize`-byte value (1624 characters).
+    static let publicKeyBase64Length = paddedBase64Length(publicKeySize)
+
+    /// Padded Base64 length of a `kemCiphertextSize`-byte value (1496 characters).
+    static let kemCiphertextBase64Length = paddedBase64Length(kemCiphertextSize)
+
+    // MARK: - Key Generation
+
+    /// Derive the X-Wing public key (1216 bytes) from a 32-byte seed.
+    public static func publicKey(fromSeed seed: Data) throws -> Data {
+        let privateKey = try privateKey(fromSeed: seed)
+        return Data(privateKey.publicKey.rawRepresentation)
+    }
+
+    /// Generate a fresh random 32-byte X-Wing seed.
+    public static func generateSeed() -> Data {
+        var bytes = [UInt8](repeating: 0, count: seedSize)
+        let status = SecRandomCopyBytes(kSecRandomDefault, seedSize, &bytes)
+        precondition(status == errSecSuccess, "SecRandomCopyBytes failed: \(status)")
+        return Data(bytes)
+    }
+
     // MARK: - Conversation ID
 
-    /// Compute deterministic conversation ID from two X25519 public keys.
+    /// Compute deterministic conversation ID from two X-Wing public keys.
     /// conversationId = hex(SHA-256(sort_bytes(pubA, pubB)))
     ///
     /// Sorting ensures symmetry: A→B and B→A produce the same ID.
     /// Variable-time comparison is safe here — these are public keys, not secrets.
     public static func computeConversationId(pubA: Data, pubB: Data) throws -> String {
-        guard pubA.count == 32, pubB.count == 32 else {
-            throw ACEError.invalidKey("X25519 public keys must be 32 bytes, got \(pubA.count) and \(pubB.count)")
+        guard pubA.count == publicKeySize, pubB.count == publicKeySize else {
+            throw ACEError.invalidKey("X-Wing public keys must be \(publicKeySize) bytes, got \(pubA.count) and \(pubB.count)")
         }
         let (first, second) = compareBytes(pubA, pubB) <= 0 ? (pubA, pubB) : (pubB, pubA)
         let combined = first + second
@@ -58,73 +97,62 @@ public enum ACEEncryption {
     ///
     /// - Parameters:
     ///   - plaintext: Raw message bytes
-    ///   - recipientPublicKey: 32-byte X25519 public key
+    ///   - recipientPublicKey: 1216-byte X-Wing public key
     ///   - conversationId: Used as HKDF info and AES-GCM AAD
-    /// - Returns: Tuple of (ephemeralPubKey, payload) where payload = nonce[12] || ciphertext || tag[16]
+    /// - Returns: Tuple of (kemCiphertext, payload) where kemCiphertext is the
+    ///   1120-byte X-Wing ciphertext and payload = nonce[12] || ciphertext || tag[16]
     public static func encrypt(
-        plaintext: Data,
+        _ plaintext: Data,
         recipientPublicKey: Data,
         conversationId: String
-    ) throws -> (ephemeralPubKey: Data, payload: Data) {
+    ) throws -> (kemCiphertext: Data, payload: Data) {
         // Validate
         try validatePublicKey(recipientPublicKey)
         guard plaintext.count <= maxPlaintextSize else {
             throw ACEError.payloadTooLarge(plaintext.count)
         }
 
-        // 1. Generate ephemeral X25519 key pair
-        let ephemeralPriv = Curve25519.KeyAgreement.PrivateKey()
-        let ephemeralPub = ephemeralPriv.publicKey
+        // 1. X-Wing encapsulate
+        let recipientKey = try XWingMLKEM768X25519.PublicKey(rawRepresentation: recipientPublicKey)
+        let result = try recipientKey.encapsulate()
+        let kemCiphertext = Data(result.encapsulated)
 
-        // 2. ECDH
-        let recipientKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientPublicKey)
-        let sharedSecret = try ephemeralPriv.sharedSecretFromKeyAgreement(with: recipientKey)
-        try validateSharedSecret(sharedSecret)
-
-        // 3. HKDF key derivation
+        // 2. HKDF key derivation
         let convIdBytes = Data(conversationId.utf8)
-        let aesKey = sharedSecret.hkdfDerivedSymmetricKey(
-            using: SHA256.self,
-            salt: dhSalt,
-            sharedInfo: convIdBytes,
-            outputByteCount: 32
-        )
+        let aesKey = deriveAESKey(sharedSecret: result.sharedSecret, conversationId: convIdBytes)
 
-        // 4. AES-256-GCM
+        // 3. AES-256-GCM
         let nonce = AES.GCM.Nonce()
         let sealedBox = try AES.GCM.seal(plaintext, using: aesKey, nonce: nonce, authenticating: convIdBytes)
 
-        // 5. payload = nonce[12] || ciphertext || tag[16]
+        // 4. payload = nonce[12] || ciphertext || tag[16]
         let payload = Data(nonce) + sealedBox.ciphertext + sealedBox.tag
 
         guard payload.count <= maxPayloadSize else {
             throw ACEError.payloadTooLarge(payload.count)
         }
 
-        return (
-            ephemeralPubKey: Data(ephemeralPub.rawRepresentation),
-            payload: payload
-        )
+        return (kemCiphertext: kemCiphertext, payload: payload)
     }
 
     // MARK: - Decrypt
 
-    /// Decrypt a message using the recipient's X25519 private key.
+    /// Decrypt a message using the recipient's X-Wing private key seed.
     ///
     /// - Parameters:
-    ///   - ephemeralPubKey: 32-byte X25519 ephemeral public key from sender
+    ///   - kemCiphertext: 1120-byte X-Wing ciphertext from sender
     ///   - payload: nonce[12] || ciphertext || tag[16]
-    ///   - recipientPrivateKey: Recipient's X25519 private key
+    ///   - seed: Recipient's 32-byte X-Wing private key seed
     ///   - conversationId: Must match the one used during encryption
     /// - Returns: Decrypted plaintext
     public static func decrypt(
-        ephemeralPubKey: Data,
+        kemCiphertext: Data,
         payload: Data,
-        recipientPrivateKey: Curve25519.KeyAgreement.PrivateKey,
+        seed: Data,
         conversationId: String
     ) throws -> Data {
         // Validate
-        try validatePublicKey(ephemeralPubKey)
+        try validateKEMCiphertext(kemCiphertext)
         guard payload.count >= minPayloadLength else {
             throw ACEError.decryptionFailed("Payload too short: expected at least \(minPayloadLength) bytes, got \(payload.count)")
         }
@@ -132,19 +160,19 @@ public enum ACEEncryption {
             throw ACEError.payloadTooLarge(payload.count)
         }
 
-        // 1. ECDH
-        let ephKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPubKey)
-        let sharedSecret = try recipientPrivateKey.sharedSecretFromKeyAgreement(with: ephKey)
-        try validateSharedSecret(sharedSecret)
+        // 1. X-Wing decapsulate (implicit rejection: a bad ciphertext yields a
+        //    pseudorandom secret and the AES-GCM tag check fails below)
+        let privateKey = try privateKey(fromSeed: seed)
+        let sharedSecret: SymmetricKey
+        do {
+            sharedSecret = try privateKey.decapsulate(kemCiphertext)
+        } catch {
+            throw ACEError.decryptionFailed("X-Wing decapsulation failed: \(error)")
+        }
 
         // 2. HKDF
         let convIdBytes = Data(conversationId.utf8)
-        let aesKey = sharedSecret.hkdfDerivedSymmetricKey(
-            using: SHA256.self,
-            salt: dhSalt,
-            sharedInfo: convIdBytes,
-            outputByteCount: 32
-        )
+        let aesKey = deriveAESKey(sharedSecret: sharedSecret, conversationId: convIdBytes)
 
         // 3. Parse payload: nonce[12] || ciphertext || tag[16]
         let nonce = try AES.GCM.Nonce(data: payload.prefix(12))
@@ -157,62 +185,82 @@ public enum ACEEncryption {
         return plaintext
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Validation
 
-    /// All 9 canonical small-order X25519 points (orders 1, 2, 4, 8) that produce
-    /// all-zero or predictable shared secrets. RFC 7748 §6 + twist companions.
-    /// This blocklist is defense-in-depth; the ECDH zero-check below is the root safeguard.
-    private static let smallOrderPoints: [Data] = [
-        // Order 1 (neutral element)
-        Data([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        // Order 1 (p)
-        Data([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        // Order 8
-        Data([0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
-              0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00]),
-        // Order 8
-        Data([0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
-              0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57]),
-        // Order 2 (p - 1)
-        Data([0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]),
-        // Order 4 (p)
-        Data([0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]),
-        // Order 8
-        Data([0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]),
-        // Order 8 (twist companion, from Wycheproof test vectors)
-        Data([0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
-              0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a]),
-        // Order 8 (twist companion)
-        Data([0x47, 0xcd, 0xc1, 0x24, 0x97, 0x08, 0xf9, 0xe7, 0x92, 0xf2, 0x97, 0x99, 0x0f, 0xd1, 0xd8, 0x39,
-              0xce, 0x72, 0xf4, 0x01, 0x63, 0xce, 0x4f, 0x2b, 0xa7, 0x4c, 0x7b, 0x3c, 0x40, 0x16, 0x52, 0x26]),
-    ]
-
-    /// Root safeguard: reject degenerate ECDH shared secrets (all-zero).
-    /// This catches any small-subgroup attack regardless of blocklist completeness.
-    private static func validateSharedSecret(_ secret: SharedSecret) throws {
-        let isZero = secret.withUnsafeBytes { ptr in
-            ptr.allSatisfy { $0 == 0 }
-        }
-        if isZero {
-            throw ACEError.encryptionFailed("ECDH produced degenerate shared secret")
+    /// Validate an X-Wing public key: must be exactly 1216 bytes.
+    public static func validatePublicKey(_ pubKey: Data) throws {
+        guard pubKey.count == publicKeySize else {
+            throw ACEError.invalidKey("X-Wing public key must be \(publicKeySize) bytes, got \(pubKey.count)")
         }
     }
 
-    /// Validate X25519 public key: must be 32 bytes, not a known small-order point.
-    private static func validatePublicKey(_ pubKey: Data) throws {
-        guard pubKey.count == 32 else {
-            throw ACEError.invalidKey("X25519 public key must be 32 bytes, got \(pubKey.count)")
+    /// Validate an X-Wing ciphertext: must be exactly 1120 bytes.
+    public static func validateKEMCiphertext(_ ct: Data) throws {
+        guard ct.count == kemCiphertextSize else {
+            throw ACEError.invalidMessage("kemCiphertext must be \(kemCiphertextSize) bytes, got \(ct.count)")
         }
-        for weakPoint in smallOrderPoints {
-            if pubKey == weakPoint {
-                throw ACEError.invalidKey("Refusing to use known small-order X25519 public key (produces all-zero shared secret)")
-            }
+    }
+
+    /// Validate an X-Wing private key seed: must be exactly 32 bytes.
+    public static func validateSeed(_ seed: Data) throws {
+        guard seed.count == seedSize else {
+            throw ACEError.invalidKey("X-Wing private key seed must be \(seedSize) bytes, got \(seed.count)")
         }
+    }
+
+    // MARK: - Decoding (Base64 wire strings)
+
+    /// Decode and validate a Base64 X-Wing public key (1216 bytes).
+    ///
+    /// The string length is checked before decoding: anything longer than the
+    /// padded Base64 encoding of 1216 bytes cannot be a valid key and is rejected
+    /// without allocating for the decode. All failures are `ACEError.invalidKey`.
+    public static func decodePublicKey(base64: String) throws -> Data {
+        guard base64.utf8.count <= publicKeyBase64Length else {
+            throw ACEError.invalidKey("X-Wing public key must be \(publicKeySize) bytes; Base64 input of \(base64.utf8.count) characters exceeds the \(publicKeyBase64Length)-character encoding")
+        }
+        guard let key = try? ACEBase64.decode(base64) else {
+            throw ACEError.invalidKey("X-Wing public key is not valid Base64")
+        }
+        try validatePublicKey(key)
+        return key
+    }
+
+    /// Decode and validate a Base64 X-Wing ciphertext (1120 bytes).
+    ///
+    /// Same shape as `decodePublicKey(base64:)`: string-length pre-check, decode,
+    /// then length validation. All failures are `ACEError.invalidMessage`.
+    public static func decodeKEMCiphertext(base64: String) throws -> Data {
+        guard base64.utf8.count <= kemCiphertextBase64Length else {
+            throw ACEError.invalidMessage("kemCiphertext must be \(kemCiphertextSize) bytes; Base64 input of \(base64.utf8.count) characters exceeds the \(kemCiphertextBase64Length)-character encoding")
+        }
+        guard let ct = try? ACEBase64.decode(base64) else {
+            throw ACEError.invalidMessage("kemCiphertext is not valid Base64")
+        }
+        try validateKEMCiphertext(ct)
+        return ct
+    }
+
+    // MARK: - Private Helpers
+
+    /// Length of the padded Base64 encoding of `byteCount` bytes.
+    private static func paddedBase64Length(_ byteCount: Int) -> Int {
+        ((byteCount + 2) / 3) * 4
+    }
+
+    private static func privateKey(fromSeed seed: Data) throws -> XWingMLKEM768X25519.PrivateKey {
+        try validateSeed(seed)
+        return try XWingMLKEM768X25519.PrivateKey(seedRepresentation: seed, publicKey: nil)
+    }
+
+    /// aesKey = HKDF-SHA256(ikm = X-Wing shared secret, salt = ACE_KEM_SALT, info = conversationId, L = 32)
+    private static func deriveAESKey(sharedSecret: SymmetricKey, conversationId: Data) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: sharedSecret,
+            salt: aceKemSalt,
+            info: conversationId,
+            outputByteCount: 32
+        )
     }
 
     /// Lexicographic byte comparison. Variable-time — safe for public keys only.

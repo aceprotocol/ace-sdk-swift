@@ -2,7 +2,8 @@
 //  MalleabilityTests.swift
 //  ACE SDK
 //
-//  secp256k1 signature malleability must be rejected (canonical low-S only).
+//  secp256k1 signature malleability must be rejected (canonical low-S only),
+//  and the signed message payload must bind the X-Wing kemCiphertext.
 //
 
 import Testing
@@ -80,5 +81,76 @@ struct MalleabilityTests {
         let (sig, _) = try id.sign(sd)
         var bad = [UInt8](sig); bad[64] = 2
         #expect(ACESigning.verifySignature(signData: sd, signature: Data(bad), scheme: .secp256k1, signingPublicKey: id.getSigningPublicKey()) == false)
+    }
+}
+
+@Suite("kemCiphertext is bound by the message signature")
+struct KEMCiphertextBindingTests {
+
+    @Test("swapping kemCiphertext fails SIGNATURE verification (not just decryption)",
+          arguments: [SigningScheme.ed25519, SigningScheme.secp256k1])
+    func swappedKEMCiphertextFailsSignature(scheme: SigningScheme) throws {
+        let alice = try SoftwareIdentity.generate(scheme: scheme)
+        let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+
+        let msg = try createMessage(CreateMessageOptions(
+            sender: alice,
+            recipientPubKey: bob.getEncryptionPublicKey(),
+            recipientACEId: bob.getACEId(),
+            type: .text,
+            body: ["message": "hello"],
+            stateMachine: ThreadStateMachine()
+        ))
+
+        // A relay encapsulates to bob itself and swaps in its own valid 1120-byte ciphertext.
+        let (foreignCt, _) = try ACEEncryption.encrypt(
+            Data("x".utf8), recipientPublicKey: bob.getEncryptionPublicKey(), conversationId: msg.conversationId
+        )
+        #expect(foreignCt.count == 1120)
+        let swapped = ACEMessage(
+            ace: msg.ace, messageId: msg.messageId, from: msg.from, to: msg.to,
+            conversationId: msg.conversationId, type: msg.type, threadId: msg.threadId, timestamp: msg.timestamp,
+            encryption: EncryptionEnvelope(kemCiphertext: ACEBase64.encode(foreignCt), payload: msg.encryption.payload),
+            signature: msg.signature
+        )
+
+        let err = #expect(throws: ACEError.self) {
+            try parseMessage(
+                swapped, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+            )
+        }
+        guard case .signatureVerificationFailed? = err else {
+            Issue.record("expected signatureVerificationFailed, got \(String(describing: err))")
+            return
+        }
+    }
+
+    @Test("single-bit flip in kemCiphertext fails SIGNATURE verification")
+    func flippedKEMCiphertextFailsSignature() throws {
+        let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+        let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+        let msg = try createMessage(CreateMessageOptions(
+            sender: alice, recipientPubKey: bob.getEncryptionPublicKey(), recipientACEId: bob.getACEId(),
+            type: .text, body: ["message": "hello"], stateMachine: ThreadStateMachine()
+        ))
+        var ct = try ACEBase64.decode(msg.encryption.kemCiphertext)
+        ct[ct.startIndex + 1100] ^= 0x80
+        let tampered = ACEMessage(
+            ace: msg.ace, messageId: msg.messageId, from: msg.from, to: msg.to,
+            conversationId: msg.conversationId, type: msg.type, threadId: msg.threadId, timestamp: msg.timestamp,
+            encryption: EncryptionEnvelope(kemCiphertext: ACEBase64.encode(ct), payload: msg.encryption.payload),
+            signature: msg.signature
+        )
+        let err = #expect(throws: ACEError.self) {
+            try parseMessage(
+                tampered, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+            )
+        }
+        guard case .signatureVerificationFailed? = err else {
+            Issue.record("expected signatureVerificationFailed, got \(String(describing: err))")
+            return
+        }
     }
 }

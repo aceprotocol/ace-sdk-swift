@@ -423,4 +423,140 @@ struct MessageValidationTests {
             }
         }
     }
+
+    // ============================================================
+    // Replay reservation lifecycle
+    // ============================================================
+
+    @Suite("replay reservation")
+    struct ReplayReservation {
+
+        @Test("a validly signed message whose decryption fails still consumes the messageId")
+        func decryptionFailureAfterValidSignatureConsumesMessageId() throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+            // Same signing key as bob (so `to` matches), different X-Wing seed: the
+            // signature verifies, decryption fails.
+            let bobExport = bob.exportPrivateKey()
+            let bobWrongSeed = try SoftwareIdentity.fromExport(SoftwareIdentityExport(
+                scheme: bobExport.scheme,
+                signingPrivateKey: bobExport.signingPrivateKey,
+                encryptionPrivateKey: ACEBase64.encode(ACEEncryption.generateSeed())
+            ))
+            #expect(bobWrongSeed.getACEId() == bob.getACEId())
+
+            let msg = try createMessage(CreateMessageOptions(
+                sender: alice, recipientPubKey: bob.getEncryptionPublicKey(), recipientACEId: bob.getACEId(),
+                type: .text, body: ["message": "hi"], stateMachine: ThreadStateMachine()
+            ))
+            let detector = ReplayDetector()
+
+            #expect(throws: (any Error).self) {
+                try parseMessage(
+                    msg, receiver: bobWrongSeed, senderSigningPubKey: alice.getSigningPublicKey(),
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: detector)
+                )
+            }
+
+            // The signature verified, so the messageId is one-shot: the genuine
+            // message with the same id is now rejected as a replay.
+            let err = #expect(throws: ACEError.self) {
+                try parseMessage(
+                    msg, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: detector)
+                )
+            }
+            if case .replayDetected? = err {} else {
+                Issue.record("expected replayDetected, got \(String(describing: err))")
+            }
+        }
+
+        @Test("a failure before signature verification releases the reservation")
+        func preSignatureFailureReleasesReservation() throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+            let msg = try createMessage(CreateMessageOptions(
+                sender: alice, recipientPubKey: bob.getEncryptionPublicKey(), recipientACEId: bob.getACEId(),
+                type: .text, body: ["message": "hi"], stateMachine: ThreadStateMachine()
+            ))
+            // Same messageId, malformed kemCiphertext: rejected before the signature check.
+            let bad = ACEMessage(
+                ace: msg.ace, messageId: msg.messageId, from: msg.from, to: msg.to,
+                conversationId: msg.conversationId, type: msg.type, threadId: msg.threadId, timestamp: msg.timestamp,
+                encryption: EncryptionEnvelope(
+                    kemCiphertext: ACEBase64.encode(Data(repeating: 0xAA, count: 1119)),
+                    payload: msg.encryption.payload
+                ),
+                signature: msg.signature
+            )
+            let detector = ReplayDetector()
+
+            #expect(throws: ACEError.self) {
+                try parseMessage(
+                    bad, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: detector)
+                )
+            }
+
+            // Reservation released: the genuine message parses with the same detector.
+            let parsed = try parseMessage(
+                msg, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                opts: ParseMessageOptions(stateMachine: ThreadStateMachine(), replayDetector: detector)
+            )
+            #expect(parsed.body["message"] as? String == "hi")
+        }
+    }
+
+    // ============================================================
+    // kemCiphertext length validation
+    // ============================================================
+
+    @Suite("kemCiphertext length validation")
+    struct KEMCiphertextLength {
+
+        @Test("message envelope carries a 1120-byte kemCiphertext")
+        func envelopeLength() throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+            let msg = try createMessage(CreateMessageOptions(
+                sender: alice, recipientPubKey: bob.getEncryptionPublicKey(), recipientACEId: bob.getACEId(),
+                type: .text, body: ["message": "hi"], stateMachine: ThreadStateMachine()
+            ))
+            #expect(try ACEBase64.decode(msg.encryption.kemCiphertext).count == 1120)
+        }
+
+        @Test("rejects an off-by-one kemCiphertext before signature check and decapsulation",
+              arguments: [1119, 1121])
+        func rejectsWrongLength(count: Int) throws {
+            let alice = try SoftwareIdentity.generate(scheme: .ed25519)
+            let bob = try SoftwareIdentity.generate(scheme: .ed25519)
+            let msg = try createMessage(CreateMessageOptions(
+                sender: alice, recipientPubKey: bob.getEncryptionPublicKey(), recipientACEId: bob.getACEId(),
+                type: .text, body: ["message": "hi"], stateMachine: ThreadStateMachine()
+            ))
+            let bad = ACEMessage(
+                ace: msg.ace, messageId: msg.messageId, from: msg.from, to: msg.to,
+                conversationId: msg.conversationId, type: msg.type, threadId: msg.threadId, timestamp: msg.timestamp,
+                encryption: EncryptionEnvelope(
+                    kemCiphertext: ACEBase64.encode(Data(repeating: 0xAA, count: count)),
+                    payload: msg.encryption.payload
+                ),
+                // Garbage signature: if length validation did not run first we would see
+                // signatureVerificationFailed instead of the invalidMessage length error.
+                signature: SignatureEnvelope(scheme: .ed25519, value: ACEBase64.encode(Data(repeating: 0, count: 64)))
+            )
+            let err = #expect(throws: ACEError.self) {
+                try parseMessage(
+                    bad, receiver: bob, senderSigningPubKey: alice.getSigningPublicKey(),
+                    opts: ParseMessageOptions(stateMachine: ThreadStateMachine())
+                )
+            }
+            if case .invalidMessage(let text)? = err {
+                #expect(text.contains("kemCiphertext"))
+                #expect(text.contains("1120"))
+            } else {
+                Issue.record("expected invalidMessage length error for count=\(count), got \(String(describing: err))")
+            }
+        }
+    }
 }

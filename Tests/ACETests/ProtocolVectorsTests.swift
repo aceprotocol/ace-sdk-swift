@@ -23,10 +23,12 @@ struct ProtocolVectorsTests {
 
     @Test("conversationId golden vector")
     func conversationIdGoldenVector() throws {
-        let pubA = Data((1...32).map { UInt8($0) })
-        let pubB = Data((0..<32).map { UInt8(255 - $0) })
+        // X-Wing public keys are 1216 bytes; sort_bytes puts pubA (0x00...) first.
+        let pubA = Data((0..<1216).map { UInt8($0 & 0xff) })
+        let pubB = Data((0..<1216).map { UInt8(255 - ($0 & 0xff)) })
         let convId = try ACEEncryption.computeConversationId(pubA: pubA, pubB: pubB)
-        #expect(convId == "fcdad8d0e1cbe6726f86938e504f6a7290c6d458181ced3e199cd25bf694cb40")
+        #expect(convId == "705d67525bcb9d3ba2312372064bdca6ce42be9f78dcc71de896411615a25cbd")
+        #expect(try ACEEncryption.computeConversationId(pubA: pubB, pubB: pubA) == convId)
     }
 
     @Test("signData golden vector (unified V1)")

@@ -7,7 +7,9 @@
 //  Security pipeline order (parseMessage):
 //    1. Envelope validation (cheap)
 //    2. Timestamp freshness (cheap, before expensive ops)
-//    3. Replay detection (atomic check-and-reserve)
+//    3. Replay detection (atomic check-and-reserve; released on failures before
+//       signature verification, kept on any failure after it — an authentic
+//       message is one-shot regardless of outcome)
 //    4. Signature verification BEFORE decryption (prevents decryption oracle attacks)
 //    5. Decryption
 //    6. Body schema validation
@@ -162,16 +164,16 @@ private func buildSignedMessagePayload(
     conversationId: String,
     messageId: String,
     threadId: String?,
-    ephemeralPubKey: Data,
+    kemCiphertext: Data,
     payload: Data
 ) -> Data {
-    // ephemeralPubKey is signed too: it is what the recipient uses to derive the
+    // kemCiphertext is signed too: it is what the recipient uses to derive the
     // decryption key, so it is part of the sender's commitment. Omitting it would
-    // let a relay swap the ephemeral key (garbling the message) without breaking
+    // let a relay swap the KEM ciphertext (garbling the message) without breaking
     // the signature.
     ACESigning.encodePayload([
         .string(type.rawValue), .string(to), .string(conversationId), .string(messageId),
-        .string(normalizeThreadId(threadId)), .data(ephemeralPubKey), .data(payload),
+        .string(normalizeThreadId(threadId)), .data(kemCiphertext), .data(payload),
     ])
 }
 
@@ -255,7 +257,7 @@ public struct ParsedMessage: @unchecked Sendable {
 
 public struct CreateMessageOptions {
     public let sender: any ACEIdentity
-    public let recipientPubKey: Data // X25519 encryption public key
+    public let recipientPubKey: Data // X-Wing encryption public key (1216 bytes)
     public let recipientACEId: String
     public let type: MessageType
     public let body: [String: Any]
@@ -329,8 +331,8 @@ public func createMessage(_ opts: CreateMessageOptions) throws -> ACEMessage {
         withJSONObject: opts.body,
         options: [.withoutEscapingSlashes]
     )
-    let (ephemeralPubKey, payload) = try ACEEncryption.encrypt(
-        plaintext: bodyData,
+    let (kemCiphertext, payload) = try ACEEncryption.encrypt(
+        bodyData,
         recipientPublicKey: opts.recipientPubKey,
         conversationId: conversationId
     )
@@ -342,7 +344,7 @@ public func createMessage(_ opts: CreateMessageOptions) throws -> ACEMessage {
         conversationId: conversationId,
         messageId: messageId,
         threadId: opts.threadId,
-        ephemeralPubKey: ephemeralPubKey,
+        kemCiphertext: kemCiphertext,
         payload: payload
     )
     let signData = ACESigning.buildSignData(action: "message", aceId: fromId, timestamp: timestamp, payload: messagePayload)
@@ -368,7 +370,7 @@ public func createMessage(_ opts: CreateMessageOptions) throws -> ACEMessage {
         threadId: opts.threadId,
         timestamp: timestamp,
         encryption: EncryptionEnvelope(
-            ephemeralPubKey: ACEBase64.encode(ephemeralPubKey),
+            kemCiphertext: ACEBase64.encode(kemCiphertext),
             payload: ACEBase64.encode(payload)
         ),
         signature: SignatureEnvelope(
@@ -477,12 +479,14 @@ public func parseMessage(
         }
     }
 
-    // Release replay reservation ONLY on pre-signature errors.
-    // Once signature is verified, messageId is permanently consumed
-    // to prevent replay via crafted messages that fail post-crypto checks.
-    var releaseReplayOnError = opts.replayDetector != nil
+    // Cross-SDK rule: release the reservation only when the message fails BEFORE
+    // signature verification. Once the signature has verified, the messageId stays
+    // consumed on ANY later failure (decrypt, body schema, state machine) — otherwise
+    // a captured authentic message rejected by the state machine could be replayed
+    // later when the state allows it.
+    var releaseReservationOnError = opts.replayDetector != nil
     defer {
-        if releaseReplayOnError {
+        if releaseReservationOnError {
             opts.replayDetector?.release(msg.messageId)
         }
     }
@@ -499,14 +503,16 @@ public func parseMessage(
         throw ACEError.payloadTooLarge(payloadBytes.count)
     }
 
-    let ephemeralPubKey = try ACEBase64.decode(msg.encryption.ephemeralPubKey)
+    // kemCiphertext length is enforced here, BEFORE signature verification and
+    // long before any decapsulation runs.
+    let kemCiphertext = try ACEEncryption.decodeKEMCiphertext(base64: msg.encryption.kemCiphertext)
     let messagePayload = buildSignedMessagePayload(
         type: msg.type,
         to: msg.to,
         conversationId: msg.conversationId,
         messageId: msg.messageId,
         threadId: msg.threadId,
-        ephemeralPubKey: ephemeralPubKey,
+        kemCiphertext: kemCiphertext,
         payload: payloadBytes
     )
     let signData = ACESigning.buildSignData(action: "message", aceId: msg.from, timestamp: msg.timestamp, payload: messagePayload)
@@ -529,14 +535,12 @@ public func parseMessage(
         throw ACEError.signatureVerificationFailed("Signature verification failed")
     }
 
-    // Signature verified — permanently consume the messageId.
-    // Post-crypto failures (decryption, body validation, state transition)
-    // must NOT release the reservation to prevent replay attacks.
-    releaseReplayOnError = false
+    // Signature verified — the messageId is now permanently consumed.
+    releaseReservationOnError = false
 
-    // 5. Decrypt body — ephemeralPubKey was decoded and signature-verified above.
+    // 5. Decrypt body — kemCiphertext was decoded, length-checked and signature-verified above.
     let decrypted = try receiver.decrypt(
-        ephemeralPubKey: ephemeralPubKey,
+        kemCiphertext: kemCiphertext,
         payload: payloadBytes,
         conversationId: msg.conversationId
     )
@@ -598,7 +602,7 @@ public func parseMessageFromRegistration(
 /// Safe path for messages whose sender keys came from a relay.
 ///
 /// `sender` must be a ``VerifiedPeer`` — obtainable only after its encryption-key
-/// binding was verified — so the recipient never trusts a relay-substituted X25519
+/// binding was verified — so the recipient never trusts a relay-substituted X-Wing
 /// key. `conversationId` is recomputed from the verified keys and must match.
 public func parseMessageFromPeer(
     _ msg: ACEMessage,

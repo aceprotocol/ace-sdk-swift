@@ -16,7 +16,7 @@ struct IdentityTests {
         #expect(identity.getSigningScheme() == .ed25519)
         #expect(identity.getTier() == .keyOnly)
         #expect(identity.getSigningPublicKey().count == 32)
-        #expect(identity.getEncryptionPublicKey().count == 32)
+        #expect(identity.getEncryptionPublicKey().count == 1216) // X-Wing
         #expect(identity.getACEId().hasPrefix("ace:sha256:"))
         #expect(identity.getACEId().count == 11 + 64) // "ace:sha256:" + 64 hex
     }
@@ -26,7 +26,7 @@ struct IdentityTests {
         let identity = try SoftwareIdentity.generate(scheme: .secp256k1)
         #expect(identity.getSigningScheme() == .secp256k1)
         #expect(identity.getSigningPublicKey().count == 33) // compressed
-        #expect(identity.getEncryptionPublicKey().count == 32)
+        #expect(identity.getEncryptionPublicKey().count == 1216) // X-Wing
         #expect(identity.getAddress().hasPrefix("0x"))
         #expect(identity.getAddress().count == 42) // 0x + 40 hex
     }
@@ -104,5 +104,23 @@ struct IdentityTests {
         #expect(throws: ACEError.self) {
             _ = try getRegistrationSigningPublicKey(reg)
         }
+    }
+
+    @Test("export carries a 32-byte X-Wing seed as encryptionPrivateKey")
+    func exportSeedIs32Bytes() throws {
+        let identity = try SoftwareIdentity.generate(scheme: .ed25519)
+        let exported = identity.exportPrivateKey()
+        let seed = try ACEBase64.decode(exported.encryptionPrivateKey)
+        #expect(seed.count == 32)
+        #expect(try ACEEncryption.publicKey(fromSeed: seed) == identity.getEncryptionPublicKey())
+    }
+
+    @Test("registration file carries the 1216-byte X-Wing public key")
+    func registrationFileEncryptionKeyLength() throws {
+        let identity = try SoftwareIdentity.generate(scheme: .ed25519)
+        let reg = identity.toRegistrationFile(name: "TestAgent", endpoint: "https://test.example.com/ace")
+        let key = try ACEBase64.decode(reg.signing.encryptionPublicKey)
+        #expect(key.count == 1216)
+        try validateRegistrationFile(reg)
     }
 }
