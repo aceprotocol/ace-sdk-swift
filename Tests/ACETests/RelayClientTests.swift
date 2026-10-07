@@ -110,6 +110,14 @@ struct RelayClientTests {
         await expectCodeAsync(.notRegistered) { try await relay.getWebhook(bob) }
     }
 
+    @Test func listenRejectsEventsWithoutValidStreamId() async throws {
+        for frame in ["event: message\ndata: {}\n\n", "id: \(String(repeating: "1", count: 21))-0\nevent: message\ndata: {}\n\n",
+                      "id: 1-0\nevent: catchup\n\n"] {
+            let relay = try makeRelay({ _, _ in .sse([frame]) })
+            await expectCodeAsync(.relayProtocolError) { for try await _ in relay.listen(alice) {} }
+        }
+    }
+
     @Test func getWebhookRejectsMalformedOptionalFields() async throws {
         let fake = FakeRelay()
         fake.add(try peerRecord(alice, registeredAt: 1741000000))
@@ -121,10 +129,8 @@ struct RelayClientTests {
         with(["lastDeliveredAt": 1741000001, "lastError": "http_500"])
         let ok = try await relay.getWebhook(alice)
         #expect(ok?.lastDeliveredAt == 1741000001 && ok?.lastError == "http_500")
-        with(["lastDeliveredAt": NSNull(), "lastError": NSNull()])
-        let nulls = try await relay.getWebhook(alice)
-        #expect(nulls?.lastDeliveredAt == nil && nulls?.lastError == nil)
-        for extra: [String: Any] in [["lastDeliveredAt": "yesterday"], ["lastDeliveredAt": 1.5], ["lastDeliveredAt": -1], ["lastError": 42]] {
+        for extra: [String: Any] in [["lastDeliveredAt": "yesterday"], ["lastDeliveredAt": 1.5], ["lastDeliveredAt": -1], ["lastDeliveredAt": NSNull()],
+                                     ["lastError": 42], ["lastError": NSNull()]] {
             with(extra)
             await expectCodeAsync(.relayProtocolError) { try await relay.getWebhook(alice) }
         }

@@ -204,7 +204,7 @@ public actor RelayClient {
         for entry in list {
             if let peer = try? verifyPeerRecord(PeerRecord.parse(entry)) { agents.append(peer) } else { rejected += 1 }
         }
-        return DiscoverPage(agents: agents, rejected: rejected, cursor: try optionalField(v, "cursor") { $0.stringValue })
+        return DiscoverPage(agents: agents, rejected: rejected, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
 
     /// `POST /v1/send`. Exact duplicates are acknowledged by the relay.
@@ -227,7 +227,7 @@ public actor RelayClient {
             }
             return InboxEntry(streamId: id, envelope: JSONWriter.serialize(m))
         }
-        return InboxPage(entries: entries, cursor: try optionalField(v, "cursor") { $0.stringValue })
+        return InboxPage(entries: entries, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
 
     /// `POST /v1/intents`.
@@ -263,7 +263,7 @@ public actor RelayClient {
             return Intent(intentId: id, from: from, need: need, tags: tags, maxPrice: i["maxPrice"]?.stringValue,
                           currency: i["currency"]?.stringValue, ttl: ttl, createdAt: createdAt, expiresAt: expiresAt)
         }
-        return IntentPage(intents: intents, cursor: try optionalField(v, "cursor") { $0.stringValue })
+        return IntentPage(intents: intents, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
 
     /// `PUT /v1/webhook`: set or replace the caller's webhook.
@@ -419,7 +419,8 @@ public actor RelayClient {
             try Task.checkCancellation()
             switch frame.event {
             case "catchup", "message":
-                guard let id = frame.id, isStreamCursor(id), !frame.data.isEmpty else { continue }
+                guard let id = frame.id, isStreamCursor(id) else { throw ACEError(.relayProtocolError, "SSE event without a valid stream id") }
+                guard !frame.data.isEmpty else { throw ACEError(.relayProtocolError, "SSE event without data") }
                 cursor = id
                 onProgress()
                 try await out.yieldWaiting(Event(streamId: id, envelope: Data(frame.data), catchup: frame.event == "catchup"))
@@ -546,8 +547,16 @@ public actor RelayClient {
     }
 
     /// Absent or null is `nil`; present but malformed is `relay_protocol_error`.
-    private func optionalField<T>(_ v: JValue, _ key: String, _ get: (JValue) -> T?) throws -> T? {
+    /// A required field whose value may be `null`.
+    private func nullableField<T>(_ v: JValue, _ key: String, _ get: (JValue) -> T?) throws -> T? {
         guard let f = v[key], !f.isNull else { return nil }
+        guard let t = get(f) else { throw ACEError(.relayProtocolError, "\(key) is malformed") }
+        return t
+    }
+
+    /// A field that may be absent; present (`null` included) it must be well-formed.
+    private func optionalField<T>(_ v: JValue, _ key: String, _ get: (JValue) -> T?) throws -> T? {
+        guard let f = v[key] else { return nil }
         guard let t = get(f) else { throw ACEError(.relayProtocolError, "\(key) is malformed") }
         return t
     }
