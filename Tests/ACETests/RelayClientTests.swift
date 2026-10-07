@@ -110,6 +110,26 @@ struct RelayClientTests {
         await expectCodeAsync(.notRegistered) { try await relay.getWebhook(bob) }
     }
 
+    @Test func getWebhookRejectsMalformedOptionalFields() async throws {
+        let fake = FakeRelay()
+        fake.add(try peerRecord(alice, registeredAt: 1741000000))
+        let relay = try makeRelay(fake.handle)
+        try await relay.setWebhook(alice, url: "https://agent.example.com/wake", secret: "0123456789abcdef0123456789abcdef")
+        let id = try alice.getACEId()
+        let base = fake.webhooks[id]!
+        func with(_ extra: [String: Any]) { fake.webhooks[id] = base.merging(extra) { _, new in new } }
+        with(["lastDeliveredAt": 1741000001, "lastError": "http_500"])
+        let ok = try await relay.getWebhook(alice)
+        #expect(ok?.lastDeliveredAt == 1741000001 && ok?.lastError == "http_500")
+        with(["lastDeliveredAt": NSNull(), "lastError": NSNull()])
+        let nulls = try await relay.getWebhook(alice)
+        #expect(nulls?.lastDeliveredAt == nil && nulls?.lastError == nil)
+        for extra: [String: Any] in [["lastDeliveredAt": "yesterday"], ["lastDeliveredAt": 1.5], ["lastDeliveredAt": -1], ["lastError": 42]] {
+            with(extra)
+            await expectCodeAsync(.relayProtocolError) { try await relay.getWebhook(alice) }
+        }
+    }
+
     @Test func sendPostsEnvelopeAndMapsExpired() async throws {
         let fake = FakeRelay()
         let relay = try makeRelay(fake.handle)

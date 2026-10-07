@@ -39,6 +39,9 @@ public func verifyWebhookNotification(
     guard isTimestampHeader(timestamp), let ts = Int(timestamp) else {
         throw ACEError.invalidArgument("X-ACE-Webhook-Timestamp is malformed")
     }
+    guard windowSeconds >= 0 else {
+        throw ACEError.invalidArgument("windowSeconds must be a non-negative integer")
+    }
     guard isWebhookSignature(signature) else {
         throw ACEError(.invalidSignature, "X-ACE-Webhook-Signature is malformed")
     }
@@ -52,10 +55,17 @@ public func verifyWebhookNotification(
     guard let v = try? JSONParser.parse(body),
           v["event"]?.stringValue == "message",
           let aceId = v["aceId"]?.stringValue, isACEId(aceId),
-          let streamId = v["streamId"]?.stringValue, isStreamCursor(streamId) else {
+          let streamId = v["streamId"]?.stringValue, isWebhookStreamId(streamId) else {
         throw ACEError.invalidArgument("notification body must be {event: message, aceId, streamId}")
     }
     return WebhookNotification(aceId: aceId, streamId: streamId)
+}
+
+/// `^[0-9]{1,20}-[0-9]{1,20}$`: the 08 `<ms>-<seq>` grammar with each side bounded as in the
+/// TS / Python verifiers. The shared `isStreamCursor` (inbox cursors, `since`) stays unbounded.
+private func isWebhookStreamId(_ s: String) -> Bool {
+    guard isStreamCursor(s) else { return false }
+    return s.split(separator: "-").allSatisfy { $0.utf8.count <= 20 }
 }
 
 /// `^sha256=[0-9a-f]{64}$`.

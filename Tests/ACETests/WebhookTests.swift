@@ -54,5 +54,12 @@ import Testing
         #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: "nope", signature: sig(), body: Data(body.utf8), clock: { ts }) } == .invalidArgument)
         let noStream = "{\"event\":\"message\",\"aceId\":\"\(ace)\"}"
         #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(body: noStream), body: Data(noStream.utf8), clock: { ts }) } == .invalidArgument)
+        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: Data(body.utf8), clock: { ts }, windowSeconds: -1) } == .invalidArgument)
+        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: Data(body.utf8), clock: { ts }, windowSeconds: 0) } == nil)
+        let twenty = String(repeating: "9", count: 20)
+        for (streamId, expected) in [("\(twenty)-\(twenty)", nil), ("9\(twenty)-0", ACEError.Code.invalidArgument), ("0-9\(twenty)", .invalidArgument)] {
+            let b = "{\"event\":\"message\",\"aceId\":\"\(ace)\",\"streamId\":\"\(streamId)\"}"
+            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(body: b), body: Data(b.utf8), clock: { ts }) } == expected)
+        }
     }
 }

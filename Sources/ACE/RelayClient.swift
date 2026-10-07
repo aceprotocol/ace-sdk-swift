@@ -279,8 +279,15 @@ public actor RelayClient {
               let failures = w["failures"]?.wireInt, let updatedAt = w["updatedAt"]?.wireInt else {
             throw ACEError(.relayProtocolError, "malformed webhook")
         }
+        // Optional fields: absent or null is fine; present but malformed is a protocol error.
+        func optional<T>(_ key: String, _ get: (JValue) -> T?) throws -> T? {
+            guard let v = w[key], !v.isNull else { return nil }
+            guard let t = get(v) else { throw ACEError(.relayProtocolError, "malformed webhook \(key)") }
+            return t
+        }
         return Webhook(url: url, status: status, failures: failures, updatedAt: updatedAt,
-                       lastDeliveredAt: w["lastDeliveredAt"]?.wireInt, lastError: w["lastError"]?.stringValue)
+                       lastDeliveredAt: try optional("lastDeliveredAt") { $0.wireInt },
+                       lastError: try optional("lastError") { $0.stringValue })
     }
 
     /// `DELETE /v1/webhook` (idempotent).
