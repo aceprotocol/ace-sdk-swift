@@ -68,6 +68,17 @@ public actor RelayClient {
         public let expiresAt: Int
     }
 
+    /// The caller's webhook as `GET /v1/webhook` reports it (the secret is never returned).
+    public struct Webhook: Sendable, Equatable {
+        public let url: String
+        /// `active` or `disabled`.
+        public let status: String
+        public let failures: Int
+        public let updatedAt: Int
+        public let lastDeliveredAt: Int?
+        public let lastError: String?
+    }
+
     /// The normalized base URL (lowercase scheme and host, no trailing `/`).
     public nonisolated let baseURL: URL
     /// `baseURL` as a string: the normalized relay key (lowercase scheme and host, no
@@ -250,6 +261,31 @@ public actor RelayClient {
                           currency: i["currency"]?.stringValue, ttl: ttl, createdAt: createdAt, expiresAt: expiresAt)
         }
         return IntentPage(intents: intents, cursor: try optionalCursor(v))
+    }
+
+    /// `PUT /v1/webhook`: set or replace the caller's webhook.
+    public func setWebhook(_ identity: any ACEIdentity, url: String, secret: String) async throws {
+        let auth = RelayAuthRequest.webhook(method: .put, url: url, secret: secret)
+        let body = JSONWriter.serialize(.object(["url": .string(url), "secret": .string(secret)]))
+        _ = try await call("PUT", "/v1/webhook", body: body, auth: (identity, auth))
+    }
+
+    /// `GET /v1/webhook`; `nil` when none is set.
+    public func getWebhook(_ identity: any ACEIdentity) async throws -> Webhook? {
+        let v = try await call("GET", "/v1/webhook", auth: (identity, .webhook(method: .get)))
+        guard let w = v["webhook"] else { throw ACEError(.relayProtocolError, "unexpected webhook response") }
+        if w.isNull { return nil }
+        guard let url = w["url"]?.stringValue, let status = w["status"]?.stringValue, status == "active" || status == "disabled",
+              let failures = w["failures"]?.wireInt, let updatedAt = w["updatedAt"]?.wireInt else {
+            throw ACEError(.relayProtocolError, "malformed webhook")
+        }
+        return Webhook(url: url, status: status, failures: failures, updatedAt: updatedAt,
+                       lastDeliveredAt: w["lastDeliveredAt"]?.wireInt, lastError: w["lastError"]?.stringValue)
+    }
+
+    /// `DELETE /v1/webhook` (idempotent).
+    public func clearWebhook(_ identity: any ACEIdentity) async throws {
+        _ = try await call("DELETE", "/v1/webhook", auth: (identity, .webhook(method: .delete)))
     }
 
     /// `GET /v1/listen` as a stream of `catchup` / `message` events.

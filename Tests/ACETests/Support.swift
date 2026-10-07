@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import ACE
 
-/// The shared cross-language vectors (`ace-spec/test-vectors.json`, version 2).
+/// The shared cross-language vectors (`ace-spec/test-vectors.json`, version 3).
 enum Fixtures {
     nonisolated(unsafe) static let root: [String: Any] = {
         let url = Bundle.module.url(forResource: "test-vectors", withExtension: "json", subdirectory: "Fixtures")!

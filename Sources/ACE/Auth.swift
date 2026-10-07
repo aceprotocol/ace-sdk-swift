@@ -7,12 +7,19 @@
 
 import Foundation
 
+/// The HTTP method of a `/v1/webhook` call; it is the first field of the `webhook` payload.
+public enum WebhookMethod: String, Sendable, Equatable {
+    case put = "PUT", get = "GET", delete = "DELETE"
+}
+
 /// What an authenticated relay call signs. `since` is `"-"` or `<ms>-<seq>`.
+/// `webhook` carries `url` and `secret` for `PUT` only; both are empty for `GET` / `DELETE`.
 public enum RelayAuthRequest: Sendable, Equatable {
     case listen(since: String)
     case inbox(since: String, limit: Int)
     case unregister
     case intent(need: String, tags: [String], maxPrice: String?, currency: String?, ttl: Int)
+    case webhook(method: WebhookMethod, url: String = "", secret: String = "")
 
     public var action: String {
         switch self {
@@ -20,6 +27,7 @@ public enum RelayAuthRequest: Sendable, Equatable {
         case .inbox: return "inbox"
         case .unregister: return "unregister"
         case .intent: return "intent"
+        case .webhook: return "webhook"
         }
     }
 
@@ -38,6 +46,15 @@ public enum RelayAuthRequest: Sendable, Equatable {
         case .intent(_, let tags, _, _, let ttl):
             guard !tags.contains(where: { $0.contains(",") }) else { throw ACEError.invalidArgument("tags must be strings without ','") }
             guard isWireInt(ttl) else { throw ACEError.invalidArgument("ttl must be an integer in [0, 2^53-1]") }
+        case .webhook(let method, let url, let secret):
+            if method == .put {
+                guard isHTTPSURL(url) else { throw ACEError.invalidArgument("url must match the ACE HTTPS URL grammar") }
+                guard isWebhookSecret(secret) else {
+                    throw ACEError.invalidArgument("secret must be 16..128 characters without control characters")
+                }
+            } else {
+                guard url.isEmpty, secret.isEmpty else { throw ACEError.invalidArgument("\(method.rawValue) takes no url or secret") }
+            }
         }
     }
 
@@ -51,6 +68,8 @@ public enum RelayAuthRequest: Sendable, Equatable {
             return Data()
         case .intent(let need, let tags, let maxPrice, let currency, let ttl):
             return ACESigning.encodePayload(need, tags.joined(separator: ","), maxPrice ?? "", currency ?? "", String(ttl))
+        case .webhook(let method, let url, let secret):
+            return ACESigning.encodePayload(method.rawValue, url, secret)
         }
     }
 
@@ -64,6 +83,12 @@ public enum RelayAuthRequest: Sendable, Equatable {
 func isStreamCursor(_ s: String) -> Bool {
     let parts = s.split(separator: "-", omittingEmptySubsequences: false)
     return parts.count == 2 && parts.allSatisfy { !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber } }
+}
+
+/// A webhook secret: 16..128 characters (Unicode scalars), none in U+0000–U+001F or U+007F.
+public func isWebhookSecret(_ s: String) -> Bool {
+    let n = s.unicodeScalars.count
+    return n >= 16 && n <= 128 && !s.unicodeScalars.contains(where: isControlScalar)
 }
 
 /// Parsed `X-ACE-*` headers.
@@ -109,7 +134,7 @@ public func parseAuthHeaders(_ headers: [String: String]) throws -> RelayAuth {
 }
 
 /// `^(0|[1-9][0-9]{0,15})$`.
-private func isTimestampHeader(_ s: String) -> Bool {
+func isTimestampHeader(_ s: String) -> Bool {
     let u = Array(s.utf8)
     guard !u.isEmpty, u.count <= 16, u.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return false }
     return u.count == 1 || u[0] != 0x30

@@ -94,6 +94,22 @@ struct RelayClientTests {
         await expectCodeAsync(.invalidArgument) { try await relay.fetchInbox(bob, limit: 101) }
     }
 
+    @Test func webhookRoundTrip() async throws {
+        let fake = FakeRelay()
+        fake.add(try peerRecord(alice, registeredAt: 1741000000))
+        let relay = try makeRelay(fake.handle)
+        #expect(try await relay.getWebhook(alice) == nil)
+        try await relay.setWebhook(alice, url: "https://agent.example.com/wake", secret: "0123456789abcdef0123456789abcdef")
+        let w = try await relay.getWebhook(alice)
+        #expect(w?.url == "https://agent.example.com/wake")
+        #expect(w?.status == "active")
+        #expect(w?.failures == 0 && w?.lastDeliveredAt == nil && w?.lastError == nil)
+        try await relay.clearWebhook(alice)
+        #expect(try await relay.getWebhook(alice) == nil)
+        await expectCodeAsync(.invalidArgument) { try await relay.setWebhook(alice, url: "http://x.example", secret: "0123456789abcdef") }
+        await expectCodeAsync(.notRegistered) { try await relay.getWebhook(bob) }
+    }
+
     @Test func sendPostsEnvelopeAndMapsExpired() async throws {
         let fake = FakeRelay()
         let relay = try makeRelay(fake.handle)

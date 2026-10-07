@@ -1,17 +1,17 @@
 //
-//  Shared cross-language vectors (ace-spec/test-vectors.json, version 2).
+//  Shared cross-language vectors (ace-spec/test-vectors.json, version 3).
 //
 
 import Foundation
 import Testing
 @testable import ACE
 
-@Suite("Vectors v2")
+@Suite("Vectors v3")
 struct VectorTests {
     let V = Fixtures.vectors
 
     @Test func versionAndSections() {
-        #expect(Fixtures.root["version"] as? String == "2")
+        #expect(Fixtures.root["version"] as? String == "3")
         for key in ["envelopes", "bodies", "transitions", "replay", "signatures", "auth", "registrations",
                     "registrationErrors", "urls", "base64", "peerBinding"] {
             #expect(V[key] != nil, "missing \(key)")
@@ -248,6 +248,9 @@ struct VectorTests {
         case "listen": return .listen(since: r["since"] as! String)
         case "inbox": return .inbox(since: r["since"] as! String, limit: r["limit"] as! Int)
         case "unregister": return .unregister
+        case "webhook":
+            return .webhook(method: WebhookMethod(rawValue: r["method"] as! String)!, url: r["url"] as! String,
+                            secret: r["secret"] as! String)
         default:
             return .intent(need: r["need"] as! String, tags: r["tags"] as! [String], maxPrice: r["maxPrice"] as? String,
                            currency: r["currency"] as? String, ttl: r["ttl"] as! Int)
@@ -256,7 +259,8 @@ struct VectorTests {
 
     @Test func auth() throws {
         let cases = V["auth"] as! [[String: Any]]
-        #expect(cases.count >= 10)
+        #expect(cases.count == 18)
+        #expect(cases.filter { ($0["request"] as! [String: Any])["action"] as? String == "webhook" }.count == 6)
         for v in cases {
             let ident = Fixtures.agent(v["agent"] as! String)
             let req = authRequest(v["request"] as! [String: Any])
