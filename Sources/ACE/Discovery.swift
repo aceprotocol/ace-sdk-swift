@@ -358,7 +358,7 @@ public enum AdoptOutcome: String, Sendable {
 /// strictly newer `registeredAt`; an unsigned registration-file candidate is adopted only
 /// without a pin, or as `unchanged` when its key equals the pin (pin kept as is).
 func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws -> (VerifiedPeer, AdoptOutcome) {
-    if candidate.registeredAt > now + ACELimits.timestampWindowSeconds {
+    if candidate.registeredAt > clampedAdd(now, ACELimits.timestampWindowSeconds) {
         throw ACEError(.invalidPeer, "registeredAt is in the future")
     }
     guard let pin else { return (candidate, .adopted) }

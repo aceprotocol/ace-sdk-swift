@@ -201,9 +201,10 @@ public func parseMessage(
     }
     // 6
     let now = clock()
-    let floor = floor ?? max(0, now - ACELimits.timestampWindowSeconds)
-    guard floor >= 0, floor <= now else { throw ACEError(.invalidArgument, "floor must be an integer in [0, now]") }
-    guard env.timestamp >= floor, env.timestamp <= now + ACELimits.timestampWindowSeconds else {
+    let floor = floor ?? max(0, clampedSub(now, ACELimits.timestampWindowSeconds))
+    // `max(now, 0)`: a pre-epoch (pathological) clock yields `stale_timestamp` below, not a floor error.
+    guard floor >= 0, floor <= max(now, 0) else { throw ACEError(.invalidArgument, "floor must be an integer in [0, now]") }
+    guard env.timestamp >= floor, env.timestamp <= clampedAdd(now, ACELimits.timestampWindowSeconds) else {
         throw ACEError(.staleTimestamp, "timestamp is outside the acceptance window")
     }
     // 7

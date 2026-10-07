@@ -254,6 +254,24 @@ struct PipelineTests {
         await bIn.close()
     }
 
+    @Test func relayPathWithExtremeClocksIsStaleNotTrap() async throws {
+        for extreme in [Int.min, Int.max] {
+            let p = try await Pair()
+            let sink = Sink()
+            let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
+            let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .rfq, body: ["need": "x"],
+                                        threads: try ThreadStateMachine(localAceId: p.alice.getACEId()),
+                                        threadId: "t", timestamp: p.clock.now)
+            // Opening on a fresh store with the extreme clock seeds the replay horizon (saturating).
+            p.clock.now = extreme
+            let bIn = try await p.inbox(p.bob, sink)
+            let o = await bIn.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "1-1"))
+            #expect(code(o) == .staleTimestamp, "clock \(extreme): \(o)")
+            #expect(sink.count == 0)
+            await bIn.close()
+        }
+    }
+
     @Test func receiverIsExclusiveAndReplayMissingIsDetected() async throws {
         let p = try await Pair()
         let bIn = try await p.inbox(p.bob, Sink())

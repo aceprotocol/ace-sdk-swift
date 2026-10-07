@@ -183,7 +183,7 @@ public actor Inbox {
             if try !store.checkedList("deliveries/").isEmpty || inbound {
                 throw ACEError(.storageFailed, "replay state missing beside history")
             }
-            let replay = try ReplayDetector(capacity: capacity, horizon: max(0, clock() - offlineWindow - 1), clock: clock)
+            let replay = try ReplayDetector(capacity: capacity, horizon: min(maxSafeInteger, max(0, clampedSub(clampedSub(clock(), offlineWindow), 1))), clock: clock)
             try store.checkedWrite("replay.json", replay.exportState().jsonData())
             return replay
         }
@@ -207,7 +207,7 @@ public actor Inbox {
         return out
     }
 
-    private var floor: Int { max(0, clock() - offlineWindow) }
+    private var floor: Int { max(0, clampedSub(clock(), offlineWindow)) }
 
     private func covered(_ m: ParsedMessage) -> Bool {
         replay.covers(sender: m.from, timestamp: m.timestamp)

@@ -115,6 +115,30 @@ import Testing
         #expect(isWithinWindow(now: Int.max, ts: 0, window: Int.max))
     }
 
+    @Test func clampedArithmetic() {
+        #expect(clampedAdd(1741000000, 300) == 1741000300 && clampedSub(1741000000, 300) == 1740999700)
+        #expect(clampedAdd(-5, 3) == -2 && clampedSub(-5, -3) == -2)
+        #expect(clampedAdd(Int.max, 1) == Int.max && clampedAdd(Int.min, -1) == Int.min)
+        #expect(clampedSub(Int.min, 1) == Int.min && clampedSub(Int.max, -1) == Int.max)
+        #expect(clampedSub(0, Int.min) == Int.max && clampedAdd(Int.max - 300, 300) == Int.max)
+    }
+
+    @Test func replayAndAdoptWithExtremeClocks() throws {
+        let ace = "ace:sha256:" + String(repeating: "b", count: 64)
+        for extreme in [Int.min, Int.max] {
+            let r = try ReplayDetector(clock: { extreme })
+            // `commit` derives its default floor from the clock (saturating, clamped at 0).
+            _ = try r.commit("m1", from: ace, timestamp: 1741000000)
+            let reg = try Fixtures.agent("alice").toRegistrationFile(name: "X", endpoint: "https://x.example/ace")
+            let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)), pinnedAt: 1741000000)
+            if extreme == Int.max {
+                #expect(code { _ = try adoptDecision(pin: nil, candidate: peer, now: extreme) } == nil)
+            } else {
+                #expect(code { _ = try adoptDecision(pin: nil, candidate: peer, now: extreme) } == .invalidPeer)
+            }
+        }
+    }
+
     @Test func extremeClockIsStaleNotTrap() {
         let b = Data(body.utf8)
         let max = 9_007_199_254_740_991

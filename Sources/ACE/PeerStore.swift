@@ -49,7 +49,7 @@ public actor PeerStore {
         let maxAge = maxAgeSeconds ?? ttlSeconds
         guard maxAge >= 0 else { throw ACEError(.invalidArgument, "maxAgeSeconds must be non-negative") }
         let pinned = try load(aceId)
-        if let pinned, clock() - pinned.fetchedAt <= maxAge { return pinned.peer }
+        if let pinned, clampedSub(clock(), pinned.fetchedAt) <= maxAge { return pinned.peer }
         guard let relay else {
             if let pinned { return pinned.peer }
             throw ACEError(.unknownPeer, "no pinned binding and no relay")

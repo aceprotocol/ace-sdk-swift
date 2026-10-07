@@ -49,5 +49,17 @@ func isWithinWindow(now: Int, ts: Int, window: Int) -> Bool {
     return !overflow && delta.magnitude <= UInt(window)
 }
 
+/// `a + b`, saturating to `Int.max` / `Int.min` instead of trapping (clock arithmetic).
+func clampedAdd(_ a: Int, _ b: Int) -> Int {
+    let (r, overflow) = a.addingReportingOverflow(b)
+    return overflow ? (b > 0 ? .max : .min) : r
+}
+
+/// `a − b`, saturating to `Int.max` / `Int.min` instead of trapping (clock arithmetic).
+func clampedSub(_ a: Int, _ b: Int) -> Int {
+    let (r, overflow) = a.subtractingReportingOverflow(b)
+    return overflow ? (b < 0 ? .max : .min) : r
+}
+
 /// The default clock: integer Unix seconds.
 @usableFromInline @Sendable func systemClock() -> Int { Int(Date().timeIntervalSince1970) }

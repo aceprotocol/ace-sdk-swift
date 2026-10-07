@@ -254,13 +254,13 @@ public final class ThreadStore: Sendable {
     private func pruneIfDue(except current: String) throws {
         let now = clock()
         pruneState.lock.lock()
-        let due = pruneState.last.map { now - $0 >= Self.pruneIntervalSeconds } ?? true
+        let due = pruneState.last.map { clampedSub(now, $0) >= Self.pruneIntervalSeconds } ?? true
         if due { pruneState.last = now }
         pruneState.lock.unlock()
         guard due else { return }
         for key in try recordKeys() where key != current {
             guard let record = try? load(key: key), record.pending == nil,
-                  let last = record.snapshot.history.last, last.timestamp < now - Self.retentionSeconds else { continue }
+                  let last = record.snapshot.history.last, last.timestamp < clampedSub(now, Self.retentionSeconds) else { continue }
             let snap = record.snapshot
             guard snap.state.isTerminal || !snap.history.contains(where: { $0.from == localAceId }) else { continue }
             try store.checkedDelete(key)
