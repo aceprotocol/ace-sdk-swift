@@ -24,10 +24,11 @@ public func signWebhookNotification(secret: String, timestamp: Int, body: Data) 
 
 /// Verify `X-ACE-Webhook-Timestamp` / `X-ACE-Webhook-Signature` over the raw `body`.
 ///
-/// Check order: malformed timestamp → `invalid_argument`; signature not shaped
-/// `sha256=<64 lowercase hex>` → `invalid_signature`; `|now − ts| > window` →
-/// `stale_timestamp`; HMAC (constant-time) → `invalid_signature`; body not
-/// `{"event":"message","aceId","streamId"}` → `invalid_argument`.
+/// Check order (mirrors the TS SDK): timestamp malformed or above 2^53 − 1 →
+/// `invalid_argument`; signature not shaped `sha256=<64 lowercase hex>` →
+/// `invalid_signature`; `windowSeconds` outside [0, 2^53 − 1] → `invalid_argument`;
+/// `|now − ts| > window` → `stale_timestamp`; HMAC (constant-time) → `invalid_signature`;
+/// body not `{"event":"message","aceId","streamId"}` → `invalid_argument`.
 public func verifyWebhookNotification(
     secret: String,
     timestamp: String,
@@ -36,14 +37,15 @@ public func verifyWebhookNotification(
     clock: @Sendable () -> Int = systemClock,
     windowSeconds: Int = ACELimits.timestampWindowSeconds
 ) throws -> WebhookNotification {
-    guard isTimestampHeader(timestamp), let ts = Int(timestamp) else {
+    // `isTimestampHeader` admits up to 16 digits, so parse and then apply the safe-integer bound.
+    guard isTimestampHeader(timestamp), let ts = Int(timestamp), ts <= maxSafeInteger else {
         throw ACEError.invalidArgument("X-ACE-Webhook-Timestamp is malformed")
-    }
-    guard windowSeconds >= 0 else {
-        throw ACEError.invalidArgument("windowSeconds must be a non-negative integer")
     }
     guard isWebhookSignature(signature) else {
         throw ACEError(.invalidSignature, "X-ACE-Webhook-Signature is malformed")
+    }
+    guard isWireInt(windowSeconds) else {
+        throw ACEError.invalidArgument("windowSeconds must be a non-negative integer")
     }
     guard abs(clock() - ts) <= windowSeconds else {
         throw ACEError(.staleTimestamp, "X-ACE-Webhook-Timestamp is outside the freshness window")
