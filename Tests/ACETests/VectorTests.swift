@@ -430,7 +430,7 @@ struct VectorTests {
 
     @Test func blockedAddresses() {
         let all = cases("blockedAddresses")
-        #expect(all.count == 77)
+        #expect(all.count == 91)
         for c in all {
             let address = c["address"] as! String
             #expect(isBlockedAddress(address) == c["blocked"] as? Bool, "\(address)")

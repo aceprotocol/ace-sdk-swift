@@ -408,18 +408,23 @@ func isBlockedIPv4(_ a: [UInt8]) -> Bool {
     }
 }
 
-/// ::/128, ::1/128, ::ffff:0:0/96 and 64:ff9b::/96 (embedded IPv4 judged), 100::/64,
-/// 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8.
+/// ::ffff:0:0/96 and 64:ff9b::/96 (embedded IPv4 judged); ::/96 (IPv4-compatible, includes
+/// :: and ::1), ::ffff:0:0:0/96 (SIIT), 64:ff9b:1::/48, 100::/64, 2001::/32 (Teredo),
+/// 2001:db8::/32, 2002::/16 (6to4), fc00::/7, fe80::/10, ff00::/8.
 func isBlockedIPv6(_ a: [UInt8]) -> Bool {
     let prefix96 = Array(a[0..<12])
     if prefix96 == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF]
         || prefix96 == [0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0] {
         return isBlockedIPv4(Array(a[12..<16]))
     }
-    if a.allSatisfy({ $0 == 0 }) { return true }
-    if a[0..<15].allSatisfy({ $0 == 0 }) && a[15] == 1 { return true }
+    // IPv4-embedding transition ranges are blocked whole, whatever the embedded IPv4.
+    if prefix96 == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] { return true }  // ::/96 (incl. :: and ::1)
+    if prefix96 == [0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0] { return true }  // ::ffff:0:0:0/96
+    if Array(a[0..<6]) == [0, 0x64, 0xFF, 0x9B, 0, 1] { return true }  // 64:ff9b:1::/48
     if a[0] == 0x01 && a[1] == 0x00 && a[2..<8].allSatisfy({ $0 == 0 }) { return true }
+    if a[0] == 0x20 && a[1] == 0x01 && a[2] == 0x00 && a[3] == 0x00 { return true }  // 2001::/32
     if a[0] == 0x20 && a[1] == 0x01 && a[2] == 0x0D && a[3] == 0xB8 { return true }
+    if a[0] == 0x20 && a[1] == 0x02 { return true }  // 2002::/16
     if a[0] & 0xFE == 0xFC { return true }
     if a[0] == 0xFE && a[1] & 0xC0 == 0x80 { return true }
     return a[0] == 0xFF
@@ -427,8 +432,8 @@ func isBlockedIPv6(_ a: [UInt8]) -> Bool {
 
 /// True when `address` is an IP literal in a blocked range (08 § Client Rules, Blocked
 /// Addresses), or is not an IP literal at all (never treated as allowed). IPv4-mapped and
-/// NAT64 (`64:ff9b::/96`) IPv6 addresses are judged by their embedded IPv4 address; an
-/// IPv6 `%zone` suffix is ignored.
+/// NAT64 (`64:ff9b::/96`) IPv6 addresses are judged by their embedded IPv4 address; other
+/// IPv4-embedding transition ranges are blocked whole; an IPv6 `%zone` suffix is ignored.
 public func isBlockedAddress(_ address: String) -> Bool {
     var address = address
     if address.contains(":"), let zone = address.firstIndex(of: "%") {
