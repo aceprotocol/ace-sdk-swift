@@ -60,6 +60,10 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
         let response = HTTPURLResponse(url: request.url!, statusCode: r.status, httpVersion: "HTTP/1.1", headerFields: r.headers)!
+        if (300..<400).contains(r.status), let location = r.headers["Location"].flatMap(URL.init(string:)) {
+            // Offer the redirect to the session; a delegate that refuses it gets this response.
+            client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: location), redirectResponse: response)
+        }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         for c in r.chunks { client?.urlProtocol(self, didLoad: c) }
         client?.urlProtocolDidFinishLoading(self)

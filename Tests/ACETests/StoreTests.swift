@@ -35,7 +35,7 @@ struct StoreTests {
 
         let held = try store.lock("receive", timeout: 0)
         expectCode(.receiverBusy) { try store.lock("receive", timeout: 0) }
-        expectCode(.storageFailed) {
+        expectCode(.lockBusy) {
             let other = try store.lock("threads", timeout: 1)
             defer { other.release() }
             return try store.lock("threads", timeout: 0.1)
@@ -43,6 +43,17 @@ struct StoreTests {
         held.release()
         held.release()
         try store.lock("receive", timeout: 0).release()
+        try store.lock("receive").release()  // default timeout
+
+        // Lock names have their own grammar (no '/', no '.', at most 64 characters).
+        for bad in ["", "a/b", "a.b", "A", "-a", String(repeating: "a", count: 65)] {
+            expectCode(.invalidArgument) { try store.lock(bad, timeout: 0) }
+        }
+        try store.lock("a_b-" + String(repeating: "c", count: 60), timeout: 0).release()
+
+        // Nothing is written that could not be read back.
+        expectCode(.invalidArgument) { try store.write("big.json", Data(count: ACELimits.maxStoreValueBytes + 1)) }
+        #expect(try store.read("big.json") == nil)
     }
 
     @Test func memoryStore() throws { try exercise(MemoryStore()) }
@@ -85,7 +96,7 @@ struct StoreTests {
         try Data("{\"createdAt\":1,\"host\":\"other-host\",\"pid\":1}".utf8).write(to: dir.appendingPathComponent("locks/receive.lock"))
         expectCode(.receiverBusy) { try store.lock("receive", timeout: 0.1) }
         try Data("garbage".utf8).write(to: dir.appendingPathComponent("locks/threads.lock"))
-        expectCode(.storageFailed) { try store.lock("threads", timeout: 0) }
+        expectCode(.lockBusy) { try store.lock("threads", timeout: 0) }
         // ... but an unparseable one older than 60 s is broken.
         let old = Date(timeIntervalSinceNow: -120)
         try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: dir.appendingPathComponent("locks/threads.lock").path)
@@ -123,7 +134,7 @@ struct PeerStoreTests {
         let older = try verifyPeerRecord(try peerRecord(rotatedIdentity, registeredAt: 1740000000))
         await expectCodeAsync(.stalePeerBinding) { try await peers.adopt(older) }
         // An unsigned (registration-file) candidate never rotates.
-        let file = try rotatedIdentity.toRegistrationFile(name: "Bob", endpoint: "https://bob.example")
+        let file = try createRegistrationFile(for: rotatedIdentity, name: "Bob", endpoint: "https://bob.example")
         await expectCodeAsync(.stalePeerBinding) { try await peers.pinRegistrationFile(file, pinnedAt: 1741000000) }
         let newer = try verifyPeerRecord(try peerRecord(rotatedIdentity, registeredAt: 1740000001))
         #expect(try await peers.adopt(newer).outcome == .rotated)
@@ -175,7 +186,7 @@ struct PeerStoreTests {
     @Test func noRelay() async throws {
         let peers = try PeerStore(store: MemoryStore(), clock: clock.fn)
         await expectCodeAsync(.unknownPeer) { try await peers.resolve(bob.getACEId()) }
-        let p = try await peers.pinRegistrationFile(try bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example"))
+        let p = try await peers.pinRegistrationFile(try createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example"))
         #expect(p.source == .registration && p.registeredAt == 1741000000 && p.registrationSignature == nil)
         clock.now += 10_000_000
         #expect(try await peers.resolve(bob.getACEId()) == p)

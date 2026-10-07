@@ -14,6 +14,9 @@ public enum ACELimits {
     public static let maxPayloadBytes = 65536
     /// Serialized envelope; relay request body limit; SSE data limit.
     public static let maxEnvelopeBytes = 131072
+    /// Direct-delivery request body (`{"message": envelope}`): `maxEnvelopeBytes + 1024`
+    /// (08 § Direct Delivery).
+    public static let maxDirectBodyBytes = maxEnvelopeBytes + 1024
     /// Top-level object = depth 0.
     public static let maxJSONDepth = 32
     /// Thread ID length in Unicode code points.
@@ -33,6 +36,10 @@ public enum ACELimits {
     public static let kemPublicKeySize = 1216
     public static let kemCiphertextSize = 1120
     public static let defaultReplayCapacity = 100000
+    /// The largest value an `ACEStore` accepts (64 MiB), so nothing is written that cannot be read back.
+    public static let maxStoreValueBytes = 64 << 20
+    /// Default `ACEStore` lock timeout.
+    public static let defaultLockTimeoutSeconds: TimeInterval = 10
 }
 
 /// 2^53 − 1: the largest wire integer.

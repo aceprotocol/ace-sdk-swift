@@ -13,7 +13,8 @@ struct VectorTests {
     @Test func versionAndSections() {
         #expect(Fixtures.root["version"] as? String == "3")
         for key in ["envelopes", "bodies", "transitions", "replay", "signatures", "auth", "registrations",
-                    "registrationErrors", "urls", "base64", "peerBinding"] {
+                    "registrationErrors", "urls", "base64", "peerBinding", "webhooks", "relayUrls", "blockedAddresses",
+                    "relayErrors", "directReceive"] {
             #expect(V[key] != nil, "missing \(key)")
         }
     }
@@ -379,5 +380,94 @@ struct VectorTests {
                 }
             }
         }
+    }
+
+    // MARK: webhooks / relay URLs / blocked addresses / relay errors / direct receive
+
+    private func cases(_ section: String) -> [[String: Any]] {
+        (V[section] as! [String: Any])["cases"] as! [[String: Any]]
+    }
+
+    @Test func webhooks() {
+        let all = cases("webhooks")
+        #expect(all.count == 21)
+        for c in all {
+            let name = c["name"] as! String
+            let secret = c["secret"] as! String, timestamp = c["timestamp"] as! String, signature = c["signature"] as! String
+            let body = Data((c["body"] as! String).utf8), now = c["now"] as! Int
+            do {
+                let n = try verifyWebhookNotification(secret: secret, timestamp: timestamp, signature: signature, body: body,
+                                                      clock: { now })
+                guard let r = c["result"] as? [String: Any] else {
+                    Issue.record("\(name): expected \(c["error"]!), got success")
+                    continue
+                }
+                #expect(n.aceId == r["aceId"] as? String && n.streamId == r["streamId"] as? String, "\(name)")
+                #expect(signWebhookNotification(secret: secret, timestamp: Int(timestamp)!, body: body) == signature, "\(name)")
+            } catch let e as ACEError {
+                #expect(e.code.rawValue == c["error"] as? String, "\(name): \(e)")
+            } catch {
+                Issue.record("\(name): \(error)")
+            }
+        }
+    }
+
+    @Test func relayUrls() {
+        let all = cases("relayUrls")
+        #expect(all.count == 43)
+        for c in all {
+            let input = c["input"] as! String
+            do {
+                let out = try normalizeRelayURL(input)
+                #expect(out == c["normalized"] as? String, "\(input.debugDescription)")
+            } catch let e as ACEError {
+                #expect(e.code.rawValue == c["error"] as? String, "\(input.debugDescription): \(e)")
+            } catch {
+                Issue.record("\(input.debugDescription): \(error)")
+            }
+        }
+    }
+
+    @Test func blockedAddresses() {
+        let all = cases("blockedAddresses")
+        #expect(all.count == 77)
+        for c in all {
+            let address = c["address"] as! String
+            #expect(isBlockedAddress(address) == c["blocked"] as? Bool, "\(address)")
+        }
+    }
+
+    @Test func relayErrors() {
+        let all = cases("relayErrors")
+        #expect(all.count == 41)
+        for c in all {
+            let name = c["name"] as! String
+            let headers = c["headers"] as! [String: String]
+            let retryAfter = headers.first { $0.key.lowercased() == "retry-after" }?.value
+            let e = relayError(status: c["status"] as! Int, retryAfter: retryAfter, body: Data((c["body"] as! String).utf8))
+            #expect(e.code.rawValue == c["code"] as? String, "\(name)")
+            #expect(e.category.rawValue == c["category"] as? String, "\(name)")
+            #expect(e.relayCode == c["relayCode"] as? String, "\(name)")
+            #expect(e.retryAfterSeconds == c["retryAfterSeconds"] as? Int, "\(name)")
+            #expect(e.status == c["status"] as? Int, "\(name)")
+        }
+    }
+
+    @Test func directReceive() async throws {
+        let section = V["directReceive"] as! [String: Any]
+        #expect(section["maxDirectBodyBytes"] as? Int == ACELimits.maxDirectBodyBytes)
+        let all = cases("directReceive")
+        #expect(all.count == 17)
+        let bob = Fixtures.agent("bob"), store = MemoryStore()
+        let inbox = try await Inbox.open(identity: bob, store: store, peers: try PeerStore(store: store), onMessage: { _ in })
+        for c in all {
+            let name = c["name"] as! String
+            var bytes = (c["bodyHex"] as? String).map(hex) ?? Data((c["body"] as! String).utf8)
+            if let padTo = c["padTo"] as? Int, bytes.count < padTo { bytes.append(Data(repeating: 0x20, count: padTo - bytes.count)) }
+            let reply = await inbox.receiveDirect(bytes)
+            #expect(reply.status == c["status"] as? Int, "\(name)")
+            #expect(reply.body == ["ok": false, "error": .string(c["error"] as! String)], "\(name): \(reply.body)")
+        }
+        await inbox.close()
     }
 }

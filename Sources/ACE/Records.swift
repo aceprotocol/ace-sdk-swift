@@ -2,7 +2,7 @@
 //  Records.swift
 //  ACE SDK
 //
-//  Persisted JSON formats (design §3 / 06-security Appendix A). Writers emit compact
+//  Persisted JSON formats (06-security Appendix A). Writers emit compact
 //  UTF-8 with keys sorted and `/` unescaped; readers accept any valid JSON. An unknown
 //  `version` or a malformed record is `storage_failed`.
 //

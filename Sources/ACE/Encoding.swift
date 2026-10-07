@@ -2,7 +2,7 @@
 //  Encoding.swift
 //  ACE SDK
 //
-//  Strict wire encodings shared by every module (design §0).
+//  Strict wire encodings shared by every module (04-messages).
 //
 
 import Foundation
@@ -71,7 +71,7 @@ private let httpsURLRegex = try! NSRegularExpression(
 )
 
 /// The ACE HTTPS URL grammar (regex plus length / host / port checks). Never the platform URL parser.
-func isHTTPSURL(_ value: String) -> Bool {
+public func isHTTPSURL(_ value: String) -> Bool {
     guard value.utf8.count <= 2048, !value.contains("\n") else { return false }
     let ns = value as NSString
     let full = NSRange(location: 0, length: ns.length)

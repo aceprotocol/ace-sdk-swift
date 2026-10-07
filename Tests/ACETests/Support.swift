@@ -41,7 +41,7 @@ func hex(_ s: String) -> Data { hexDecode(s)! }
 
 /// A registration-file peer for a local identity.
 func peerOf(_ identity: SoftwareIdentity, pinnedAt: Int = 0) throws -> VerifiedPeer {
-    try verifyRegistrationFile(try identity.toRegistrationFile(name: "Peer", endpoint: "https://peer.example/ace"), pinnedAt: pinnedAt)
+    try verifyRegistrationFile(try createRegistrationFile(for: identity, name: "Peer", endpoint: "https://peer.example/ace"), pinnedAt: pinnedAt)
 }
 
 /// Expect an `ACEError` with `code`.

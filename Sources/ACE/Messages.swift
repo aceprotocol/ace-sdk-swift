@@ -90,7 +90,7 @@ private func event(_ env: ACEMessage) -> ThreadEvent {
 
 // MARK: - Create
 
-/// Encrypt, sign and record an outbound message (design §2.5 order):
+/// Encrypt, sign and record an outbound message, in this order:
 /// type / threadId / local identity (`invalid_argument`) → JSON values and schema
 /// (`invalid_body`) → conversationId → state-machine pre-check → serialize
 /// (`limit_exceeded` over 65508 bytes) → encrypt → sign → `threads.apply`.

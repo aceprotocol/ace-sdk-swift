@@ -7,14 +7,18 @@
 
 import Foundation
 
-/// Relay HTTP client. Authenticated calls use `X-ACE-*` headers with
-/// `timestamp = max(now, last + 1)` and retry once on 409 `replay`.
+/// Relay HTTP client (08-relay § Client Rules). Authenticated calls use `X-ACE-*` headers
+/// with `timestamp = max(now, last + 1)` and retry once on 409 `replay`.
 ///
-/// Error mapping: network errors, timeouts, 5xx, 408 and 429 → `relay_unavailable`
-/// (with `retryAfterSeconds`); an oversized or malformed body → `relay_protocol_error`;
-/// 400 `envelope_expired` → `envelope_expired`; 404 `unknown_peer` → `unknown_peer`;
-/// 403 `not_registered` → `not_registered`; any other 4xx → `relay_rejected` (with
-/// `status` and `relayCode`).
+/// Redirects are never followed (every request, `listen` included, runs with a task
+/// delegate that refuses them). Error mapping: network errors and timeouts →
+/// `relay_unavailable`; a non-2xx status maps as in 08 § Client Rules, Responses
+/// (1xx / 3xx → `relay_protocol_error`; 408, 5xx and 429 `rate_limited` (or no code) →
+/// `relay_unavailable`; any other 429 → `relay_rejected`; 400 `envelope_expired`,
+/// 403 `not_registered`, 404 `unknown_peer` → the same code; other 4xx → `relay_rejected`),
+/// keeping `status` and `relayCode`. `retryAfterSeconds` is set only from an integer
+/// `Retry-After` on a transient error. An oversized, empty or malformed 2xx body, or a
+/// present-but-malformed field, is `relay_protocol_error`.
 public actor RelayClient {
     public enum RegisterStatus: String, Sendable {
         case registered, idempotent, refreshed, rotated
@@ -22,8 +26,8 @@ public actor RelayClient {
 
     public struct InboxEntry: Sendable, Equatable {
         public let streamId: String
-        /// The envelope JSON as served by the relay (decode with `decodeEnvelope`).
-        public let envelope: Data
+        /// The `message` JSON as served by the relay, undecoded (`Inbox.receive` decodes it).
+        public let message: Data
     }
 
     public struct InboxPage: Sendable {
@@ -31,10 +35,10 @@ public actor RelayClient {
         public let cursor: String?
     }
 
-    /// One SSE `catchup` / `message` event.
+    /// One SSE `catchup` / `message` event. `message` is the raw frame data, not parsed.
     public struct Event: Sendable, Equatable {
         public let streamId: String
-        public let envelope: Data
+        public let message: Data
         public let catchup: Bool
     }
 
@@ -82,10 +86,10 @@ public actor RelayClient {
         public let lastError: String?
     }
 
-    /// The normalized base URL (lowercase scheme and host, no trailing `/`).
+    /// The normalized base URL (08 § Client Rules, Relay URL).
     public nonisolated let baseURL: URL
-    /// `baseURL` as a string: the normalized relay key (lowercase scheme and host, no
-    /// trailing `/`). Use it for `ReceiveSource.relay(url:)`; `Inbox` keys cursors by it.
+    /// `baseURL` as a string: the normalized relay key. Use it for
+    /// `ReceiveSource.relay(url:)`; `Inbox` keys cursors by it.
     public nonisolated let baseURLString: String
     private let session: URLSession
     /// `listen`'s own session (see `init`); created on first use.
@@ -94,6 +98,7 @@ public actor RelayClient {
     private let maxResponseBytes: Int
     private let clock: @Sendable () -> Int
     private let sleeper: @Sendable (Double) async throws -> Void
+    private let noRedirect = NoRedirectDelegate()
     private var lastAuthTimestamp = 0
 
     /// Reconnect attempts after which `listen` fails with `relay_unavailable`.
@@ -103,6 +108,9 @@ public actor RelayClient {
     /// Events buffered for a slow consumer; when full, reading the socket pauses.
     static let listenBuffer = 64
 
+    /// `baseURL` is normalized per 08 § Client Rules, Relay URL: http(s) only, no userinfo,
+    /// query, fragment or whitespace / control characters (`invalid_argument`).
+    ///
     /// `session` carries every request-response call. `listen` does not use it directly:
     /// it opens a dedicated session from a copy of `session.configuration` (same
     /// protocol classes, proxy, TLS and cookie settings, and the same delegate) with
@@ -125,9 +133,8 @@ public actor RelayClient {
         baseURL: URL, session: URLSession, timeout: TimeInterval, maxResponseBytes: Int,
         clock: @escaping @Sendable () -> Int, sleeper: @escaping @Sendable (Double) async throws -> Void
     ) throws {
-        guard let normalized = normalizeRelayURL(baseURL.absoluteString), let url = URL(string: normalized) else {
-            throw ACEError(.invalidArgument, "baseURL must be an absolute http(s) URL")
-        }
+        let normalized = try normalizeRelayURL(baseURL.absoluteString)
+        guard let url = URL(string: normalized) else { throw ACEError(.invalidArgument, "baseURL is not a valid URL") }
         guard timeout > 0, maxResponseBytes > 0 else { throw ACEError(.invalidArgument, "timeout and maxResponseBytes must be positive") }
         self.baseURL = url
         self.baseURLString = normalized
@@ -157,20 +164,15 @@ public actor RelayClient {
 
     /// `POST /v1/register` with a fresh registration request.
     @discardableResult
+    /// The request is body-signed, not header-authenticated, so the relay never answers it
+    /// with `replay` and it is not retried.
     public func register(_ identity: any ACEIdentity, profile: RegistrationProfile = .keep) async throws -> RegisterStatus {
-        var attempt = 0
-        while true {
-            let req = try createRegistrationRequest(identity: identity, profile: profile, timestamp: nextTimestamp())
-            do {
-                let v = try await call("POST", "/v1/register", body: req.jsonData())
-                guard let s = v["status"]?.stringValue, let status = RegisterStatus(rawValue: s) else {
-                    throw ACEError(.relayProtocolError, "unexpected register response")
-                }
-                return status
-            } catch let e as ACEError where e.relayCode == "replay" && attempt == 0 {
-                attempt += 1
-            }
+        let req = try createRegistrationRequest(identity: identity, profile: profile, timestamp: nextTimestamp())
+        let v = try await call("POST", "/v1/register", body: req.jsonData())
+        guard let s = v["status"]?.stringValue, let status = RegisterStatus(rawValue: s) else {
+            throw ACEError(.relayProtocolError, "unexpected register response")
         }
+        return status
     }
 
     /// `POST /v1/unregister`.
@@ -188,10 +190,11 @@ public actor RelayClient {
     }
 
     /// `GET /v1/discover`; unverifiable entries are dropped and counted in `rejected`.
+    /// `tags` are joined with `,` (a tag containing `,` is `invalid_argument`).
     public func discover(_ query: DiscoverQuery = DiscoverQuery()) async throws -> DiscoverPage {
         var q: [(String, String)] = []
         if let v = query.q { q.append(("q", v)) }
-        if let v = query.tags { q.append(("tags", v)) }
+        if let v = query.tags { q.append(("tags", try joinTags(v))) }
         if let v = query.chain { q.append(("chain", v)) }
         if let v = query.scheme { q.append(("scheme", v)) }
         if let v = query.online { q.append(("online", v ? "true" : "false")) }
@@ -213,29 +216,32 @@ public actor RelayClient {
         _ = try await call("POST", "/v1/send", body: body)
     }
 
-    /// `GET /v1/inbox`. `since` is a stream ID (`nil` = from the start); `limit` 1…100.
+    /// `GET /v1/inbox`. `since` is a stream ID (`nil` or `"-"` = from the start); `limit` 1…100.
+    /// More than `limit` entries is `relay_protocol_error`.
     public func fetchInbox(_ identity: any ACEIdentity, since: String? = nil, limit: Int = ACELimits.maxInboxPage) async throws -> InboxPage {
-        let auth = RelayAuthRequest.inbox(since: since ?? "-", limit: limit)
+        let since = since ?? "-"
+        let auth = RelayAuthRequest.inbox(since: since, limit: limit)
+        try auth.validate()
         var q: [(String, String)] = []
-        if let since { q.append(("since", since)) }
+        if since != "-" { q.append(("since", since)) }
         q.append(("limit", String(limit)))
         let v = try await call("GET", "/v1/inbox", query: q, auth: (identity, auth))
         guard let list = v["messages"]?.arrayValue else { throw ACEError(.relayProtocolError, "unexpected inbox response") }
+        guard list.count <= limit else { throw ACEError(.relayProtocolError, "inbox page has more than \(limit) entries") }
         let entries: [InboxEntry] = try list.map { e in
             guard let id = e["streamId"]?.stringValue, isStreamCursor(id), let m = e["message"] else {
                 throw ACEError(.relayProtocolError, "malformed inbox entry")
             }
-            return InboxEntry(streamId: id, envelope: JSONWriter.serialize(m))
+            return InboxEntry(streamId: id, message: JSONWriter.serialize(m))
         }
         return InboxPage(entries: entries, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
 
-    /// `POST /v1/intents`.
+    /// `POST /v1/intents`. `tags` is always sent (possibly empty), mirroring the signed payload.
     public func postIntent(_ identity: any ACEIdentity, need: String, tags: [String] = [], maxPrice: String? = nil,
                            currency: String? = nil, ttl: Int) async throws -> PostedIntent {
         let auth = RelayAuthRequest.intent(need: need, tags: tags, maxPrice: maxPrice, currency: currency, ttl: ttl)
-        var o: [String: JValue] = ["need": .string(need), "ttl": .number(String(ttl))]
-        if !tags.isEmpty { o["tags"] = .array(tags.map { .string($0) }) }
+        var o: [String: JValue] = ["need": .string(need), "ttl": .number(String(ttl)), "tags": .array(tags.map { .string($0) })]
         if let maxPrice { o["maxPrice"] = .string(maxPrice) }
         if let currency { o["currency"] = .string(currency) }
         let v = try await call("POST", "/v1/intents", body: JSONWriter.serialize(.object(o)), auth: (identity, auth))
@@ -245,11 +251,11 @@ public actor RelayClient {
         return PostedIntent(intentId: id, expiresAt: expiresAt)
     }
 
-    /// `GET /v1/intents`.
-    public func listIntents(q: String? = nil, tags: String? = nil, limit: Int? = nil, cursor: String? = nil) async throws -> IntentPage {
+    /// `GET /v1/intents`. `tags` are joined with `,` (a tag containing `,` is `invalid_argument`).
+    public func listIntents(q: String? = nil, tags: [String]? = nil, limit: Int? = nil, cursor: String? = nil) async throws -> IntentPage {
         var query: [(String, String)] = []
         if let q { query.append(("q", q)) }
-        if let tags { query.append(("tags", tags)) }
+        if let tags { query.append(("tags", try joinTags(tags))) }
         if let limit { query.append(("limit", String(limit))) }
         if let cursor { query.append(("cursor", cursor)) }
         let v = try await call("GET", "/v1/intents", query: query)
@@ -259,9 +265,15 @@ public actor RelayClient {
                   let ttl = i["ttl"]?.wireInt, let createdAt = i["createdAt"]?.wireInt, let expiresAt = i["expiresAt"]?.wireInt else {
                 throw ACEError(.relayProtocolError, "malformed intent")
             }
-            let tags = i["tags"]?.arrayValue?.compactMap(\.stringValue) ?? []
-            return Intent(intentId: id, from: from, need: need, tags: tags, maxPrice: i["maxPrice"]?.stringValue,
-                          currency: i["currency"]?.stringValue, ttl: ttl, createdAt: createdAt, expiresAt: expiresAt)
+            guard let tagList = i["tags"]?.arrayValue else { throw ACEError(.relayProtocolError, "malformed intent tags") }
+            let tags: [String] = try tagList.map {
+                guard let t = $0.stringValue else { throw ACEError(.relayProtocolError, "malformed intent tags") }
+                return t
+            }
+            return Intent(intentId: id, from: from, need: need, tags: tags,
+                          maxPrice: try optionalField(i, "maxPrice") { $0.stringValue },
+                          currency: try optionalField(i, "currency") { $0.stringValue },
+                          ttl: ttl, createdAt: createdAt, expiresAt: expiresAt)
         }
         return IntentPage(intents: intents, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
@@ -295,9 +307,11 @@ public actor RelayClient {
     /// `GET /v1/listen` as a stream of `catchup` / `message` events.
     ///
     /// Reconnects internally with backoff 1, 2, 4 … 30 s (honoring `Retry-After`), resuming
-    /// after the last yielded `streamId`; `drain` reconnects at once; `connected` and
-    /// heartbeats are ignored; 90 s without a byte reconnects. Ten consecutive failed
-    /// connects end the stream with `relay_unavailable`; a non-retryable status ends it
+    /// after the last yielded `streamId`. `drain` or a clean end of stream reconnects at once
+    /// when that connection carried a `catchup`, `message` or `drain` frame; one that
+    /// delivered only `connected`, heartbeats or nothing counts as a failure. Only those three
+    /// frame types reset the failure count; 90 s without a byte reconnects. Ten consecutive
+    /// failures end the stream with `relay_unavailable`; a non-retryable status ends it
     /// with the mapped error; a frame larger than `MAX_ENVELOPE_BYTES + 512` ends it with
     /// `relay_protocol_error`.
     ///
@@ -340,10 +354,13 @@ public actor RelayClient {
         while true {
             try Task.checkCancellation()
             do {
-                // A clean end (drain or EOF) reconnects at once.
-                try await connectOnce(identity, cursor: &cursor, onOpen: onOpen, out, onProgress: { failures = 0 })
-                failures = 0
-                continue
+                // A clean end (drain or EOF) reconnects at once if the connection made progress;
+                // one that delivered only `connected`, heartbeats or nothing is a failure.
+                if try await connectOnce(identity, cursor: &cursor, onOpen: onOpen, out, onProgress: { failures = 0 }) {
+                    failures = 0
+                    continue
+                }
+                throw ACEError(.relayUnavailable, "listen stream ended without progress")
             } catch let e as ACEError where e.code == .relayUnavailable {
                 failures += 1
                 if failures >= Self.maxConnectFailures { throw e }
@@ -354,10 +371,11 @@ public actor RelayClient {
         }
     }
 
-    /// One connection; returns after `drain` or a clean end of stream.
+    /// One connection; returns after `drain` or a clean end of stream, with whether it made
+    /// progress (a `catchup`, `message` or `drain` frame).
     private func connectOnce(_ identity: any ACEIdentity, cursor: inout String, onOpen: (@Sendable () throws -> Void)?,
                              _ out: AsyncThrowingStream<Event, Error>.Continuation,
-                             onProgress: () -> Void) async throws {
+                             onProgress: () -> Void) async throws -> Bool {
         var q: [(String, String)] = []
         if cursor != "-" { q.append(("since", cursor)) }
         var bytes: URLSession.AsyncBytes?
@@ -372,7 +390,7 @@ public actor RelayClient {
             let response: URLResponse
             let b: URLSession.AsyncBytes
             do {
-                (b, response) = try await session.bytes(for: request)
+                (b, response) = try await session.bytes(for: request, delegate: noRedirect)
             } catch {
                 throw transportError(error, "listen connect failed")
             }
@@ -391,7 +409,6 @@ public actor RelayClient {
             bytes.task.cancel()
             throw ACEError(.relayProtocolError, "listen response is not text/event-stream")
         }
-        onProgress()
         do { try onOpen?() } catch { throw OnOpenFailure(error: error) }
         var parser = SSEParser(maxLine: ACELimits.maxEnvelopeBytes + 512)
         // Cancel the data task itself on task cancellation, so a stream that only carries
@@ -399,7 +416,7 @@ public actor RelayClient {
         let dataTask = bytes.task
         defer { dataTask.cancel() }
         do {
-            try await withTaskCancellationHandler {
+            return try await withTaskCancellationHandler {
                 try await readEvents(bytes, &parser, cursor: &cursor, out, onProgress: onProgress)
             } onCancel: {
                 dataTask.cancel()
@@ -411,25 +428,31 @@ public actor RelayClient {
         }
     }
 
-    /// Feed the stream to `parser`; returns at `drain` or end of stream.
+    /// Feed the stream to `parser`; returns at `drain` or end of stream, with whether the
+    /// connection made progress (a `catchup`, `message` or `drain` frame, each of which calls
+    /// `onProgress`; `connected`, other types and comments do not).
     private func readEvents(_ bytes: URLSession.AsyncBytes, _ parser: inout SSEParser, cursor: inout String,
-                            _ out: AsyncThrowingStream<Event, Error>.Continuation, onProgress: () -> Void) async throws {
+                            _ out: AsyncThrowingStream<Event, Error>.Continuation, onProgress: () -> Void) async throws -> Bool {
+        var sawEvent = false
         for try await byte in bytes {
             guard let frame = try parser.feed(byte) else { continue }
             try Task.checkCancellation()
             switch frame.event {
             case "catchup", "message":
+                sawEvent = true
                 guard let id = frame.id, isStreamCursor(id) else { throw ACEError(.relayProtocolError, "SSE event without a valid stream id") }
-                guard !frame.data.isEmpty else { throw ACEError(.relayProtocolError, "SSE event without data") }
+                // The data is yielded as is: the Inbox quarantines what does not decode.
                 cursor = id
                 onProgress()
-                try await out.yieldWaiting(Event(streamId: id, envelope: Data(frame.data), catchup: frame.event == "catchup"))
+                try await out.yieldWaiting(Event(streamId: id, message: Data(frame.data), catchup: frame.event == "catchup"))
             case "drain":
-                return
-            default:
                 onProgress()
+                return true
+            default:
+                break  // connected, or an unknown type: not progress
             }
         }
+        return sawEvent
     }
 
     // MARK: HTTP
@@ -471,10 +494,10 @@ public actor RelayClient {
             if let auth { try addAuth(&request, auth.0, auth.1) }
             let (http, data) = try await perform(request)
             if (200..<300).contains(http.statusCode) {
-                guard !data.isEmpty else { return .object([:]) }
-                do { return try JSONParser.parse(data) } catch {
-                    throw ACEError(.relayProtocolError, "malformed relay response", status: http.statusCode)
+                guard let v = try? JSONParser.parse(data), v.objectValue != nil else {
+                    throw ACEError(.relayProtocolError, "relay response is not a JSON object", status: http.statusCode)
                 }
+                return v
             }
             let error = mapStatus(http, data)
             if http.statusCode == 409, error.relayCode == "replay", auth != nil, attempt == 0 {
@@ -487,7 +510,7 @@ public actor RelayClient {
 
     private func perform(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
         do {
-            let (bytes, response) = try await session.bytes(for: request)
+            let (bytes, response) = try await session.bytes(for: request, delegate: noRedirect)
             guard let http = response as? HTTPURLResponse else { throw ACEError(.relayProtocolError, "not an HTTP response") }
             return (http, try await readBounded(bytes))
         } catch let e as ACEError {
@@ -523,27 +546,7 @@ public actor RelayClient {
     }
 
     private func mapStatus(_ http: HTTPURLResponse, _ data: Data) -> ACEError {
-        let status = http.statusCode
-        let body = try? JSONParser.parse(data)
-        let relayCode = body?["error"]?.stringValue
-        let message = body?["message"]?.stringValue.map { String($0.prefix(500)) } ?? "HTTP \(status)"
-        let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-        if status >= 500 || status == 408 || status == 429 {
-            return ACEError(.relayUnavailable, message, status: status, relayCode: relayCode, retryAfterSeconds: retryAfter)
-        }
-        if status == 400 && relayCode == "envelope_expired" {
-            return ACEError(.envelopeExpired, message, status: status, relayCode: relayCode)
-        }
-        if status == 404 && relayCode == "unknown_peer" {
-            return ACEError(.unknownPeer, message, status: status, relayCode: relayCode)
-        }
-        if status == 403 && relayCode == "not_registered" {
-            return ACEError(.notRegistered, message, status: status, relayCode: relayCode)
-        }
-        if (400..<500).contains(status) {
-            return ACEError(.relayRejected, message, status: status, relayCode: relayCode)
-        }
-        return ACEError(.relayProtocolError, "unexpected HTTP \(status)", status: status, relayCode: relayCode)
+        relayError(status: http.statusCode, retryAfter: http.value(forHTTPHeaderField: "Retry-After"), body: data)
     }
 
     /// Absent or null is `nil`; present but malformed is `relay_protocol_error`.
@@ -568,16 +571,94 @@ private func percentEncode(_ s: String) -> String {
     return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
 }
 
-/// Lowercase scheme and host, no trailing `/` (Appendix A cursor keys).
-func normalizeRelayURL(_ s: String) -> String? {
-    guard var c = URLComponents(string: s), let scheme = c.scheme?.lowercased(), scheme == "https" || scheme == "http",
-          let host = c.host, !host.isEmpty else { return nil }
-    c.scheme = scheme
-    c.host = host.lowercased()
-    c.query = nil
-    c.fragment = nil
-    guard var out = c.string else { return nil }
-    while out.hasSuffix("/") { out.removeLast() }
+/// Tags joined with `,` for a query parameter; a tag containing `,` is `invalid_argument`.
+private func joinTags(_ tags: [String]) throws -> String {
+    guard !tags.contains(where: { $0.contains(",") }) else { throw ACEError.invalidArgument("tags must be strings without ','") }
+    return tags.joined(separator: ",")
+}
+
+/// Map one non-2xx relay response to an `ACEError` (08 § Client Rules, Responses). The
+/// single 409 `replay` retry happens before this mapping.
+func relayError(status: Int, retryAfter: String?, body: Data) -> ACEError {
+    let json = try? JSONParser.parse(body)
+    let relayCode = json?.objectValue?["error"]?.stringValue
+    let message = json?.objectValue?["message"]?.stringValue.map { String($0.prefix(500)) } ?? "HTTP \(status)"
+    let code: ACEError.Code
+    switch status {
+    case 100..<200, 300..<400: code = .relayProtocolError
+    case 408, 500..<600: code = .relayUnavailable
+    case 429: code = relayCode == nil || relayCode == "rate_limited" ? .relayUnavailable : .relayRejected
+    case 400 where relayCode == "envelope_expired": code = .envelopeExpired
+    case 403 where relayCode == "not_registered": code = .notRegistered
+    case 404 where relayCode == "unknown_peer": code = .unknownPeer
+    case 400..<500: code = .relayRejected
+    default: code = .relayProtocolError
+    }
+    let seconds = code.category == .transient ? retryAfter.flatMap(parseRetryAfter) : nil
+    return ACEError(code, code == .relayProtocolError ? "unexpected HTTP \(status)" : message,
+                    status: status, relayCode: relayCode, retryAfterSeconds: seconds)
+}
+
+/// `Retry-After` as delay-seconds (`^[0-9]+$`); any other form (HTTP-date, fraction) is nil.
+private func parseRetryAfter(_ value: String) -> Int? {
+    guard !value.isEmpty, value.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
+    return Int(value)
+}
+
+/// Normalize a relay base URL (08 § Client Rules, Relay URL): lowercase http(s) scheme
+/// and host (ASCII `[A-Za-z0-9.-]+` or a bracketed IPv6 literal), no userinfo / query /
+/// fragment / whitespace or control characters, port without leading zeros, default
+/// port dropped, trailing `/` removed, the rest of the path verbatim. Failures are
+/// `invalid_argument`. The result is the inbox cursor key.
+func normalizeRelayURL(_ s: String) throws -> String {
+    func bad(_ why: String) -> ACEError { ACEError(.invalidArgument, "relay URL \(why)") }
+    let u = Array(s.utf8)
+    guard !u.contains(where: { $0 <= 0x20 || $0 == 0x7F }) else { throw bad("must not contain whitespace or control characters") }
+    guard !u.contains(UInt8(ascii: "?")), !u.contains(UInt8(ascii: "#")) else { throw bad("must not have a query or fragment") }
+    guard let sep = s.range(of: "://") else { throw bad("must be an absolute http(s) URL") }
+    let scheme = s[..<sep.lowerBound].lowercased()
+    guard scheme == "http" || scheme == "https" else { throw bad("must use http or https") }
+    let rest = s[sep.upperBound...]
+    let pathStart = rest.firstIndex(of: "/") ?? rest.endIndex
+    let authority = rest[..<pathStart]
+    var path = String(rest[pathStart...])
+    guard !authority.contains("@") else { throw bad("must not contain userinfo") }
+    var host: Substring
+    var portText: Substring?
+    if authority.hasPrefix("[") {
+        guard let close = authority.firstIndex(of: "]") else { throw bad("has an invalid host") }
+        host = authority[...close]
+        let after = authority[authority.index(after: close)...]
+        if !after.isEmpty {
+            guard after.hasPrefix(":") else { throw bad("has an invalid host") }
+            portText = after.dropFirst()
+        }
+        let inner = host.dropFirst().dropLast()
+        var v6 = in6_addr()
+        guard !inner.isEmpty, inner.allSatisfy({ $0.isHexDigit || $0 == ":" || $0 == "." }),
+              inet_pton(AF_INET6, String(inner), &v6) == 1 else { throw bad("has an invalid IPv6 host") }
+    } else {
+        if let colon = authority.firstIndex(of: ":") {
+            host = authority[..<colon]
+            portText = authority[authority.index(after: colon)...]
+        } else {
+            host = authority
+        }
+        guard host.allSatisfy({ ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" || $0 == "." }) else {
+            throw bad("host must be ASCII [A-Za-z0-9.-]")
+        }
+    }
+    guard !host.isEmpty else { throw bad("has an empty host") }
+    var port = ""
+    if let portText {
+        guard !portText.isEmpty, portText.count <= 5, portText.first != "0",
+              portText.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let n = Int(portText), (1...65535).contains(n) else { throw bad("has an invalid port") }
+        if !((scheme == "https" && n == 443) || (scheme == "http" && n == 80)) { port = ":\(n)" }
+    }
+    while path.hasSuffix("/") { path.removeLast() }
+    let out = "\(scheme)://\(host.lowercased())\(port)\(path)"
+    guard URL(string: out) != nil else { throw bad("is not a valid URL") }
     return out
 }
 
@@ -593,23 +674,29 @@ struct SSEParser {
     private var line: [UInt8] = []
     private var frame = Frame()
     private var hasData = false
+    /// The previous byte was CR, so an LF right after it ends no further line.
+    private var afterCR = false
 
     init(maxLine: Int) { self.maxLine = maxLine }
 
-    /// Feed one byte; returns a frame at each blank line that carried fields.
+    /// Feed one byte; returns a frame at each blank line that ends an event with a `data`
+    /// field (08 § Client Rules, Listen); `id` and `event` apply to that event only. Lines
+    /// end with CR, LF or CRLF.
     mutating func feed(_ b: UInt8) throws -> Frame? {
-        if b != 0x0A {
+        let wasCR = afterCR
+        afterCR = b == 0x0D
+        if b == 0x0A && wasCR { return nil }
+        if b != 0x0A && b != 0x0D {
             line.append(b)
             if line.count > maxLine {
                 throw ACEError(.relayProtocolError, "SSE line exceeds \(maxLine) bytes")
             }
             return nil
         }
-        if line.last == 0x0D { line.removeLast() }
         defer { line.removeAll(keepingCapacity: true) }
         if line.isEmpty {
             defer { frame = Frame(); hasData = false }
-            return frame.id != nil || hasData || frame.event != "message" ? frame : nil
+            return hasData ? frame : nil
         }
         if line[0] == UInt8(ascii: ":") { return nil }
         let colon = line.firstIndex(of: UInt8(ascii: ":")) ?? line.count

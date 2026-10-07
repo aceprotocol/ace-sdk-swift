@@ -211,19 +211,19 @@ public final class ReplayDetector: @unchecked Sendable {
         return ts <= max(_horizon, sh[sender] ?? _horizon)
     }
 
-    public var horizon: Int {
+    var horizon: Int {
         lock.lock()
         defer { lock.unlock() }
         return _horizon
     }
 
-    private static func checkArgs(_ sender: String, _ ts: Int) throws {
-        guard !sender.isEmpty else { throw ACEError(.invalidArgument, "messageId and sender must be non-empty strings") }
+    private static func checkArgs(_ messageId: String, _ sender: String, _ ts: Int) throws {
+        guard !messageId.isEmpty, !sender.isEmpty else { throw ACEError(.invalidArgument, "messageId and sender must be non-empty strings") }
         guard isWireInt(ts) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
     }
 
     public func accepts(_ messageId: String, from sender: String, timestamp: Int) throws -> Bool {
-        try Self.checkArgs(sender, timestamp)
+        try Self.checkArgs(messageId, sender, timestamp)
         lock.lock()
         defer { lock.unlock() }
         return acceptsLocked(messageId, sender, timestamp)
@@ -233,7 +233,7 @@ public final class ReplayDetector: @unchecked Sendable {
     /// `floor` defaults to `now − 300`.
     @discardableResult
     public func commit(_ messageId: String, from sender: String, timestamp: Int, floor: Int? = nil) throws -> Bool {
-        try Self.checkArgs(sender, timestamp)
+        try Self.checkArgs(messageId, sender, timestamp)
         if let floor, !isWireInt(floor) {
             throw ACEError(.invalidArgument, "floor must be an integer in [0, 2^53-1]")
         }

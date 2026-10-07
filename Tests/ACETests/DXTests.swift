@@ -115,7 +115,7 @@ struct DXTests {
                                     threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
         let sink = Sink()
         let bIn = try await p.inbox(p.bob, sink)
-        let outcome = await bIn.receive(env.jsonData(), source: .direct)
+        let outcome = try await bIn.receive(env.jsonData(), source: .direct)
         #expect(outcome.message?.body == body)
         let key = DeliveryRecord.key(from: env.from, messageId: env.messageId)
         let rec = try DeliveryRecord.parse(try p.bobStore.readJSON(key)!, key: key)
@@ -142,9 +142,7 @@ struct DXTests {
         let peer = try verifyRegistrationFile(reg)
         #expect(peer.aceId == se.getACEId() && peer.encryptionPublicKey == se.getEncryptionPublicKey())
         let k1 = try SoftwareIdentity.generate(scheme: .secp256k1)
-        #expect(try k1.toRegistrationFile(name: "K", endpoint: "https://k.example")
-                == createRegistrationFile(for: k1, name: "K", endpoint: "https://k.example"))
-        #expect(try verifyRegistrationFile(k1.toRegistrationFile(name: "K", endpoint: "https://k.example")).scheme == .secp256k1)
+        #expect(try verifyRegistrationFile(createRegistrationFile(for: k1, name: "K", endpoint: "https://k.example")).scheme == .secp256k1)
     }
 
     // MARK: pull / follow
@@ -313,18 +311,22 @@ struct DXTests {
         let alicePeer = try await p.bobPeers.get(peer)!
         let rfq = try createMessage(sender: p.alice, recipient: bobPeer, type: .rfq, body: ["need": "x"],
                                     threads: try ThreadStateMachine(localAceId: peer), threadId: "new", timestamp: p.clock.now)
-        let refused = await bIn.receive(rfq.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-1"))
+        let refused = try await bIn.receive(rfq.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-1"))
         #expect(refused.error == ACEError(.limitExceeded))
         if case .quarantined = refused {} else { Issue.record("expected quarantined: \(refused)") }
         let bOut = try await p.outbox(p.bob)
         await expectCodeAsync(.limitExceeded) {
             try await bOut.stage(recipient: alicePeer, type: .rfq, body: ["need": "y"], threadId: "mine")
         }
+        // A type that cannot open a thread fails on the state machine, not on the bound.
+        await expectCodeAsync(.transitionNotAllowed) {
+            try await bOut.stage(recipient: alicePeer, type: .offer, body: ["price": "1", "currency": "USDC"], threadId: "mine")
+        }
         // Closing one thread frees a slot.
         try threads.remove(conversationId: sha256Hex(Data("c0".utf8)), threadId: "t0")
         let rfq2 = try createMessage(sender: p.alice, recipient: bobPeer, type: .rfq, body: ["need": "x"],
                                      threads: try ThreadStateMachine(localAceId: peer), threadId: "new2", timestamp: p.clock.now)
-        #expect(isDelivered(await bIn.receive(rfq2.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(rfq2.jsonData(), source: .direct)))
         await bIn.close()
     }
 
@@ -369,7 +371,7 @@ struct DXTests {
             let forged = ACEMessage(messageId: "00000000-0000-4000-8000-\(String(format: "%012d", n))", from: env.from, to: env.to,
                                     conversationId: env.conversationId, type: env.type, timestamp: env.timestamp,
                                     encryption: env.encryption, signature: env.signature)
-            let o = await bIn.receive(forged.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-\(n)"))
+            let o = try await bIn.receive(forged.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-\(n)"))
             #expect(o.error == ACEError(.invalidSignature))
         }
         #expect(try store.list(prefix: "quarantine/").count == Inbox.quarantineKeep)

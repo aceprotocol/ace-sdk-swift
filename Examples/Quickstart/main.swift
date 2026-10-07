@@ -8,8 +8,8 @@ let bob = try SoftwareIdentity.generate(scheme: .ed25519)
 
 // Keys are trusted here because both identities were created locally; in production a
 // VerifiedPeer comes from PeerStore / RelayClient / verifyRegistrationFile.
-let bobPeer = try verifyRegistrationFile(bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example/ace"))
-let alicePeer = try verifyRegistrationFile(alice.toRegistrationFile(name: "Alice", endpoint: "https://alice.example/ace"))
+let bobPeer = try verifyRegistrationFile(createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example/ace"))
+let alicePeer = try verifyRegistrationFile(createRegistrationFile(for: alice, name: "Alice", endpoint: "https://alice.example/ace"))
 
 let rfq = try createMessage(
     sender: alice, recipient: bobPeer, type: .rfq,
@@ -34,8 +34,8 @@ let bobStore = MemoryStore()
 // and `PeerStore(store:relay:)`; peers are then resolved and pinned from the relay.
 let alicePeers = try PeerStore(store: aliceStore)
 let bobPeers = try PeerStore(store: bobStore)
-let bobPinned = try await alicePeers.pinRegistrationFile(bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example/ace"))
-try await bobPeers.pinRegistrationFile(alice.toRegistrationFile(name: "Alice", endpoint: "https://alice.example/ace"))
+let bobPinned = try await alicePeers.pinRegistrationFile(createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example/ace"))
+try await bobPeers.pinRegistrationFile(createRegistrationFile(for: alice, name: "Alice", endpoint: "https://alice.example/ace"))
 
 // onMessage must persist the host effect idempotently, keyed by (from, messageId).
 let inbox = try await Inbox.open(identity: bob, store: bobStore, peers: bobPeers) { message in
@@ -47,7 +47,7 @@ let staged = try await outbox.stage(recipient: bobPinned, type: .rfq, body: ["ne
 // With a relay: `try await outbox.deliver(staged.requestId) { try await relay.send($0) }`
 // and on the receiving side `await inbox.pull(relay).messages` or `for try await o in inbox.follow(relay)`.
 try await outbox.deliver(staged.requestId) { envelope in
-    let outcome = await inbox.receive(envelope.jsonData(), source: .direct)
+    let outcome = try await inbox.receive(envelope.jsonData(), source: .direct)
     guard case .delivered = outcome else { throw outcome.error ?? ACEError(.relayRejected) }
 }
 let threads = try ThreadStore(store: bobStore, localAceId: bob.getACEId())

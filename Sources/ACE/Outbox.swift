@@ -12,9 +12,11 @@ import Foundation
 /// - `stage` signs the message and persists it with its resulting thread state in one
 ///   write (economic: in the thread record; otherwise `outbox/<sha256(requestId)>.json`).
 ///   Staging an existing `requestId` returns the pending send unchanged.
-/// - `deliver(_:transport:)` calls the transport; success clears the pending send,
-///   `envelope_expired` marks it `expired`, any other error leaves it unchanged. A pending
-///   send is never abandoned automatically.
+/// - `deliver(_:transport:)` calls the transport (e.g. `relay.send` or
+///   `deliverDirectOrRelay`); success clears the pending send, `envelope_expired` marks it
+///   `expired`, any other error leaves it unchanged. An `expired` send is refused with
+///   `envelope_expired` before any transport call. A pending send is never abandoned
+///   automatically.
 /// - `resign` re-signs an `expired` send with the same `messageId` and a fresh timestamp.
 ///   The ciphertext is kept (the plaintext is not stored; the AEAD binds only the
 ///   conversation ID) and the thread head entry is rebuilt with the new timestamp.
@@ -30,13 +32,28 @@ public actor Outbox {
 
     /// Open the outbox. Under lock `threads`, thread records are repaired from `deliveries/`
     /// records whose snapshot strictly extends the stored history (divergence is
-    /// `storage_failed`); nothing is handed over and replay state is not touched.
+    /// `storage_failed`); records already `acked` and covered by the replay horizon are
+    /// skipped (their threads may have been pruned). Nothing is handed over and replay state
+    /// is not written.
     public static func open(identity: any ACEIdentity, store: any ACEStore,
                             clock: @escaping @Sendable () -> Int = systemClock) async throws -> Outbox {
         let clock = wireClock(clock)
         let threads = try ThreadStore(store: store, localAceId: identity.getACEId(), clock: clock)
+        var replay: ReplayDetector?
+        if let raw = try store.checkedRead("replay.json") {
+            do {
+                let state = try ReplayState(json: raw)
+                // Capacity never below the stored entry count, so loading cannot raise the horizon.
+                replay = try ReplayDetector(state: state, capacity: max(ACELimits.defaultReplayCapacity, state.entries.count), clock: clock)
+            } catch let e as ACEError {
+                throw ACEError(.storageFailed, "replay.json is invalid: \(e.message)")
+            }
+        }
         try store.withLock("threads") {
             for (key, rec) in try threads.deliveryRecords() {
+                if rec.status == .acked, replay?.covers(sender: rec.message.from, timestamp: rec.message.timestamp) == true {
+                    continue
+                }
                 if let snap = rec.thread { try threads.repair(from: snap, recordKey: key) }
             }
         }
@@ -112,7 +129,10 @@ public actor Outbox {
                 if rec?.pending != nil {
                     throw ACEError(.pendingSendConflict, "the thread already has a pending send")
                 }
-                if rec == nil { try threads.checkCanOpenThread(peer: recipient.aceId) }
+                // Only a message that opens a thread counts against the peer's open threads.
+                if rec == nil, machine.allowedTypes(conversationId: conversationId, threadId: threadId, senderAceId: local).contains(type) {
+                    try threads.checkCanOpenThread(peer: recipient.aceId)
+                }
                 let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
                                             threads: machine, threadId: threadId, timestamp: now)
                 let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env)
@@ -131,16 +151,22 @@ public actor Outbox {
         }
     }
 
-    /// Hand the staged envelope to `transport` (e.g. `{ try await relay.send($0) }`).
-    /// Unknown `requestId` is `invalid_argument`.
-    public func deliver(_ requestId: String, transport: @Sendable (ACEMessage) async throws -> Void) async throws {
+    /// Hand the staged envelope to `transport` (e.g. `{ try await relay.send($0) }` or
+    /// `deliverDirectOrRelay(relay:endpoint:)`) and return its result. Unknown `requestId`
+    /// is `invalid_argument`; an `expired` send is `envelope_expired` (re-sign it first).
+    @discardableResult
+    public func deliver<T: Sendable>(_ requestId: String, transport: @Sendable (ACEMessage) async throws -> T) async throws -> T {
         let rid = try Self.checkRequestId(requestId)
         guard let found = try store.withLock("threads", { try find(rid) }) else {
             throw ACEError(.invalidArgument, "no pending send with this requestId")
         }
+        guard found.0.status != .expired else {
+            throw ACEError(.envelopeExpired, "the pending send expired; resign it first")
+        }
         let message = found.0.message
+        let result: T
         do {
-            try await transport(message)
+            result = try await transport(message)
         } catch let e as ACEError where e.code == .envelopeExpired {
             try update(rid, messageId: message.messageId) {
                 PendingSend(requestId: $0.requestId, status: .expired, stagedAt: $0.stagedAt, message: $0.message)
@@ -148,6 +174,7 @@ public actor Outbox {
             throw e
         }
         try update(rid, messageId: message.messageId) { _ in nil }
+        return result
     }
 
     /// Replace the pending send (nil clears it).

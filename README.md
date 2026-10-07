@@ -35,7 +35,7 @@ import ACE
 
 let me = try SoftwareIdentity.generate(scheme: .ed25519)
 let store = try FileStore(directory: URL(fileURLWithPath: NSHomeDirectory() + "/.ace/state"))
-let relay = try RelayClient(baseURL: URL(string: "https://relay.example")!)
+let relay = try RelayClient(baseURL: URL(string: "https://relay.aceprotocol.org")!)
 try await relay.register(me, profile: .replace(AgentProfile(name: "My Agent")))
 
 let peers = try PeerStore(store: store, relay: relay)
@@ -62,23 +62,65 @@ do {
 }
 ```
 
-- `Inbox.receive(_:source:)` also accepts directly delivered envelopes (`.direct`, e.g. from your own HTTP endpoint); it returns `.delivered`, `.duplicate`, `.quarantined` or `.retryable`.
+- `Inbox.receive(_:source:)` takes the raw message bytes (`Data`) and returns `.delivered`, `.duplicate`, `.quarantined` (bytes that are not an envelope included) or `.retryable`. It throws `invalid_argument` only for misuse: an invalid `source` or a closed inbox. Delivery records are swept automatically.
 - `Inbox.pull(relay, limit:maxPages:)` drains the relay inbox from the durable cursor and returns a `PullResult`: `outcomes` (delivered / duplicate / quarantined, in relay order; `messages`, `delivered`, `duplicates`, `quarantined` are derived), `blocked` (the retryable error that stopped it) and `hasMore` (stopped by `maxPages`). `inbox.cursor(for: relay)` is the durable cursor.
-- Hand-fed relay entries use `.relay(url: relay.baseURLString, streamId:)`: `baseURLString` is the normalized cursor key.
+- Hand-fed relay entries use `.relay(url: relay.baseURLString, streamId:)`: `baseURLString` is the normalized cursor key (lowercase http(s) scheme and host, default port and trailing `/` removed; userinfo, query, fragment and whitespace are `invalid_argument`).
+- `RelayClient` never follows redirects (a 3xx is `relay_protocol_error`). 429 `rate_limited` is `relay_unavailable` (retryable, with `retryAfterSeconds`); any other 429 (`recipient_inbox_full`, `sender_quota_exceeded`, `max_open_intents`) is `relay_rejected`. `discover` / `listIntents` take `tags` as `[String]`.
 - `RelayClient.listen` runs on its own session derived from the injected one (`timeoutIntervalForResource = .infinity`, 90 s idle request timeout), so a short host timeout cannot kill the SSE stream. Cancelling the consumer closes the connection immediately.
 - Bodies are `[String: JSONValue]` (Sendable, literal-friendly: `["need": "x", "ttl": 60]`). Numbers are `Double`; integers up to 2^53−1 round-trip exactly and are written without a fraction.
 - `ACEError` equality compares `code` only: `#expect(throws: ACEError(.replay)) { … }`.
 - A peer may hold at most `ACELimits.maxOpenThreadsPerPeer` (1000) non-terminal threads; one more is `limit_exceeded`.
-- A custom `ACEStore` (database, wallet-scoped storage) can replace `FileStore`.
+- A custom `ACEStore` (database, wallet-scoped storage) can replace `FileStore`. Lock names match `^[a-z0-9][a-z0-9_-]{0,63}$`, the default lock timeout is 10 s, a held lock is `lock_busy` (`receiver_busy` for `receive`) and values over 64 MiB are `invalid_argument`.
 - `VerifiedPeer.profile` is unverified relay metadata; only the keys are verified.
+
+## Direct delivery
+
+An agent that advertises an `endpoint` accepts `POST <endpoint>` with `{"message": Envelope}` (08-relay § Direct Delivery). Serving HTTP, routing and rate limiting stay in your application; the SDK maps one request body to the reply:
+
+```swift
+// Receiver: inside your HTTP handler (request bodies up to ACELimits.maxDirectBodyBytes).
+let reply = await inbox.receiveDirect(requestBody)
+respond(status: reply.status, contentType: "application/json", body: reply.bodyData)
+// 200 {"ok":true,"messageId"} · 400 / 413 {"ok":false,"error"} · 503 {"ok":false,"error"} (retry later)
+```
+
+```swift
+// Sender: try the peer's endpoint first, fall back to the relay.
+let path = try await outbox.deliver(pending.requestId,
+                                    transport: deliverDirectOrRelay(relay: relay, endpoint: seller.profile?.endpoint))
+// path == .direct or .relay
+```
+
+- `postDirect(endpoint:envelope:timeout:)` sends one envelope: HTTPS only, the host is resolved and refused when any address is blocked (`isBlockedAddress`), redirects are not followed, default timeout 5 s. Success requires 2xx and `{"ok":true}`.
+- 400 / 413 is `direct_rejected` (permanent; `remoteCode` carries the receiver's `error` when it matches `^[a-z0-9_]{1,64}$`): the envelope must not be resent, neither directly nor through the relay, and `deliverDirectOrRelay` rethrows it. Anything else is `direct_unavailable` (transient), and an unsafe endpoint is `invalid_argument`; both fall back to the relay. Both paths carry the same envelope, so a second copy is a duplicate at the receiver.
+- `URLSession` cannot connect to a pre-validated IP, so the host is resolved again when connecting. A DNS rebind to an internal address then fails certificate validation before any request bytes are sent; there is no IP pinning.
+
+## Webhooks
+
+A non-resident agent can register one HTTPS URL; the relay POSTs a signed wake-up hint there after enqueuing a message (08-relay § Webhooks). Pull the inbox when it arrives:
+
+```swift
+try await relay.setWebhook(me, url: "https://agent.example.com/ace/wake", secret: webhookSecret) // 16..128 chars
+let current = try await relay.getWebhook(me)   // url, status (.active / .disabled), failures, …; never the secret
+try await relay.clearWebhook(me)
+
+// In your HTTP handler, over the raw body:
+let hint = try verifyWebhookNotification(secret: webhookSecret,
+                                         timestamp: headers["X-ACE-Webhook-Timestamp"] ?? "",
+                                         signature: headers["X-ACE-Webhook-Signature"] ?? "",
+                                         body: rawBody)
+_ = await inbox.pull(relay)   // hint.aceId / hint.streamId identify the newest entry
+```
+
+Malformed headers are `invalid_argument` / `invalid_signature`, a timestamp outside ±300 s is `stale_timestamp` and a wrong HMAC is `invalid_signature`. The notification carries no message: a missed one loses nothing.
 
 ## Quick start: local, without storage
 
 ```swift
 let alice = try SoftwareIdentity.generate(scheme: .ed25519)
 let bob = try SoftwareIdentity.generate(scheme: .ed25519)
-let bobPeer = try verifyRegistrationFile(bob.toRegistrationFile(name: "Bob", endpoint: "https://bob.example/ace"))
-let alicePeer = try verifyRegistrationFile(alice.toRegistrationFile(name: "Alice", endpoint: "https://alice.example/ace"))
+let bobPeer = try verifyRegistrationFile(createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example/ace"))
+let alicePeer = try verifyRegistrationFile(createRegistrationFile(for: alice, name: "Alice", endpoint: "https://alice.example/ace"))
 
 let message = try createMessage(sender: alice, recipient: bobPeer, type: .rfq, body: ["need": "Translate"],
                                 threads: ThreadStateMachine(localAceId: alice.getACEId()), threadId: "t1")
@@ -102,7 +144,7 @@ final class EnclaveIdentity: ACEIdentity {
 }
 ```
 
-`createRegistrationFile(for: enclave, name:endpoint:…)` builds and verifies its registration file, so `verifyRegistrationFile(try createRegistrationFile(for: enclave, …))` yields a `VerifiedPeer` (`SoftwareIdentity.toRegistrationFile` is the same function).
+`createRegistrationFile(for: enclave, name:endpoint:…)` builds and verifies its registration file, so `verifyRegistrationFile(try createRegistrationFile(for: enclave, …))` yields a `VerifiedPeer`.
 
 `ACEEncryption` also exposes `publicKey(fromSeed:)`, `generateSeed()` and `computeConversationId(pubA:pubB:)`.
 
@@ -122,7 +164,9 @@ Each message uses a fresh encapsulation, but the recipient's static seed decrypt
 
 ## Cross-language compatibility
 
-Wire-compatible with the TypeScript and Python SDKs (0.2.0). All sections of the shared `test-vectors.json` (version 2) run in `Tests/ACETests/VectorTests.swift`, including the three X-Wing draft KATs and byte-exact replay state. CryptoKit ed25519 signatures are randomized, so signature vectors are verified rather than reproduced byte for byte.
+Wire-compatible with the TypeScript and Python SDKs (0.2.0). All sections of the shared `test-vectors.json` (version 3) run in `Tests/ACETests/VectorTests.swift`, including the three X-Wing draft KATs, byte-exact replay state, webhook signatures, relay URL normalization, blocked addresses, relay error mapping and direct-receive replies.
+
+Signatures are not deterministic: CryptoKit ed25519 signatures are randomized (hedged), so signing the same bytes twice gives different valid signatures. Treat signatures as verify-only: never compare them byte for byte or use them as identifiers. Signature vectors are verified rather than reproduced.
 
 ## License
 

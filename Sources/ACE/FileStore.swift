@@ -22,7 +22,7 @@ import Darwin
 public final class FileStore: ACEStore, @unchecked Sendable {
     public let directory: URL
     private let root: String
-    private static let maxReadBytes = 64 << 20
+    private static let maxReadBytes = ACELimits.maxStoreValueBytes
     private static let processMutexes = NamedMutexes()
 
     /// Opens (creating if needed, mode 0700) the store directory.
@@ -88,6 +88,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
 
     public func write(_ key: String, _ value: Data) throws {
         try validateStoreKey(key)
+        try validateStoreValue(value)
         let p = path(key)
         let dir = (p as NSString).deletingLastPathComponent
         try makeDirectories(dir)
@@ -162,7 +163,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
     }
 
     public func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
-        try validateStoreKey(name)
+        try validateLockName(name)
         let mutexKey = root + "\u{0}" + name
         let deadline = Date(timeIntervalSinceNow: max(0, timeout))
         guard Self.processMutexes.acquire(mutexKey, timeout: timeout) else { throw lockTimeoutError(name) }

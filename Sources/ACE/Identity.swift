@@ -131,22 +131,6 @@ public final class SoftwareIdentity: ACEIdentity, @unchecked Sendable {
             encryptionPrivateKey: ACEBase64.encode(encryptionSeed)
         )
     }
-
-    /// `createRegistrationFile(for: self, …)`.
-    public func toRegistrationFile(
-        name: String,
-        endpoint: String,
-        description: String? = nil,
-        tier: IdentityTier = .keyOnly,
-        hardwareBacking: HardwareBacking? = nil,
-        capabilities: [Capability]? = nil,
-        settlement: [String]? = nil,
-        chains: [ChainInfo]? = nil
-    ) throws -> RegistrationFile {
-        try createRegistrationFile(for: self, name: name, endpoint: endpoint, description: description, tier: tier,
-                                   hardwareBacking: hardwareBacking, capabilities: capabilities, settlement: settlement,
-                                   chains: chains)
-    }
 }
 
 /// The registration file (01) of any identity, built from its public keys and verified

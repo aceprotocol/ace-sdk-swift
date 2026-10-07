@@ -15,7 +15,8 @@ public struct WebhookNotification: Sendable, Equatable {
 }
 
 /// `sha256=<lowercase hex HMAC-SHA256(secret, decimal(timestamp) || "." || body)>`.
-public func signWebhookNotification(secret: String, timestamp: Int, body: Data) -> String {
+/// Relay-side; internal here (the agent only verifies).
+func signWebhookNotification(secret: String, timestamp: Int, body: Data) -> String {
     var mac = HMAC<SHA256>(key: SymmetricKey(data: Data(secret.utf8)))
     mac.update(data: Data("\(timestamp).".utf8))
     mac.update(data: body)

@@ -225,8 +225,9 @@ private func regexFull(_ re: NSRegularExpression, _ s: String) -> Bool {
     return re.firstMatch(in: s, range: r)?.range == r
 }
 
-/// Validate a discovery profile; failures are `invalid_profile`.
-public func validateProfile(_ p: AgentProfile) throws {
+/// Validate a discovery profile and return it; failures are `invalid_profile`.
+@discardableResult
+public func validateProfile(_ p: AgentProfile) throws -> AgentProfile {
     let code = ACEError.Code.invalidProfile
     func text(_ value: String?, _ name: String, _ lo: Int, _ hi: Int) throws {
         guard let value else { return }
@@ -261,6 +262,7 @@ public func validateProfile(_ p: AgentProfile) throws {
             throw ACEError(code, "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)")
         }
     }
+    return p
 }
 
 // MARK: - Keys / binding
@@ -423,41 +425,65 @@ func isBlockedIPv6(_ a: [UInt8]) -> Bool {
     return a[0] == 0xFF
 }
 
-/// Resolve `domain` with `getaddrinfo` and reject if any address is in a blocked range.
-func resolveAndCheck(_ domain: String, allowPrivate: Bool) throws {
+/// True when `address` is an IP literal in a blocked range (08 § Client Rules, Blocked
+/// Addresses), or is not an IP literal at all (never treated as allowed). IPv4-mapped and
+/// NAT64 (`64:ff9b::/96`) IPv6 addresses are judged by their embedded IPv4 address; an
+/// IPv6 `%zone` suffix is ignored.
+public func isBlockedAddress(_ address: String) -> Bool {
+    var address = address
+    if address.contains(":"), let zone = address.firstIndex(of: "%") {
+        address = String(address[..<zone])  // an IPv6 %zone is ignored
+    }
+    var v4 = in_addr()
+    if inet_pton(AF_INET, address, &v4) == 1 {
+        return withUnsafeBytes(of: v4) { isBlockedIPv4(Array($0)) }
+    }
+    var v6 = in6_addr()
+    if inet_pton(AF_INET6, address, &v6) == 1 {
+        return withUnsafeBytes(of: v6) { isBlockedIPv6(Array($0)) }
+    }
+    return true
+}
+
+/// The resolved addresses of `host` (IPv4 as 4 bytes, IPv6 as 16), or nil when resolution
+/// fails or yields nothing. An IP literal resolves to itself.
+func resolveAddresses(_ host: String) -> [[UInt8]]? {
     var hints = addrinfo()
     hints.ai_socktype = SOCK_STREAM
     hints.ai_protocol = IPPROTO_TCP
     var res: UnsafeMutablePointer<addrinfo>?
-    let rc = getaddrinfo(domain, "443", &hints, &res)
-    guard rc == 0, let first = res else {
-        throw ACEError(.fetchFailed, "DNS resolution failed for \(String(domain.prefix(100)))")
-    }
+    guard getaddrinfo(host, "443", &hints, &res) == 0, let first = res else { return nil }
     defer { freeaddrinfo(first) }
-    var count = 0
+    var out: [[UInt8]] = []
     var p: UnsafeMutablePointer<addrinfo>? = first
     while let ai = p {
         defer { p = ai.pointee.ai_next }
         guard let sa = ai.pointee.ai_addr else { continue }
-        var blocked = false
         if ai.pointee.ai_family == AF_INET {
             let addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
-            blocked = withUnsafeBytes(of: addr) { isBlockedIPv4(Array($0)) }
+            out.append(withUnsafeBytes(of: addr) { Array($0) })
         } else if ai.pointee.ai_family == AF_INET6 {
             let addr = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
-            blocked = withUnsafeBytes(of: addr) { isBlockedIPv6(Array($0)) }
-        } else {
-            continue
-        }
-        count += 1
-        if blocked && !allowPrivate {
-            throw ACEError(.blockedAddress, "\(String(domain.prefix(100))) resolves to a blocked address")
+            out.append(withUnsafeBytes(of: addr) { Array($0) })
         }
     }
-    guard count > 0 else { throw ACEError(.fetchFailed, "no addresses resolved") }
+    return out.isEmpty ? nil : out
 }
 
-private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+func isBlockedRaw(_ a: [UInt8]) -> Bool { a.count == 4 ? isBlockedIPv4(a) : isBlockedIPv6(a) }
+
+/// Resolve `domain` with `getaddrinfo` and reject if any address is in a blocked range.
+func resolveAndCheck(_ domain: String, allowPrivate: Bool) throws {
+    guard let addresses = resolveAddresses(domain) else {
+        throw ACEError(.fetchFailed, "DNS resolution failed for \(String(domain.prefix(100)))")
+    }
+    if !allowPrivate, addresses.contains(where: isBlockedRaw) {
+        throw ACEError(.blockedAddress, "\(String(domain.prefix(100))) resolves to a blocked address")
+    }
+}
+
+/// Task delegate that refuses every HTTP redirect: the 3xx response itself is returned.
+final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest) async -> URLRequest? {
         nil

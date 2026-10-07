@@ -135,7 +135,7 @@ import Testing
 
     @Test func replayAndAdoptWithExtremeClocks() throws {
         let ace = "ace:sha256:" + String(repeating: "b", count: 64)
-        let reg = try Fixtures.agent("alice").toRegistrationFile(name: "X", endpoint: "https://x.example/ace")
+        let reg = try createRegistrationFile(for: Fixtures.agent("alice"), name: "X", endpoint: "https://x.example/ace")
         let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)), pinnedAt: 1741000000)
         for (extreme, expected) in [(Int.min, ACEError.Code.invalidPeer), (Int.max, nil)] {
             let r = try ReplayDetector(clock: { extreme })

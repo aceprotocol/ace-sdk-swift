@@ -9,7 +9,7 @@ import Foundation
 
 /// Every SDK-originated failure. `category` is a fixed function of `code`.
 ///
-/// Equality compares `code` only (message, status, relayCode and retryAfterSeconds are
+/// Equality compares `code` only (message, status, relayCode, remoteCode and retryAfterSeconds are
 /// diagnostics), so `#expect(throws: ACEError(.replay)) { … }` and `error == ACEError(.replay)`
 /// match any `replay` failure.
 public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
@@ -44,22 +44,25 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         case envelopeExpired = "envelope_expired"
         case pendingSendConflict = "pending_send_conflict"
         case blockedAddress = "blocked_address"
+        case directRejected = "direct_rejected"
         // transient
         case relayUnavailable = "relay_unavailable"
         case relayProtocolError = "relay_protocol_error"
         case fetchFailed = "fetch_failed"
+        case directUnavailable = "direct_unavailable"
         // local
         case storageFailed = "storage_failed"
         case identityUnavailable = "identity_unavailable"
         case handlerFailed = "handler_failed"
         case receiverBusy = "receiver_busy"
+        case lockBusy = "lock_busy"
 
         /// The fixed category of this code.
         public var category: Category {
             switch self {
-            case .relayUnavailable, .relayProtocolError, .fetchFailed:
+            case .relayUnavailable, .relayProtocolError, .fetchFailed, .directUnavailable:
                 return .transient
-            case .storageFailed, .identityUnavailable, .handlerFailed, .receiverBusy:
+            case .storageFailed, .identityUnavailable, .handlerFailed, .receiverBusy, .lockBusy:
                 return .local
             default:
                 return .permanent
@@ -75,10 +78,12 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
 
     public let code: Code
     public let message: String
-    /// HTTP status, for relay / fetch failures.
+    /// HTTP status, for relay / fetch / direct-delivery failures.
     public let status: Int?
     /// The relay's `error` code, when the relay returned one.
     public let relayCode: String?
+    /// For `direct_rejected`: the receiving agent's `error` string, when it returned one.
+    public let remoteCode: String?
     /// Seconds from a `Retry-After` header, when present.
     public let retryAfterSeconds: Int?
 
@@ -87,12 +92,14 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         _ message: String = "",
         status: Int? = nil,
         relayCode: String? = nil,
+        remoteCode: String? = nil,
         retryAfterSeconds: Int? = nil
     ) {
         self.code = code
         self.message = message.isEmpty ? code.rawValue : message
         self.status = status
         self.relayCode = relayCode
+        self.remoteCode = remoteCode
         self.retryAfterSeconds = retryAfterSeconds
     }
 

@@ -43,7 +43,11 @@ struct RelayClientTests {
             (.error(400, "envelope_expired"), .envelopeExpired),
             (.error(400, "invalid_envelope"), .relayRejected),
             (.error(409, "message_id_conflict"), .relayRejected),
+            (.error(429, "recipient_inbox_full", headers: ["Retry-After": "7"]), .relayRejected),
+            (.error(301, "x", headers: ["Location": "https://elsewhere.test/"]), .relayProtocolError),
             (StubResponse(status: 200, chunks: [Data("not json".utf8)]), .relayProtocolError),
+            (StubResponse(status: 200, chunks: []), .relayProtocolError),
+            (StubResponse(status: 200, chunks: [Data("[]".utf8)]), .relayProtocolError),
             (StubResponse(status: -1), .relayUnavailable),
         ]
         for (response, code) in cases {
@@ -54,7 +58,7 @@ struct RelayClientTests {
             } catch let e as ACEError {
                 #expect(e.code == code, "\(response.status): \(e)")
                 if response.status == 503 { #expect(e.retryAfterSeconds == 7) }
-                if code == .relayRejected { #expect(e.status == response.status && e.relayCode != nil) }
+                if code == .relayRejected { #expect(e.status == response.status && e.relayCode != nil && e.retryAfterSeconds == nil) }
             }
         }
     }
@@ -90,8 +94,79 @@ struct RelayClientTests {
         let relay = try makeRelay(fake.handle)
         let page = try await relay.fetchInbox(bob, limit: 10)
         #expect(page.entries.count == 1 && page.entries[0].streamId == id && page.cursor == id)
-        #expect(try decodeEnvelope(page.entries[0].envelope) == env)
+        #expect(try decodeEnvelope(page.entries[0].message) == env)
         await expectCodeAsync(.invalidArgument) { try await relay.fetchInbox(bob, limit: 101) }
+    }
+
+    @Test func redirectsAreNeverFollowed() async throws {
+        let followed = Locked(0)
+        let target = uniqueHost()
+        StubURLProtocol.register(host: target) { _, _ in followed.mutate { $0 += 1 }; return .json(200, ["ok": true]) }
+        let relay = try makeRelay { _, _ in StubResponse(status: 307, headers: ["Location": "https://\(target)/v1/listen"]) }
+        await expectCodeAsync(.relayProtocolError) { try await relay.lookupPeer(bob.getACEId()) }
+        await expectCodeAsync(.relayProtocolError) { for try await _ in relay.listen(alice) {} }
+        #expect(followed.value == 0)
+    }
+
+    @Test func registerIsNotRetriedOnReplay() async throws {
+        let calls = Locked(0)
+        let relay = try makeRelay { _, _ in calls.mutate { $0 += 1 }; return .error(409, "replay") }
+        await expectCodeAsync(.relayRejected) { try await relay.register(alice) }
+        #expect(calls.value == 1)
+    }
+
+    @Test func fetchInboxIsStrict() async throws {
+        let queries = Locked<[String]>([])
+        let entry: [String: Any] = ["streamId": "1-1", "message": ["x": 1]]
+        let page = json(["messages": [entry, entry], "cursor": "1-1"])
+        let relay = try makeRelay { req, _ in
+            queries.mutate { $0.append(req.url?.query ?? "") }
+            return StubResponse(status: 200, chunks: [page])
+        }
+        await expectCodeAsync(.relayProtocolError) { try await relay.fetchInbox(bob, since: "-", limit: 1) }
+        #expect(try await relay.fetchInbox(bob, since: "-", limit: 2).entries.count == 2)
+        #expect(queries.value == ["limit=1", "limit=2"])  // "-" (start) is not sent
+        let badCursor = try makeRelay { _, _ in .json(200, ["messages": [], "cursor": 5]) }
+        await expectCodeAsync(.relayProtocolError) { try await badCursor.fetchInbox(bob) }
+    }
+
+    @Test func intentsAreStrict() async throws {
+        let posted = Locked<[String: Any]?>(nil)
+        let listed = Locked<String?>(nil)
+        let intent: [String: Any] = ["intentId": "i1", "from": Fixtures.agent("alice").getACEId(), "need": "x",
+                                     "tags": ["a"], "ttl": 60, "createdAt": 1, "expiresAt": 61]
+        let response = Locked<[String: Any]>(intent)
+        let relay = try makeRelay { req, body in
+            if req.httpMethod == "POST" {
+                posted.mutate { $0 = try? JSONSerialization.jsonObject(with: body) as? [String: Any] }
+                return .json(201, ["intentId": "i1", "expiresAt": 99])
+            }
+            listed.mutate { $0 = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "tags" }?.value }
+            return .json(200, ["intents": [response.value], "cursor": NSNull()])
+        }
+        _ = try await relay.postIntent(alice, need: "x", ttl: 60)
+        #expect(posted.value?["tags"] as? [String] == [])
+        #expect(try await relay.listIntents(tags: ["a", "b"]).intents[0].maxPrice == nil)
+        #expect(listed.value == "a,b")
+        await expectCodeAsync(.invalidArgument) { try await relay.listIntents(tags: ["a,b"]) }
+        await expectCodeAsync(.invalidArgument) { try await relay.discover(DiscoverQuery(tags: ["a,b"])) }
+        var withPrice = intent
+        withPrice["maxPrice"] = "5"
+        withPrice["currency"] = "USDC"
+        response.mutate { $0 = withPrice }
+        let priced = try await relay.listIntents().intents[0]
+        #expect(priced.maxPrice == "5" && priced.currency == "USDC")
+        let breakages: [([String: Any]) -> [String: Any]] = [
+            { var v = $0; v.removeValue(forKey: "tags"); return v },
+            { $0.merging(["tags": "a"]) { $1 } },
+            { $0.merging(["tags": [1]]) { $1 } },
+            { $0.merging(["maxPrice": 5]) { $1 } },
+            { $0.merging(["currency": NSNull()]) { $1 } },
+        ]
+        for brk in breakages {
+            response.mutate { $0 = brk(intent) }
+            await expectCodeAsync(.relayProtocolError) { try await relay.listIntents() }
+        }
     }
 
     @Test func webhookRoundTrip() async throws {
@@ -111,11 +186,23 @@ struct RelayClientTests {
     }
 
     @Test func listenRejectsEventsWithoutValidStreamId() async throws {
-        for frame in ["event: message\ndata: {}\n\n", "id: \(String(repeating: "1", count: 21))-0\nevent: message\ndata: {}\n\n",
-                      "id: 1-0\nevent: catchup\n\n"] {
+        for frame in ["event: message\ndata: {}\n\n", "id: \(String(repeating: "1", count: 21))-0\nevent: message\ndata: {}\n\n"] {
             let relay = try makeRelay({ _, _ in .sse([frame]) })
             await expectCodeAsync(.relayProtocolError) { for try await _ in relay.listen(alice) {} }
         }
+    }
+
+    @Test func listenYieldsPoisonFramesRaw() async throws {
+        // Frame data is not parsed by the client: the Inbox quarantines what does not decode.
+        let relay = try makeRelay({ _, _ in .sse(["id: 1-0\nevent: catchup\ndata:\n\n", "id: 1-1\nevent: message\ndata: not json\n\n"]) })
+        var events: [RelayClient.Event] = []
+        for try await e in relay.listen(alice) {
+            events.append(e)
+            if events.count == 2 { break }
+        }
+        #expect(events.map(\.streamId) == ["1-0", "1-1"])
+        #expect(events[0].message.isEmpty && events[0].catchup)
+        #expect(events[1].message == Data("not json".utf8) && !events[1].catchup)
     }
 
     @Test func getWebhookRejectsMalformedOptionalFields() async throws {
@@ -123,7 +210,7 @@ struct RelayClientTests {
         fake.add(try peerRecord(alice, registeredAt: 1741000000))
         let relay = try makeRelay(fake.handle)
         try await relay.setWebhook(alice, url: "https://agent.example.com/wake", secret: "0123456789abcdef0123456789abcdef")
-        let id = try alice.getACEId()
+        let id = alice.getACEId()
         let base = fake.webhooks[id]!
         func with(_ extra: [String: Any]) { fake.webhooks[id] = base.merging(extra) { _, new in new } }
         with(["lastDeliveredAt": 1741000001, "lastError": "http_500"])
@@ -217,7 +304,7 @@ struct RelayClientTests {
         }
         #expect(events.map(\.streamId) == ["1-1", "1-2"])
         #expect(events[0].catchup && !events[1].catchup)
-        #expect(try decodeEnvelope(events[1].envelope) == env)
+        #expect(try decodeEnvelope(events[1].message) == env)
         #expect(calls.value == ["-", "1-1", "1-1", "1-1", "1-2"])
     }
 
@@ -236,6 +323,23 @@ struct RelayClientTests {
         #expect(delays.value == Array(repeating: 30, count: 9))
     }
 
+    @Test func listenConnectedOnlyStreamsCountAsFailures() async throws {
+        // 200, `connected`, then a clean end, forever: neither `connected` nor heartbeats are
+        // progress, so each connection is a failure and the stream ends after ten.
+        let calls = Locked(0)
+        let delays = Locked<[Double]>([])
+        let host = uniqueHost()
+        StubURLProtocol.register(host: host) { _, _ in
+            calls.mutate { $0 += 1 }
+            return .sse(["event: connected\ndata: {}\n\n", ": hb\n\n"])
+        }
+        let relay = try RelayClient(baseURL: URL(string: "https://\(host)")!, session: stubSession(), timeout: 5,
+                                    maxResponseBytes: 1 << 20, clock: systemClock, sleeper: { d in delays.mutate { $0.append(d) } })
+        await expectCodeAsync(.relayUnavailable) { for try await _ in relay.listen(bob) {} }
+        #expect(calls.value == 10)
+        #expect(delays.value == [1, 2, 4, 8, 16, 30, 30, 30, 30])
+    }
+
     @Test func listenOversizedFrameIsProtocolError() async throws {
         let big = "data: " + String(repeating: "x", count: ACELimits.maxEnvelopeBytes + 600) + "\n\n"
         let relay = try makeRelay { _, _ in .sse(["id: 1-1\n", big]) }
@@ -250,6 +354,24 @@ struct RelayClientTests {
         }
         #expect(frames.count == 1)
         #expect(frames[0].id == "5-1" && frames[0].event == "catchup" && String(decoding: frames[0].data, as: UTF8.self) == "a\nb")
+
+        // Only an event with data is dispatched; id and event do not carry over.
+        var r = SSEParser(maxLine: 100)
+        var some: [SSEParser.Frame] = []
+        for b in Array("id: 1-0\nevent: message\n\ndata: a\n\nid: 2-0\nevent: drain\n\n".utf8) {
+            if let f = try r.feed(b) { some.append(f) }
+        }
+        #expect(some.count == 1)
+        #expect(some.first?.id == nil && some.first?.event == "message" && some.first?.data == Array("a".utf8))
+
+        // CR-only and mixed line endings.
+        for text in ["id: 5-2\revent: message\rdata: x\r\r", "id: 5-2\nevent: message\r\ndata: x\r\r\n"] {
+            var q = SSEParser(maxLine: 100)
+            var got: [SSEParser.Frame] = []
+            for b in Array(text.utf8) { if let f = try q.feed(b) { got.append(f) } }
+            #expect(got.count == 1, "\(text.debugDescription)")
+            #expect(got.first?.id == "5-2" && got.first?.event == "message" && got.first?.data == Array("x".utf8))
+        }
     }
 }
 

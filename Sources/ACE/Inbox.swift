@@ -10,8 +10,8 @@ import Foundation
 /// Where an envelope came from.
 public enum ReceiveSource: Sendable, Equatable {
     /// Fetched from a relay. `streamId` advances the durable cursor keyed by `url`
-    /// normalized (lowercase scheme and host, no trailing `/`). Pass
-    /// `relayClient.baseURLString` — the key `pull`, `follow` and `cursor(for:)` use.
+    /// normalized (08 § Client Rules, Relay URL). Pass `relayClient.baseURLString` — the
+    /// key `pull`, `follow` and `cursor(for:)` use.
     case relay(url: String, streamId: String?)
     /// Delivered directly (unauthenticated until verified; rejections are not persisted).
     case direct
@@ -39,6 +39,29 @@ public enum ReceiveOutcome: Sendable {
     public var message: ParsedMessage? {
         if case .delivered(let m) = self { return m }
         return nil
+    }
+}
+
+/// The HTTP reply for one direct-delivery request (08 § Direct Delivery, Receiver).
+/// The application serves it: status `status`, `Content-Type: application/json`, body
+/// `bodyData`.
+public struct DirectReply: Sendable {
+    /// 200, 400, 413 or 503.
+    public let status: Int
+    /// `{"ok":true,"messageId":…}` or `{"ok":false,"error":<code>}`.
+    public let body: [String: JSONValue]
+    /// The receive outcome, when the `message` member reached the pipeline.
+    public let outcome: ReceiveOutcome?
+
+    /// `body` serialized as compact JSON.
+    public var bodyData: Data { JSONWriter.serialize(JSONValue.object(body).jvalue ?? .object([:])) }
+
+    static func ok(_ messageId: String, _ outcome: ReceiveOutcome) -> DirectReply {
+        DirectReply(status: 200, body: ["ok": true, "messageId": .string(messageId)], outcome: outcome)
+    }
+
+    static func fail(_ status: Int, _ error: String, _ outcome: ReceiveOutcome? = nil) -> DirectReply {
+        DirectReply(status: status, body: ["ok": false, "error": .string(error)], outcome: outcome)
     }
 }
 
@@ -262,21 +285,22 @@ public actor Inbox {
 
     // MARK: Receive
 
-    /// Verify, commit and hand over one envelope. Never throws: failures are outcomes.
-    public func receive(_ envelope: Data, source: ReceiveSource) async -> ReceiveOutcome {
+    /// Verify, commit and hand over one message given as its raw JSON bytes. Message
+    /// failures are outcomes (bytes that are not an envelope are `quarantined`); only a
+    /// misuse throws `invalid_argument`: an invalid `source` (relay URL or `streamId`) or a
+    /// closed inbox.
+    public func receive(_ message: Data, source: ReceiveSource) async throws -> ReceiveOutcome {
         var normalizedSource = source
         if case .relay(let url, let streamId) = source {
-            guard let n = normalizeRelayURL(url) else {
-                return .retryable(ACEError(.invalidArgument, "relay URL must be http(s)://host[:port][/path]"))
-            }
+            let n = try normalizeRelayURL(url)
             if let streamId, !isStreamCursor(streamId) {
-                return .retryable(ACEError(.invalidArgument, "streamId must be '<ms>-<seq>'"))
+                throw ACEError(.invalidArgument, "streamId must be '<ms>-<seq>'")
             }
             normalizedSource = .relay(url: n, streamId: streamId)
         }
-        if closed { return .retryable(ACEError(.storageFailed, "the inbox is closed")) }
+        if closed { throw ACEError(.invalidArgument, "the inbox is closed") }
         if failed { return .retryable(ACEError(.storageFailed, "inbox is in a failed state; reopen it")) }
-        let outcome = await receiveOne(envelope, normalizedSource)
+        let outcome = await receiveOne(message, normalizedSource)
         switch outcome {
         case .delivered, .duplicate, .quarantined:
             do {
@@ -289,6 +313,45 @@ public actor Inbox {
             break
         }
         return outcome
+    }
+
+    /// Handle one direct-delivery request body (08 § Direct Delivery, Receiver): the first
+    /// matching row of
+    ///
+    /// - a closed inbox (not accepting; not a fault of the request, so the sender falls back
+    ///   to the relay) → 503 `internal_error`;
+    /// - body larger than `ACELimits.maxDirectBodyBytes` → 413 `payload_too_large`;
+    /// - not UTF-8 JSON whose top level is an object with a `message` member → 400
+    ///   `invalid_argument`;
+    /// - `delivered` or `duplicate` → 200 `{"ok":true,"messageId"}`;
+    /// - `quarantined` (a `message` that is not an envelope included) → 400 with its code;
+    /// - `retryable` or a thrown transient / local `ACEError` → 503 with its code;
+    /// - any other thrown `ACEError` → 400 with its code; anything else → 503 `internal_error`.
+    ///
+    /// The `message` member is received with source `.direct`. HTTP serving, routing and
+    /// rate limiting belong to the application.
+    public func receiveDirect(_ body: Data) async -> DirectReply {
+        guard !closed else { return .fail(503, "internal_error") }
+        guard body.count <= ACELimits.maxDirectBodyBytes else { return .fail(413, "payload_too_large") }
+        guard String(validating: body, as: UTF8.self) != nil,
+              let request = try? JSONParser.parse(body), let message = request.objectValue?["message"] else {
+            return .fail(400, ACEError.Code.invalidArgument.rawValue)
+        }
+        let outcome: ReceiveOutcome
+        do {
+            outcome = try await receive(JSONWriter.serialize(message), source: .direct)
+        } catch let e as ACEError {
+            if closed { return .fail(503, "internal_error") }  // closed meanwhile
+            return .fail(e.isTransient ? 503 : 400, e.code.rawValue)
+        } catch {
+            return .fail(503, "internal_error")
+        }
+        switch outcome {
+        case .delivered(let m): return .ok(m.messageId, outcome)
+        case .duplicate(_, let messageId): return .ok(messageId, outcome)
+        case .quarantined(let e, _): return .fail(400, e.code.rawValue, outcome)
+        case .retryable(let e): return .fail(503, e.code.rawValue, outcome)
+        }
     }
 
     private func advanceCursor(_ source: ReceiveSource) throws {
@@ -372,7 +435,7 @@ public actor Inbox {
             if e.isTransient { return .retryable(e) }
             do { return try quarantine(e, env, source) } catch { return .retryable(.wrap(error)) }
         } catch {
-            return .retryable(.wrap(error))
+            return .retryable(ACEError(.relayUnavailable, "peer resolution failed: \(error)"))
         }
         // 4. stored delivery
         let key = DeliveryRecord.key(from: env.from, messageId: env.messageId)
@@ -386,7 +449,7 @@ public actor Inbox {
         }
         // 5–7
         let lock: (any ACEStoreLock)?
-        do { lock = env.type.isEconomic ? try store.checkedLock("threads", timeout: 10) : nil } catch {
+        do { lock = env.type.isEconomic ? try store.checkedLock("threads", timeout: ACELimits.defaultLockTimeoutSeconds) : nil } catch {
             return .retryable(.wrap(error))
         }
         let committed = parseAndCommit(env, peer: peer, key: key, source: source, now: now)
@@ -406,7 +469,7 @@ public actor Inbox {
                 deliveredSinceSweep += 1
                 if deliveredSinceSweep >= Self.sweepEvery {
                     deliveredSinceSweep = 0
-                    _ = try? sweep()
+                    try? sweep()
                 }
             }
             return outcome
@@ -473,18 +536,13 @@ public actor Inbox {
         return .handOver(delivery)
     }
 
-    /// Delete `acked` delivery records covered by a replay horizon; returns the count.
-    @discardableResult
-    public func sweep() throws -> Int {
-        var removed = 0
+    /// Delete `acked` delivery records covered by a replay horizon (every
+    /// `sweepEvery` deliveries).
+    private func sweep() throws {
         for key in try store.checkedList("deliveries/") {
             guard let rec = try threads.loadDelivery(key) else { continue }
-            if rec.status == .acked && covered(rec.message) {
-                try store.checkedDelete(key)
-                removed += 1
-            }
+            if rec.status == .acked && covered(rec.message) { try store.checkedDelete(key) }
         }
-        return removed
     }
 
     // MARK: Relay drivers
@@ -519,7 +577,12 @@ public actor Inbox {
             for entry in page.entries {
                 // A cancelled caller stops before the next entry; the cursor marks the spot.
                 if Task.isCancelled { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
-                let outcome = await receive(entry.envelope, source: .relay(url: relay.baseURLString, streamId: entry.streamId))
+                let outcome: ReceiveOutcome
+                do {
+                    outcome = try await receive(entry.message, source: .relay(url: relay.baseURLString, streamId: entry.streamId))
+                } catch {
+                    return PullResult(outcomes: outcomes, blocked: .wrap(error, .invalidArgument))
+                }
                 if case .retryable(let e) = outcome {
                     await yield?(outcome)  // follow yields it, then throws `blocked`
                     return PullResult(outcomes: outcomes, blocked: e)
@@ -557,7 +620,7 @@ public actor Inbox {
                     try Task.checkCancellation()
                     let events = relay.listen(self.identity, since: await self.cursor(for: relay), onOpen: onLive)
                     for try await event in events {
-                        let outcome = await self.receive(event.envelope, source: .relay(url: relay.baseURLString, streamId: event.streamId))
+                        let outcome = try await self.receive(event.message, source: .relay(url: relay.baseURLString, streamId: event.streamId))
                         try await continuation.yieldWaiting(outcome)
                         if case .retryable(let e) = outcome { throw e }
                     }

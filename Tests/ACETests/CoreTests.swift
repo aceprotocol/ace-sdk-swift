@@ -9,7 +9,9 @@ struct CoreTests {
     let now = 1741000000
 
     @Test func errorCategories() {
-        #expect(ACEError.Code.allCases.count == 34)
+        #expect(ACEError.Code.allCases.count == 37)
+        #expect(ACEError(.lockBusy).category == .local && ACEError(.directRejected).category == .permanent
+                && ACEError(.directUnavailable).category == .transient)
         #expect(ACEError(.relayUnavailable).category == .transient)
         #expect(ACEError(.storageFailed).category == .local && ACEError(.storageFailed).isTransient)
         #expect(ACEError(.decryptionFailed).category == .permanent && !ACEError(.decryptionFailed).isTransient)
@@ -20,6 +22,8 @@ struct CoreTests {
     @Test func limits() {
         #expect(ACELimits.maxPlaintextBytes == 65508 && ACELimits.maxPayloadBytes == 65536 && ACELimits.maxEnvelopeBytes == 131072)
         #expect(ACELimits.kemPublicKeySize == 1216 && ACELimits.kemCiphertextSize == 1120 && ACELimits.kemSeedSize == 32)
+        #expect(ACELimits.maxDirectBodyBytes == 132096)
+        #expect(signingSchemes == [.ed25519, .secp256k1] && isSigningScheme("secp256k1") && !isSigningScheme("p256"))
     }
 
     @Test func predicates() {
@@ -48,6 +52,8 @@ struct CoreTests {
         expectCode(.invalidArgument) { try ThreadStateMachine(localAceId: alice.getACEId(), maxThreads: 0) }
         expectCode(.invalidArgument) { try ACESigning.buildSignData(action: "a", aceId: "b", timestamp: -1) }
         expectCode(.invalidArgument) { try ReplayDetector().commit("x", from: "", timestamp: 1) }
+        expectCode(.invalidArgument) { try ReplayDetector().commit("", from: "s", timestamp: 1) }
+        expectCode(.invalidArgument) { try ReplayDetector().accepts("", from: "s", timestamp: 1) }
         expectCode(.invalidArgument) { try ReplayDetector().accepts("x", from: "s", timestamp: -1) }
         expectCode(.invalidArgument) { try ReplayDetector().commit("x", from: "s", timestamp: 1, floor: -1) }
         expectCode(.invalidArgument) { try ReplayDetector(state: try ReplayState(json: Data("{\"version\":true,\"horizon\":0,\"senderHorizons\":{},\"entries\":[]}".utf8))) }
@@ -171,11 +177,11 @@ struct CoreTests {
             let id = try SoftwareIdentity.generate(scheme: scheme)
             let back = try SoftwareIdentity(export: id.exportPrivateKey())
             #expect(back.getACEId() == id.getACEId() && back.getEncryptionPublicKey() == id.getEncryptionPublicKey())
-            let reg = try id.toRegistrationFile(name: "X", endpoint: "https://x.example/ace", tier: .chainRegistered)
+            let reg = try createRegistrationFile(for: id, name: "X", endpoint: "https://x.example/ace", tier: .chainRegistered)
             #expect(reg.tier == .chainRegistered)
             let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)), pinnedAt: 5)
             #expect(peer.registeredAt == 5 && peer.address == id.getAddress())
-            expectCode(.invalidRegistration) { try id.toRegistrationFile(name: "X", endpoint: "http://x.example") }
+            expectCode(.invalidRegistration) { try createRegistrationFile(for: id, name: "X", endpoint: "http://x.example") }
         }
         expectCode(.invalidKey) { try SoftwareIdentity(export: SoftwareIdentityExport(scheme: .ed25519, signingPrivateKey: "QR==", encryptionPrivateKey: "")) }
     }
@@ -224,8 +230,9 @@ struct CoreTests {
     }
 
     @Test func profileValidation() throws {
-        try validateProfile(AgentProfile(name: "A", tags: ["a-1"], chains: ["eip155:1"], endpoint: "https://a.example",
-                                         pricing: ProfilePricing(currency: "USDC", maxAmount: "10.5")))
+        let profile = AgentProfile(name: "A", tags: ["a-1"], chains: ["eip155:1"], endpoint: "https://a.example",
+                                   pricing: ProfilePricing(currency: "USDC", maxAmount: "10.5"))
+        #expect(try validateProfile(profile) == profile)
         expectCode(.invalidProfile) { try validateProfile(AgentProfile(name: "")) }
         expectCode(.invalidProfile) { try validateProfile(AgentProfile(tags: ["A"])) }
         expectCode(.invalidProfile) { try validateProfile(AgentProfile(pricing: ProfilePricing(currency: "USDC", maxAmount: "1e3"))) }
@@ -233,11 +240,11 @@ struct CoreTests {
         #expect(try AgentProfile.parse(jvalue(["name": "A", "unknown": 1, "image": NSNull()])) == AgentProfile(name: "A"))
     }
 
-    @Test func streamIdOrdering() {
+    @Test func streamIdOrdering() throws {
         #expect(compareStreamIds("10-0", "9-99") > 0)
         #expect(compareStreamIds("1-2", "1-10") < 0)
         #expect(compareStreamIds("01-2", "1-2") == 0)
-        #expect(normalizeRelayURL("HTTPS://Relay.Example:8443/base/") == "https://relay.example:8443/base")
+        #expect(try normalizeRelayURL("HTTPS://Relay.Example:8443/base/") == "https://relay.example:8443/base")
     }
 
     @Test func threadMachineSnapshotRoundTrip() throws {

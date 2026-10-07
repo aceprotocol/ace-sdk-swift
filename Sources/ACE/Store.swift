@@ -15,17 +15,44 @@ public protocol ACEStoreLock: Sendable {
 /// Durable key-value storage for pipeline state. Implementations are synchronous.
 ///
 /// - Keys match `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$` and are ≤ 200 characters.
-/// - `write` is an atomic replace, durable when it returns. `delete` of a missing key is fine.
+/// - `write` is an atomic replace, durable when it returns. A value larger than
+///   `ACELimits.maxStoreValueBytes` (64 MiB) is `invalid_argument`. `delete` of a missing key is fine.
 /// - `list(prefix:)` returns the keys with that prefix, sorted ascending.
-/// - `lock(_:timeout:)` is exclusive and non-reentrant. The SDK uses the names `receive`,
-///   `threads` and `peers`. A timeout is `receiver_busy` for `receive` and
-///   `storage_failed` otherwise; every I/O error is `storage_failed`.
+/// - `lock(_:timeout:)` is exclusive and non-reentrant. Lock names match
+///   `^[a-z0-9][a-z0-9_-]{0,63}$` (`invalid_argument`); the SDK uses `receive`, `threads`
+///   and `peers`. A timeout is `receiver_busy` for `receive` and `lock_busy` otherwise
+///   (06 § SDK Error Codes); every I/O error is `storage_failed`. `lock(_:)` uses the
+///   default timeout `ACELimits.defaultLockTimeoutSeconds` (10 s).
 public protocol ACEStore: Sendable {
     func read(_ key: String) throws -> Data?
     func write(_ key: String, _ value: Data) throws
     func delete(_ key: String) throws
     func list(prefix: String) throws -> [String]
     func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock
+}
+
+extension ACEStore {
+    /// `lock(name, timeout: ACELimits.defaultLockTimeoutSeconds)`.
+    public func lock(_ name: String) throws -> any ACEStoreLock {
+        try lock(name, timeout: ACELimits.defaultLockTimeoutSeconds)
+    }
+}
+
+/// Lock-name grammar `^[a-z0-9][a-z0-9_-]{0,63}$` (`invalid_argument`).
+func validateLockName(_ name: String) throws {
+    let u = Array(name.utf8)
+    func alnum(_ b: UInt8) -> Bool { (b >= 0x61 && b <= 0x7A) || (b >= 0x30 && b <= 0x39) }
+    guard let first = u.first, u.count <= 64, alnum(first),
+          u.dropFirst().allSatisfy({ alnum($0) || $0 == UInt8(ascii: "_") || $0 == UInt8(ascii: "-") }) else {
+        throw ACEError(.invalidArgument, "invalid lock name '\(String(name.prefix(64)))'")
+    }
+}
+
+/// Value size cap (`invalid_argument`).
+func validateStoreValue(_ value: Data) throws {
+    guard value.count <= ACELimits.maxStoreValueBytes else {
+        throw ACEError(.invalidArgument, "store value exceeds \(ACELimits.maxStoreValueBytes) bytes")
+    }
 }
 
 /// Key grammar check (`invalid_argument`).
@@ -57,7 +84,7 @@ func isValidStoreKey(_ key: String) -> Bool {
 func lockTimeoutError(_ name: String) -> ACEError {
     name == "receive"
         ? ACEError(.receiverBusy, "another receiver holds the '\(name)' lock")
-        : ACEError(.storageFailed, "timed out waiting for the '\(name)' lock")
+        : ACEError(.lockBusy, "timed out waiting for the '\(name)' lock")
 }
 
 /// A process-local mutex per name that can be acquired with a timeout.
@@ -121,6 +148,7 @@ public final class MemoryStore: ACEStore, @unchecked Sendable {
 
     public func write(_ key: String, _ value: Data) throws {
         try validateStoreKey(key)
+        try validateStoreValue(value)
         lock.lock()
         data[key] = value
         lock.unlock()
@@ -140,7 +168,7 @@ public final class MemoryStore: ACEStore, @unchecked Sendable {
     }
 
     public func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
-        try validateStoreKey(name)
+        try validateLockName(name)
         guard mutexes.acquire(name, timeout: timeout) else { throw lockTimeoutError(name) }
         let mutexes = self.mutexes
         return makeStoreLock { mutexes.release(name) }
@@ -185,11 +213,11 @@ extension ACEStore {
     }
 
     func checkedLock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
-        try storageCall("lock", name, keep: [.storageFailed, .receiverBusy]) { try lock(name, timeout: timeout) }
+        try storageCall("lock", name, keep: [.storageFailed, .receiverBusy, .lockBusy]) { try lock(name, timeout: timeout) }
     }
 
     /// Run `body` holding lock `name`.
-    func withLock<T>(_ name: String, timeout: TimeInterval = 10, _ body: () throws -> T) throws -> T {
+    func withLock<T>(_ name: String, timeout: TimeInterval = ACELimits.defaultLockTimeoutSeconds, _ body: () throws -> T) throws -> T {
         let l = try checkedLock(name, timeout: timeout)
         defer { l.release() }
         return try body()

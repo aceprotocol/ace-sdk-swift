@@ -14,6 +14,12 @@ public enum SigningScheme: String, Codable, Sendable, CaseIterable {
     case secp256k1
 }
 
+/// Every supported signing scheme (`SIGNING_SCHEMES` in the TS and Python SDKs).
+public let signingSchemes: [SigningScheme] = SigningScheme.allCases
+
+/// True when `value` is the wire name of a supported signing scheme.
+public func isSigningScheme(_ value: String) -> Bool { SigningScheme(rawValue: value) != nil }
+
 public enum IdentityTier: Int, Codable, Sendable {
     case keyOnly = 0
     case chainRegistered = 1
@@ -199,7 +205,8 @@ public struct AgentProfile: Codable, Sendable, Equatable {
 /// Query parameters for `GET /v1/discover`.
 public struct DiscoverQuery: Codable, Sendable, Equatable {
     public var q: String?
-    public var tags: String?
+    /// Sent comma-joined; a tag must not contain `,`.
+    public var tags: [String]?
     public var chain: String?
     public var scheme: String?
     public var online: Bool?
@@ -207,7 +214,7 @@ public struct DiscoverQuery: Codable, Sendable, Equatable {
     public var cursor: String?
 
     public init(
-        q: String? = nil, tags: String? = nil, chain: String? = nil,
+        q: String? = nil, tags: [String]? = nil, chain: String? = nil,
         scheme: String? = nil, online: Bool? = nil, limit: Int? = nil, cursor: String? = nil
     ) {
         self.q = q

@@ -42,8 +42,8 @@ public actor PeerStore {
     }
 
     /// The peer, refreshed from the relay when the pin is older than `maxAgeSeconds`
-    /// (default: the TTL). Falls back to the pin on transient errors, `unknown_peer` and
-    /// `stale_peer_binding` while `maxAgeSeconds > 0`.
+    /// (default: the TTL). Falls back to the pin on retryable (`transient` or `local`)
+    /// errors, `unknown_peer` and `stale_peer_binding` while `maxAgeSeconds > 0`.
     public func resolve(_ aceId: String, maxAgeSeconds: Int? = nil) async throws -> VerifiedPeer {
         guard isACEId(aceId) else { throw ACEError(.invalidArgument, "aceId must be an ACE ID") }
         let maxAge = maxAgeSeconds ?? ttlSeconds
@@ -57,7 +57,7 @@ public actor PeerStore {
         let candidate: VerifiedPeer
         do {
             candidate = try await relay.lookupPeer(aceId)
-        } catch let e as ACEError where e.category == .transient || e.code == .unknownPeer {
+        } catch let e as ACEError where e.isTransient || e.code == .unknownPeer {
             if let pinned, maxAge > 0 { return pinned.peer }
             throw e
         }
