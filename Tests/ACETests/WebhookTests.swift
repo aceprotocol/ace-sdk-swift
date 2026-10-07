@@ -106,6 +106,15 @@ import Testing
         #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + 11 }, windowSeconds: 10) } == .staleTimestamp)
     }
 
+    @Test func isWithinWindowHelper() {
+        #expect(isWithinWindow(now: 10, ts: 0, window: 10) && isWithinWindow(now: 0, ts: 10, window: 10))
+        #expect(!isWithinWindow(now: 11, ts: 0, window: 10) && !isWithinWindow(now: 0, ts: 0, window: -1))
+        #expect(!isWithinWindow(now: Int.min, ts: 0, window: Int.max))
+        #expect(!isWithinWindow(now: Int.min, ts: 1, window: Int.max))
+        #expect(!isWithinWindow(now: Int.max, ts: -1, window: Int.max))
+        #expect(isWithinWindow(now: Int.max, ts: 0, window: Int.max))
+    }
+
     @Test func extremeClockIsStaleNotTrap() {
         let b = Data(body.utf8)
         let max = 9_007_199_254_740_991

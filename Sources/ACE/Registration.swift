@@ -158,7 +158,7 @@ public func verifyRegistrationRequest(
     let spkBytes = try decodeB64(spk, code: code, what: "signingPublicKey", maxBytes: 64)
     _ = try decodeB64(epk, code: code, what: "encryptionPublicKey", maxBytes: ACELimits.kemPublicKeySize + 3)
     let now = clock()
-    guard abs(now - ts) <= windowSeconds else {
+    guard isWithinWindow(now: now, ts: ts, window: windowSeconds) else {
         throw ACEError(.staleTimestamp, "registration timestamp is outside the freshness window")
     }
     guard computeACEId(spkBytes) == aceId else { throw ACEError(code, "aceId does not match signingPublicKey") }

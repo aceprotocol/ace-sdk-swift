@@ -47,10 +47,7 @@ public func verifyWebhookNotification(
     guard isWireInt(windowSeconds) else {
         throw ACEError.invalidArgument("windowSeconds must be a non-negative integer")
     }
-    // Overflow-safe: a clock far enough from `ts` to overflow `Int` is stale by definition,
-    // and `magnitude` avoids the `abs(Int.min)` trap.
-    let (delta, overflow) = clock().subtractingReportingOverflow(ts)
-    guard !overflow, delta.magnitude <= UInt(windowSeconds) else {
+    guard isWithinWindow(now: clock(), ts: ts, window: windowSeconds) else {
         throw ACEError(.staleTimestamp, "X-ACE-Webhook-Timestamp is outside the freshness window")
     }
     let expected = signWebhookNotification(secret: secret, timestamp: ts, body: body)

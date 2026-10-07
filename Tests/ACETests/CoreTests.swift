@@ -186,6 +186,9 @@ struct CoreTests {
         let auth = try parseAuthHeaders(lower)
         expectCode(.invalidArgument) { try verifyAuthHeaders(auth, request: .listen(since: "-"), aceId: bob.getACEId(), scheme: .ed25519, signingPublicKey: alice.getSigningPublicKey(), clock: { 1741000000 }) }
         expectCode(.staleTimestamp) { try verifyAuthHeaders(auth, request: .listen(since: "-"), aceId: alice.getACEId(), scheme: .ed25519, signingPublicKey: alice.getSigningPublicKey(), clock: { 1741000301 }) }
+        for extreme in [Int.min, Int.max] {
+            expectCode(.staleTimestamp) { try verifyAuthHeaders(auth, request: .listen(since: "-"), aceId: alice.getACEId(), scheme: .ed25519, signingPublicKey: alice.getSigningPublicKey(), clock: { extreme }) }
+        }
         expectCode(.invalidSignature) { try verifyAuthHeaders(auth, request: .listen(since: "1-1"), aceId: alice.getACEId(), scheme: .ed25519, signingPublicKey: alice.getSigningPublicKey(), clock: { 1741000000 }) }
         expectCode(.invalidArgument) { try parseAuthHeaders(["X-ACE-Id": alice.getACEId(), "X-ACE-Timestamp": "01", "X-ACE-Signature": "x"]) }
         expectCode(.invalidArgument) { try parseAuthHeaders(["X-ACE-Id": alice.getACEId(), "X-ACE-Timestamp": "1", "X-ACE-Signature": String(repeating: "a", count: 513)]) }

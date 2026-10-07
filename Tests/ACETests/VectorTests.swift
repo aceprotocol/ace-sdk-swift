@@ -314,6 +314,9 @@ struct VectorTests {
                 let result = try verifyRegistrationRequest(req.jsonData(), clock: { 1741000000 })
                 #expect(result.request == req)
                 #expect(result.peer.encryptionPublicKey == ident.getEncryptionPublicKey())
+                for extreme in [Int.min, Int.max] {
+                    expectCode(.staleTimestamp) { try verifyRegistrationRequest(req.jsonData(), clock: { extreme }) }
+                }
             }
         }
     }

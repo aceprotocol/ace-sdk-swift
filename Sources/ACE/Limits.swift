@@ -41,5 +41,13 @@ let maxSafeInteger = 9_007_199_254_740_991
 /// An integer in [0, 2^53-1], the range every wire integer must fall in.
 func isWireInt(_ v: Int) -> Bool { (0...maxSafeInteger).contains(v) }
 
+/// `|now − ts| <= window`, overflow-safe: a negative window, or a gap too large for `Int`,
+/// is outside the window (never traps, unlike `abs(now - ts)` on extreme clocks).
+func isWithinWindow(now: Int, ts: Int, window: Int) -> Bool {
+    guard window >= 0 else { return false }
+    let (delta, overflow) = now.subtractingReportingOverflow(ts)
+    return !overflow && delta.magnitude <= UInt(window)
+}
+
 /// The default clock: integer Unix seconds.
 @usableFromInline @Sendable func systemClock() -> Int { Int(Date().timeIntervalSince1970) }

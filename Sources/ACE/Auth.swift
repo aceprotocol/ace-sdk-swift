@@ -157,7 +157,7 @@ public func verifyAuthHeaders(
     guard windowSeconds >= 0 else { throw ACEError.invalidArgument("windowSeconds must be a non-negative integer") }
     try request.validate()
     guard auth.aceId == aceId else { throw ACEError.invalidArgument("X-ACE-Id does not match the signer") }
-    guard abs(clock() - auth.timestamp) <= windowSeconds else {
+    guard isWithinWindow(now: clock(), ts: auth.timestamp, window: windowSeconds) else {
         throw ACEError(.staleTimestamp, "X-ACE-Timestamp is outside the freshness window")
     }
     let sig = try decodeSignature(auth.signature, scheme: scheme, code: .invalidSignature)

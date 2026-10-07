@@ -354,7 +354,7 @@ public actor Inbox {
             return .quarantined(.wrap(error, .invalidEnvelope), fingerprint: nil)
         }
         // 2. direct freshness
-        if source == .direct, abs(now - env.timestamp) > ACELimits.timestampWindowSeconds {
+        if source == .direct, !isWithinWindow(now: now, ts: env.timestamp, window: ACELimits.timestampWindowSeconds) {
             return .quarantined(ACEError(.staleTimestamp, "direct delivery outside the timestamp window"),
                                 fingerprint: envelopeFingerprint(env))
         }

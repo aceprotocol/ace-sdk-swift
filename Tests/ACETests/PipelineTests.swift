@@ -238,6 +238,13 @@ struct PipelineTests {
         let late = await bIn.receive(env.jsonData(), source: .direct)
         #expect(code(late) == .staleTimestamp)
         #expect(try p.bobStore.list(prefix: "quarantine/").count == 1)
+        // Extreme clocks: the freshness check reports stale instead of trapping on overflow.
+        let saved = p.clock.now
+        for extreme in [Int.min, Int.max] {
+            p.clock.now = extreme
+            #expect(code(await bIn.receive(env.jsonData(), source: .direct)) == .staleTimestamp)
+        }
+        p.clock.now = saved
         // Unknown sender (no relay, no pin) is permanent → quarantined.
         let stranger = try SoftwareIdentity.generate(scheme: .ed25519)
         let s = try createMessage(sender: stranger, recipient: bobPeer, type: .text, body: ["message": "?"],
