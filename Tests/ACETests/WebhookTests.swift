@@ -33,8 +33,22 @@ import Testing
             .webhook(method: .get, url: "https://example.com"),
             .webhook(method: .delete, secret: secret),
         ] {
-            #expect(throws: ACEError.self) { try req.validate() }
+            #expect(code { try req.validate() } == .invalidArgument)
         }
+        // control characters in the secret are rejected
+        for bad in ["0123456789abcdef\u{0}", "0123456789abcdef\n", "0123456789abcdef\u{7F}"] {
+            #expect(!isWebhookSecret(bad))
+            #expect(code { try RelayAuthRequest.webhook(method: .put, url: "https://example.com", secret: bad).validate() } == .invalidArgument)
+        }
+    }
+
+    @Test func multibyteSecretCountsScalars() throws {
+        for s in [String(repeating: "\u{E9}", count: 16), String(repeating: "\u{1F600}", count: 16)] {
+            #expect(s.unicodeScalars.count == 16 && s.utf8.count > 16)
+            #expect(isWebhookSecret(s))
+            #expect(code { try RelayAuthRequest.webhook(method: .put, url: "https://example.com", secret: s).validate() } == nil)
+        }
+        #expect(!isWebhookSecret(String(repeating: "\u{E9}", count: 15)))
     }
 
     @Test func verifyOK() throws {
@@ -44,9 +58,6 @@ import Testing
     }
 
     @Test func verifyRejects() {
-        func code(_ f: () throws -> Void) -> ACEError.Code? {
-            do { try f(); return nil } catch let e as ACEError { return e.code } catch { return nil }
-        }
         #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(secret: "wrong-secret-wrong-secret"), body: Data(body.utf8), clock: { ts }) } == .invalidSignature)
         #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(prefix: "sha1="), body: Data(body.utf8), clock: { ts }) } == .invalidSignature)
         #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig().uppercased(), body: Data(body.utf8), clock: { ts }) } == .invalidSignature)
@@ -62,8 +73,48 @@ import Testing
             #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(body: b), body: Data(b.utf8), clock: { ts }) } == expected)
         }
     }
+    /// `nil` only on success; a non-`ACEError` maps to a sentinel so `== nil` cannot pass vacuously.
     func code(_ f: () throws -> Void) -> ACEError.Code? {
-        do { try f(); return nil } catch let e as ACEError { return e.code } catch { return nil }
+        do { try f(); return nil } catch let e as ACEError { return e.code } catch { return Self.nonACEError }
+    }
+    static let nonACEError = ACEError.Code.storageFailed
+
+    struct OtherError: Error {}
+
+    @Test func codeHelperSentinel() {
+        #expect(code { throw OtherError() } != nil)
+        #expect(code { throw OtherError() } == Self.nonACEError)
+        #expect(code {} == nil)
+    }
+
+    @Test func timestampHeaderShape() {
+        for t in ["\(ts)\n", "0\(ts)", " \(ts)", "+\(ts)", ""] {
+            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: t, signature: sig(), body: Data(body.utf8), clock: { ts }) } == .invalidArgument)
+        }
+        #expect("0\(ts)" == "01741000000")
+    }
+
+    @Test func windowBoundary() {
+        let b = Data(body.utf8)
+        for d in [300, -300] {
+            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + d }) } == nil)
+        }
+        for d in [301, -301] {
+            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + d }) } == .staleTimestamp)
+        }
+        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + 10 }, windowSeconds: 10) } == nil)
+        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + 11 }, windowSeconds: 10) } == .staleTimestamp)
+    }
+
+    @Test func extremeClockIsStaleNotTrap() {
+        let b = Data(body.utf8)
+        let max = 9_007_199_254_740_991
+        for t in [0, ts, max] {
+            for c in [Int.min, Int.max, Int.min + 1] {
+                #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(t), signature: sig(ts: t), body: b, clock: { c }) } == .staleTimestamp)
+                #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(t), signature: sig(ts: t), body: b, clock: { c }, windowSeconds: max) } == .staleTimestamp)
+            }
+        }
     }
 
     @Test func timestampSafeIntegerBound() {
