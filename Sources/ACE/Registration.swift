@@ -133,7 +133,7 @@ public func verifyRegistrationRequest(
     clock: @Sendable () -> Int = systemClock,
     windowSeconds: Int = ACELimits.timestampWindowSeconds
 ) throws -> VerifiedRegistration {
-    guard windowSeconds >= 0 else { throw ACEError(.invalidArgument, "windowSeconds must be a non-negative integer") }
+    try checkWindowSeconds(windowSeconds)
     let code = ACEError.Code.invalidRegistration
     let v: JValue
     do { v = try JSONParser.parse(json) } catch { throw ACEError(code, "registration request is not JSON") }
@@ -157,7 +157,7 @@ public func verifyRegistrationRequest(
     }
     let spkBytes = try decodeB64(spk, code: code, what: "signingPublicKey", maxBytes: 64)
     _ = try decodeB64(epk, code: code, what: "encryptionPublicKey", maxBytes: ACELimits.kemPublicKeySize + 3)
-    let now = clock()
+    let now = wireNow(clock)
     guard isWithinWindow(now: now, ts: ts, window: windowSeconds) else {
         throw ACEError(.staleTimestamp, "registration timestamp is outside the freshness window")
     }

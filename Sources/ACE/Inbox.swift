@@ -112,9 +112,10 @@ public actor Inbox {
         offlineWindowSeconds: Int = ACELimits.offlineWindowSeconds,
         clock: @escaping @Sendable () -> Int = systemClock
     ) async throws -> Inbox {
-        guard offlineWindowSeconds >= ACELimits.timestampWindowSeconds else {
-            throw ACEError(.invalidArgument, "offlineWindowSeconds must be >= \(ACELimits.timestampWindowSeconds)")
+        guard offlineWindowSeconds >= ACELimits.timestampWindowSeconds, isWireInt(offlineWindowSeconds) else {
+            throw ACEError(.invalidArgument, "offlineWindowSeconds must be an integer in [\(ACELimits.timestampWindowSeconds), 2^53-1]")
         }
+        let clock = wireClock(clock)
         guard capacity >= 1 else { throw ACEError(.invalidArgument, "capacity must be an integer >= 1") }
         let threads = try ThreadStore(store: store, localAceId: identity.getACEId(), clock: clock)
         let lock = try store.checkedLock("receive", timeout: 0)
@@ -183,7 +184,7 @@ public actor Inbox {
             if try !store.checkedList("deliveries/").isEmpty || inbound {
                 throw ACEError(.storageFailed, "replay state missing beside history")
             }
-            let replay = try ReplayDetector(capacity: capacity, horizon: min(maxSafeInteger, max(0, clampedSub(clampedSub(clock(), offlineWindow), 1))), clock: clock)
+            let replay = try ReplayDetector(capacity: capacity, horizon: windowFloor(now: clock(), window: offlineWindow + 1), clock: clock)
             try store.checkedWrite("replay.json", replay.exportState().jsonData())
             return replay
         }
@@ -207,7 +208,7 @@ public actor Inbox {
         return out
     }
 
-    private var floor: Int { max(0, clampedSub(clock(), offlineWindow)) }
+    private var floor: Int { windowFloor(now: clock(), window: offlineWindow) }
 
     private func covered(_ m: ParsedMessage) -> Bool {
         replay.covers(sender: m.from, timestamp: m.timestamp)

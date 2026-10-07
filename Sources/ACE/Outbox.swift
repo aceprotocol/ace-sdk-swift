@@ -33,6 +33,7 @@ public actor Outbox {
     /// `storage_failed`); nothing is handed over and replay state is not touched.
     public static func open(identity: any ACEIdentity, store: any ACEStore,
                             clock: @escaping @Sendable () -> Int = systemClock) async throws -> Outbox {
+        let clock = wireClock(clock)
         let threads = try ThreadStore(store: store, localAceId: identity.getACEId(), clock: clock)
         try store.withLock("threads") {
             for (key, rec) in try threads.deliveryRecords() {

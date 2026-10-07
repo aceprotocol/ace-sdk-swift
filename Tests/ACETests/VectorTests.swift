@@ -249,8 +249,11 @@ struct VectorTests {
         case "inbox": return .inbox(since: r["since"] as! String, limit: r["limit"] as! Int)
         case "unregister": return .unregister
         case "webhook":
-            return .webhook(method: WebhookMethod(rawValue: r["method"] as! String)!, url: r["url"] as! String,
-                            secret: r["secret"] as! String)
+            switch r["method"] as! String {
+            case "PUT": return .webhook(.put(url: r["url"] as! String, secret: r["secret"] as! String))
+            case "GET": return .webhook(.get)
+            default: return .webhook(.delete)
+            }
         default:
             return .intent(need: r["need"] as! String, tags: r["tags"] as! [String], maxPrice: r["maxPrice"] as? String,
                            currency: r["currency"] as? String, ttl: r["ttl"] as! Int)

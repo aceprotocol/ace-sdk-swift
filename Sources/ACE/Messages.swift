@@ -200,11 +200,10 @@ public func parseMessage(
         throw ACEError(.invalidEnvelope, "conversationId does not match the verified keys")
     }
     // 6
-    let now = clock()
-    let floor = floor ?? max(0, clampedSub(now, ACELimits.timestampWindowSeconds))
-    // `max(now, 0)`: a pre-epoch (pathological) clock yields `stale_timestamp` below, not a floor error.
-    guard floor >= 0, floor <= max(now, 0) else { throw ACEError(.invalidArgument, "floor must be an integer in [0, now]") }
-    guard env.timestamp >= floor, env.timestamp <= clampedAdd(now, ACELimits.timestampWindowSeconds) else {
+    let now = wireNow(clock)
+    let floor = floor ?? windowFloor(now: now)
+    guard floor >= 0, floor <= now else { throw ACEError(.invalidArgument, "floor must be an integer in [0, now]") }
+    guard env.timestamp >= floor, env.timestamp <= now + ACELimits.timestampWindowSeconds else {
         throw ACEError(.staleTimestamp, "timestamp is outside the acceptance window")
     }
     // 7

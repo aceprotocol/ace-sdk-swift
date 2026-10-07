@@ -7,19 +7,28 @@
 
 import Foundation
 
-/// The HTTP method of a `/v1/webhook` call; it is the first field of the `webhook` payload.
-public enum WebhookMethod: String, Sendable, Equatable {
-    case put = "PUT", get = "GET", delete = "DELETE"
+/// A `/v1/webhook` call. Its HTTP method is the first field of the `webhook` payload; only `PUT`
+/// carries `url` and `secret`.
+public enum WebhookMethod: Sendable, Equatable {
+    case put(url: String, secret: String)
+    case get, delete
+
+    public var verb: String {
+        switch self {
+        case .put: return "PUT"
+        case .get: return "GET"
+        case .delete: return "DELETE"
+        }
+    }
 }
 
 /// What an authenticated relay call signs. `since` is `"-"` or `<ms>-<seq>`.
-/// `webhook` carries `url` and `secret` for `PUT` only; both are empty for `GET` / `DELETE`.
 public enum RelayAuthRequest: Sendable, Equatable {
     case listen(since: String)
     case inbox(since: String, limit: Int)
     case unregister
     case intent(need: String, tags: [String], maxPrice: String?, currency: String?, ttl: Int)
-    case webhook(method: WebhookMethod, url: String = "", secret: String = "")
+    case webhook(WebhookMethod)
 
     public var action: String {
         switch self {
@@ -46,15 +55,13 @@ public enum RelayAuthRequest: Sendable, Equatable {
         case .intent(_, let tags, _, _, let ttl):
             guard !tags.contains(where: { $0.contains(",") }) else { throw ACEError.invalidArgument("tags must be strings without ','") }
             guard isWireInt(ttl) else { throw ACEError.invalidArgument("ttl must be an integer in [0, 2^53-1]") }
-        case .webhook(let method, let url, let secret):
-            if method == .put {
-                guard isHTTPSURL(url) else { throw ACEError.invalidArgument("url must match the ACE HTTPS URL grammar") }
-                guard isWebhookSecret(secret) else {
-                    throw ACEError.invalidArgument("secret must be 16..128 characters without control characters")
-                }
-            } else {
-                guard url.isEmpty, secret.isEmpty else { throw ACEError.invalidArgument("\(method.rawValue) takes no url or secret") }
+        case .webhook(.put(let url, let secret)):
+            guard isHTTPSURL(url) else { throw ACEError.invalidArgument("url must match the ACE HTTPS URL grammar") }
+            guard isWebhookSecret(secret) else {
+                throw ACEError.invalidArgument("secret must be 16..128 characters without control characters")
             }
+        case .webhook(.get), .webhook(.delete):
+            break
         }
     }
 
@@ -68,8 +75,9 @@ public enum RelayAuthRequest: Sendable, Equatable {
             return Data()
         case .intent(let need, let tags, let maxPrice, let currency, let ttl):
             return ACESigning.encodePayload(need, tags.joined(separator: ","), maxPrice ?? "", currency ?? "", String(ttl))
-        case .webhook(let method, let url, let secret):
-            return ACESigning.encodePayload(method.rawValue, url, secret)
+        case .webhook(let method):
+            guard case .put(let url, let secret) = method else { return ACESigning.encodePayload(method.verb, "", "") }
+            return ACESigning.encodePayload(method.verb, url, secret)
         }
     }
 
@@ -79,16 +87,16 @@ public enum RelayAuthRequest: Sendable, Equatable {
     }
 }
 
-/// `^\d+-\d+$` (a relay stream ID).
+/// `^[0-9]{1,20}-[0-9]{1,20}$` (a relay stream ID).
 func isStreamCursor(_ s: String) -> Bool {
-    let parts = s.split(separator: "-", omittingEmptySubsequences: false)
-    return parts.count == 2 && parts.allSatisfy { !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber } }
+    let parts = s.utf8.split(separator: UInt8(ascii: "-"), omittingEmptySubsequences: false)
+    return parts.count == 2 && parts.allSatisfy { (1...20).contains($0.count) && $0.allSatisfy { $0 >= 0x30 && $0 <= 0x39 } }
 }
 
 /// A webhook secret: 16..128 characters (Unicode scalars), none in U+0000–U+001F or U+007F.
 public func isWebhookSecret(_ s: String) -> Bool {
     let n = s.unicodeScalars.count
-    return n >= 16 && n <= 128 && !s.unicodeScalars.contains(where: isControlScalar)
+    return n >= 16 && n <= 128 && !hasControlCharacter(s)
 }
 
 /// Parsed `X-ACE-*` headers.
@@ -124,7 +132,7 @@ public func parseAuthHeaders(_ headers: [String: String]) throws -> RelayAuth {
     guard let aceId = found["x-ace-id"], isACEId(aceId) else {
         throw ACEError.invalidArgument("X-ACE-Id is missing or not an ACE ID")
     }
-    guard let tsText = found["x-ace-timestamp"], isTimestampHeader(tsText), let ts = Int(tsText), ts <= maxSafeInteger else {
+    guard let tsText = found["x-ace-timestamp"], let ts = parseTimestampHeader(tsText) else {
         throw ACEError.invalidArgument("X-ACE-Timestamp is missing or malformed")
     }
     guard let sig = found["x-ace-signature"], !sig.isEmpty, sig.count <= 512 else {
@@ -133,8 +141,14 @@ public func parseAuthHeaders(_ headers: [String: String]) throws -> RelayAuth {
     return RelayAuth(aceId: aceId, timestamp: ts, signature: sig)
 }
 
+/// A timestamp header value: `^(0|[1-9][0-9]{0,15})$` and at most 2^53 − 1.
+func parseTimestampHeader(_ s: String) -> Int? {
+    guard isTimestampHeader(s), let ts = Int(s), isWireInt(ts) else { return nil }
+    return ts
+}
+
 /// `^(0|[1-9][0-9]{0,15})$`.
-func isTimestampHeader(_ s: String) -> Bool {
+private func isTimestampHeader(_ s: String) -> Bool {
     let u = Array(s.utf8)
     guard !u.isEmpty, u.count <= 16, u.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return false }
     return u.count == 1 || u[0] != 0x30
@@ -154,10 +168,10 @@ public func verifyAuthHeaders(
     clock: @Sendable () -> Int = systemClock,
     windowSeconds: Int = ACELimits.timestampWindowSeconds
 ) throws {
-    guard windowSeconds >= 0 else { throw ACEError.invalidArgument("windowSeconds must be a non-negative integer") }
+    try checkWindowSeconds(windowSeconds)
     try request.validate()
     guard auth.aceId == aceId else { throw ACEError.invalidArgument("X-ACE-Id does not match the signer") }
-    guard isWithinWindow(now: clock(), ts: auth.timestamp, window: windowSeconds) else {
+    guard isWithinWindow(now: wireNow(clock), ts: auth.timestamp, window: windowSeconds) else {
         throw ACEError(.staleTimestamp, "X-ACE-Timestamp is outside the freshness window")
     }
     let sig = try decodeSignature(auth.signature, scheme: scheme, code: .invalidSignature)

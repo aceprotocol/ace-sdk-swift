@@ -238,7 +238,7 @@ struct PipelineTests {
         let late = await bIn.receive(env.jsonData(), source: .direct)
         #expect(code(late) == .staleTimestamp)
         #expect(try p.bobStore.list(prefix: "quarantine/").count == 1)
-        // Extreme clocks: the freshness check reports stale instead of trapping on overflow.
+        // Extreme clocks read as 0 / 2^53 − 1, so the message is stale.
         let saved = p.clock.now
         for extreme in [Int.min, Int.max] {
             p.clock.now = extreme
@@ -262,7 +262,7 @@ struct PipelineTests {
             let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .rfq, body: ["need": "x"],
                                         threads: try ThreadStateMachine(localAceId: p.alice.getACEId()),
                                         threadId: "t", timestamp: p.clock.now)
-            // Opening on a fresh store with the extreme clock seeds the replay horizon (saturating).
+            // Opening on a fresh store with the extreme clock seeds the replay horizon from the clamped clock.
             p.clock.now = extreme
             let bIn = try await p.inbox(p.bob, sink)
             let o = await bIn.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "1-1"))

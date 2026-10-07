@@ -176,8 +176,8 @@ public final class ReplayDetector: @unchecked Sendable {
         }
         self.capacity = capacity
         self.quota = max(1, capacity / 16)
-        self.clock = clock
-        self._horizon = horizon ?? max(0, clampedSub(clock(), ACELimits.timestampWindowSeconds))
+        self.clock = wireClock(clock)
+        self._horizon = horizon ?? windowFloor(now: self.clock())
     }
 
     /// Validate (`invalid_argument`) and normalize a persisted state.
@@ -237,7 +237,7 @@ public final class ReplayDetector: @unchecked Sendable {
         if let floor, !isWireInt(floor) {
             throw ACEError(.invalidArgument, "floor must be an integer in [0, 2^53-1]")
         }
-        let floor = floor ?? max(0, clampedSub(clock(), ACELimits.timestampWindowSeconds))
+        let floor = floor ?? windowFloor(now: clock())
         lock.lock()
         defer { lock.unlock() }
         guard acceptsLocked(messageId, sender, timestamp) else { return false }

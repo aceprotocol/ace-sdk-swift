@@ -144,26 +144,29 @@ final class FakeRelay: @unchecked Sendable {
             let messages = after.map { ["streamId": $0.0, "message": try! JSONSerialization.jsonObject(with: $0.1)] }
             return .json(200, ["messages": messages, "cursor": after.last?.0 as Any? ?? NSNull()])
         case "/v1/webhook":
-            guard let method = WebhookMethod(rawValue: req.httpMethod ?? "") else { return .error(405, "method_not_allowed") }
-            var url = "", secret = ""
-            if method == .put {
+            let method: WebhookMethod
+            switch req.httpMethod {
+            case "PUT":
                 guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                       let u = obj["url"] as? String, let s = obj["secret"] as? String else { return .error(400, "invalid_argument") }
-                (url, secret) = (u, s)
+                method = .put(url: u, secret: s)
+            case "GET": method = .get
+            case "DELETE": method = .delete
+            default: return .error(405, "method_not_allowed")
             }
             guard let auth = try? parseAuthHeaders(req.allHTTPHeaderFields ?? [:]) else { return .error(401, "invalid_signature") }
             lock.lock(); let peer = peers[auth.aceId]; lock.unlock()
             guard let peer, let scheme = SigningScheme(rawValue: peer.scheme),
                   let key = try? ACEBase64.decode(peer.signingPublicKey) else { return .error(403, "not_registered") }
             do {
-                try verifyAuthHeaders(auth, request: .webhook(method: method, url: url, secret: secret), aceId: auth.aceId,
+                try verifyAuthHeaders(auth, request: .webhook(method), aceId: auth.aceId,
                                       scheme: scheme, signingPublicKey: key)
             } catch {
                 return .error(401, "invalid_signature")
             }
             lock.lock(); defer { lock.unlock() }
             switch method {
-            case .put:
+            case .put(let url, _):
                 webhooks[auth.aceId] = ["url": url, "status": "active", "failures": 0, "updatedAt": 1741000000]
                 return .json(200, ["ok": true])
             case .get:

@@ -342,7 +342,7 @@ public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil
     guard computeACEId(signingKey) == reg.id else { throw ACEError(code, "id does not match the signing key") }
     let encKey = try ACEEncryption.decodeKemPublicKey(s.encryptionPublicKey, code: code)
     return VerifiedPeer(aceId: reg.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
-                        registeredAt: pinnedAt ?? clock(), registrationSignature: nil, source: .registration, profile: nil)
+                        registeredAt: pinnedAt ?? wireNow(clock), registrationSignature: nil, source: .registration, profile: nil)
 }
 
 // MARK: - Rollback barrier (02)
@@ -358,7 +358,7 @@ public enum AdoptOutcome: String, Sendable {
 /// strictly newer `registeredAt`; an unsigned registration-file candidate is adopted only
 /// without a pin, or as `unchanged` when its key equals the pin (pin kept as is).
 func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws -> (VerifiedPeer, AdoptOutcome) {
-    if candidate.registeredAt > clampedAdd(now, ACELimits.timestampWindowSeconds) {
+    if candidate.registeredAt > now + ACELimits.timestampWindowSeconds {
         throw ACEError(.invalidPeer, "registeredAt is in the future")
     }
     guard let pin else { return (candidate, .adopted) }

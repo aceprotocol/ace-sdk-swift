@@ -18,27 +18,25 @@ import Testing
     }
 
     @Test func payloads() throws {
-        let put = RelayAuthRequest.webhook(method: .put, url: "https://example.com/h", secret: secret)
+        let put = RelayAuthRequest.webhook(.put(url: "https://example.com/h", secret: secret))
         #expect(put.action == "webhook")
         #expect(put.payload() == ACESigning.encodePayload("PUT", "https://example.com/h", secret))
-        #expect(RelayAuthRequest.webhook(method: .get).payload() == ACESigning.encodePayload("GET", "", ""))
+        #expect(RelayAuthRequest.webhook(.get).payload() == ACESigning.encodePayload("GET", "", ""))
         try put.validate()
     }
 
     @Test func rejects() {
         for req in [
-            RelayAuthRequest.webhook(method: .put, url: "http://example.com", secret: secret),
-            .webhook(method: .put, url: "https://example.com", secret: "short"),
-            .webhook(method: .put, url: "https://example.com", secret: String(repeating: "x", count: 129)),
-            .webhook(method: .get, url: "https://example.com"),
-            .webhook(method: .delete, secret: secret),
+            RelayAuthRequest.webhook(.put(url: "http://example.com", secret: secret)),
+            .webhook(.put(url: "https://example.com", secret: "short")),
+            .webhook(.put(url: "https://example.com", secret: String(repeating: "x", count: 129))),
         ] {
             #expect(code { try req.validate() } == .invalidArgument)
         }
         // control characters in the secret are rejected
         for bad in ["0123456789abcdef\u{0}", "0123456789abcdef\n", "0123456789abcdef\u{7F}"] {
             #expect(!isWebhookSecret(bad))
-            #expect(code { try RelayAuthRequest.webhook(method: .put, url: "https://example.com", secret: bad).validate() } == .invalidArgument)
+            #expect(code { try RelayAuthRequest.webhook(.put(url: "https://example.com", secret: bad)).validate() } == .invalidArgument)
         }
     }
 
@@ -46,7 +44,7 @@ import Testing
         for s in [String(repeating: "\u{E9}", count: 16), String(repeating: "\u{1F600}", count: 16)] {
             #expect(s.unicodeScalars.count == 16 && s.utf8.count > 16)
             #expect(isWebhookSecret(s))
-            #expect(code { try RelayAuthRequest.webhook(method: .put, url: "https://example.com", secret: s).validate() } == nil)
+            #expect(code { try RelayAuthRequest.webhook(.put(url: "https://example.com", secret: s)).validate() } == nil)
         }
         #expect(!isWebhookSecret(String(repeating: "\u{E9}", count: 15)))
     }
@@ -57,20 +55,28 @@ import Testing
         #expect(n.streamId == "1741000000000-0")
     }
 
+    /// Verify the fixture notification, overriding one input at a time; `nil` on success.
+    func verify(timestamp: String? = nil, signature: String? = nil, body: String? = nil,
+                now: Int? = nil, window: Int = ACELimits.timestampWindowSeconds) -> ACEError.Code? {
+        code {
+            _ = try verifyWebhookNotification(
+                secret: secret, timestamp: timestamp ?? String(ts), signature: signature ?? sig(body: body),
+                body: Data((body ?? self.body).utf8), clock: { [ts] in now ?? ts }, windowSeconds: window)
+        }
+    }
+
     @Test func verifyRejects() {
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(secret: "wrong-secret-wrong-secret"), body: Data(body.utf8), clock: { ts }) } == .invalidSignature)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(prefix: "sha1="), body: Data(body.utf8), clock: { ts }) } == .invalidSignature)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig().uppercased(), body: Data(body.utf8), clock: { ts }) } == .invalidSignature)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: Data(body.utf8), clock: { ts + 301 }) } == .staleTimestamp)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: "nope", signature: sig(), body: Data(body.utf8), clock: { ts }) } == .invalidArgument)
-        let noStream = "{\"event\":\"message\",\"aceId\":\"\(ace)\"}"
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(body: noStream), body: Data(noStream.utf8), clock: { ts }) } == .invalidArgument)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: Data(body.utf8), clock: { ts }, windowSeconds: -1) } == .invalidArgument)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: Data(body.utf8), clock: { ts }, windowSeconds: 0) } == nil)
+        #expect(verify(signature: sig(secret: "wrong-secret-wrong-secret")) == .invalidSignature)
+        #expect(verify(signature: sig(prefix: "sha1=")) == .invalidSignature)
+        #expect(verify(signature: sig().uppercased()) == .invalidSignature)
+        #expect(verify(now: ts + 301) == .staleTimestamp)
+        #expect(verify(timestamp: "nope") == .invalidArgument)
+        #expect(verify(body: "{\"event\":\"message\",\"aceId\":\"\(ace)\"}") == .invalidArgument)
+        #expect(verify(window: -1) == .invalidArgument)
+        #expect(verify(window: 0) == nil)
         let twenty = String(repeating: "9", count: 20)
         for (streamId, expected) in [("\(twenty)-\(twenty)", nil), ("9\(twenty)-0", ACEError.Code.invalidArgument), ("0-9\(twenty)", .invalidArgument)] {
-            let b = "{\"event\":\"message\",\"aceId\":\"\(ace)\",\"streamId\":\"\(streamId)\"}"
-            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(body: b), body: Data(b.utf8), clock: { ts }) } == expected)
+            #expect(verify(body: "{\"event\":\"message\",\"aceId\":\"\(ace)\",\"streamId\":\"\(streamId)\"}") == expected)
         }
     }
     /// `nil` only on success; a non-`ACEError` maps to a sentinel so `== nil` cannot pass vacuously.
@@ -89,21 +95,15 @@ import Testing
 
     @Test func timestampHeaderShape() {
         for t in ["\(ts)\n", "0\(ts)", " \(ts)", "+\(ts)", ""] {
-            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: t, signature: sig(), body: Data(body.utf8), clock: { ts }) } == .invalidArgument)
+            #expect(verify(timestamp: t) == .invalidArgument)
         }
-        #expect("0\(ts)" == "01741000000")
     }
 
     @Test func windowBoundary() {
-        let b = Data(body.utf8)
-        for d in [300, -300] {
-            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + d }) } == nil)
-        }
-        for d in [301, -301] {
-            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + d }) } == .staleTimestamp)
-        }
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + 10 }, windowSeconds: 10) } == nil)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: b, clock: { ts + 11 }, windowSeconds: 10) } == .staleTimestamp)
+        for d in [300, -300] { #expect(verify(now: ts + d) == nil) }
+        for d in [301, -301] { #expect(verify(now: ts + d) == .staleTimestamp) }
+        #expect(verify(now: ts + 10, window: 10) == nil)
+        #expect(verify(now: ts + 11, window: 10) == .staleTimestamp)
     }
 
     @Test func isWithinWindowHelper() {
@@ -115,63 +115,64 @@ import Testing
         #expect(isWithinWindow(now: Int.max, ts: 0, window: Int.max))
     }
 
-    @Test func clampedArithmetic() {
-        #expect(clampedAdd(1741000000, 300) == 1741000300 && clampedSub(1741000000, 300) == 1740999700)
-        #expect(clampedAdd(-5, 3) == -2 && clampedSub(-5, -3) == -2)
-        #expect(clampedAdd(Int.max, 1) == Int.max && clampedAdd(Int.min, -1) == Int.min)
-        #expect(clampedSub(Int.min, 1) == Int.min && clampedSub(Int.max, -1) == Int.max)
-        #expect(clampedSub(0, Int.min) == Int.max && clampedAdd(Int.max - 300, 300) == Int.max)
+    @Test func streamIdsAreBoundedEverywhere() {
+        let twenty = String(repeating: "9", count: 20)
+        #expect(isStreamCursor("\(twenty)-\(twenty)") && isStreamCursor("0-0"))
+        for bad in ["9\(twenty)-0", "0-9\(twenty)", "-0", "0-", "1-2-3", "\u{0661}-0", "+1-0"] { #expect(!isStreamCursor(bad)) }
+        #expect(code { try RelayAuthRequest.listen(since: "9\(twenty)-0").validate() } == .invalidArgument)
+    }
+
+    @Test func windowSecondsRangeIsShared() {
+        #expect(code { try checkWindowSeconds(maxSafeInteger) } == nil)
+        for w in [-1, maxSafeInteger + 1] { #expect(code { try checkWindowSeconds(w) } == .invalidArgument) }
+    }
+
+    @Test func clockIsClampedToWireRange() {
+        #expect(wireNow { Int.min } == 0 && wireNow { -1 } == 0 && wireNow { ts } == ts)
+        #expect(wireNow { Int.max } == maxSafeInteger && wireClock { Int.max }() == maxSafeInteger)
+        #expect(windowFloor(now: 100) == 0 && windowFloor(now: ts) == ts - 300 && windowFloor(now: ts, window: 10) == ts - 10)
     }
 
     @Test func replayAndAdoptWithExtremeClocks() throws {
         let ace = "ace:sha256:" + String(repeating: "b", count: 64)
-        for extreme in [Int.min, Int.max] {
+        let reg = try Fixtures.agent("alice").toRegistrationFile(name: "X", endpoint: "https://x.example/ace")
+        let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)), pinnedAt: 1741000000)
+        for (extreme, expected) in [(Int.min, ACEError.Code.invalidPeer), (Int.max, nil)] {
             let r = try ReplayDetector(clock: { extreme })
-            // `commit` derives its default floor from the clock (saturating, clamped at 0).
+            // `commit` derives its default floor from the clamped clock.
             _ = try r.commit("m1", from: ace, timestamp: 1741000000)
-            let reg = try Fixtures.agent("alice").toRegistrationFile(name: "X", endpoint: "https://x.example/ace")
-            let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)), pinnedAt: 1741000000)
-            if extreme == Int.max {
-                #expect(code { _ = try adoptDecision(pin: nil, candidate: peer, now: extreme) } == nil)
-            } else {
-                #expect(code { _ = try adoptDecision(pin: nil, candidate: peer, now: extreme) } == .invalidPeer)
-            }
+            #expect(code { _ = try adoptDecision(pin: nil, candidate: peer, now: wireNow { extreme }) } == expected)
         }
     }
 
-    @Test func extremeClockIsStaleNotTrap() {
-        let b = Data(body.utf8)
-        let max = 9_007_199_254_740_991
-        for t in [0, ts, max] {
-            for c in [Int.min, Int.max, Int.min + 1] {
-                #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(t), signature: sig(ts: t), body: b, clock: { c }) } == .staleTimestamp)
-                #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(t), signature: sig(ts: t), body: b, clock: { c }, windowSeconds: max) } == .staleTimestamp)
-            }
-        }
+    @Test func extremeClocksReadAsWireRangeEnds() {
+        // Int.min reads as 0 and Int.max as 2^53 − 1: stale against a current timestamp, fresh at the ends.
+        for c in [Int.min, Int.max] { #expect(verify(now: c) == .staleTimestamp) }
+        #expect(verify(timestamp: "0", signature: sig(ts: 0), now: Int.min) == nil)
+        #expect(verify(timestamp: String(maxSafeInteger), signature: sig(ts: maxSafeInteger), now: Int.max) == nil)
+        #expect(verify(now: Int.min, window: maxSafeInteger) == nil)
     }
 
     @Test func timestampSafeIntegerBound() {
-        let max = 9_007_199_254_740_991
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(max), signature: sig(ts: max), body: Data(body.utf8), clock: { max }) } == nil)
+        #expect(verify(timestamp: String(maxSafeInteger), signature: sig(ts: maxSafeInteger), now: maxSafeInteger) == nil)
         for t in ["9007199254740992", "9007199254740993", "9999999999999999"] {
-            #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: t, signature: sig(), body: Data(body.utf8), clock: { ts }) } == .invalidArgument)
+            #expect(verify(timestamp: t) == .invalidArgument)
         }
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: sig(), body: Data(body.utf8), clock: { ts }, windowSeconds: max + 1) } == .invalidArgument)
+        #expect(verify(window: maxSafeInteger + 1) == .invalidArgument)
     }
 
     @Test func checkOrder() {
         let badSig = "sha256=" + String(repeating: "Z", count: 64)
         let wrongSig = sig(secret: "wrong-secret-wrong-secret")
-        let b = Data(body.utf8)
         // malformed timestamp wins over a malformed signature
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: "nope", signature: badSig, body: b, clock: { ts }) } == .invalidArgument)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: "9007199254740993", signature: badSig, body: b, clock: { ts }) } == .invalidArgument)
+        #expect(verify(timestamp: "nope", signature: badSig) == .invalidArgument)
+        #expect(verify(timestamp: "9007199254740993", signature: badSig) == .invalidArgument)
         // malformed signature wins over a bad windowSeconds and over staleness
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: badSig, body: b, clock: { ts }, windowSeconds: -1) } == .invalidSignature)
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: badSig, body: b, clock: { ts + 301 }) } == .invalidSignature)
+        #expect(verify(signature: badSig, window: -1) == .invalidSignature)
+        #expect(verify(signature: badSig, now: ts + 301) == .invalidSignature)
         // well-formed but wrong HMAC: staleness is reported first
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: wrongSig, body: b, clock: { ts + 301 }) } == .staleTimestamp)
+        #expect(verify(signature: wrongSig, now: ts + 301) == .staleTimestamp)
         // bad windowSeconds wins over staleness and a wrong HMAC
-        #expect(code { _ = try verifyWebhookNotification(secret: secret, timestamp: String(ts), signature: wrongSig, body: b, clock: { ts + 301 }, windowSeconds: -1) } == .invalidArgument)
+        #expect(verify(signature: wrongSig, now: ts + 301, window: -1) == .invalidArgument)
     }
 }

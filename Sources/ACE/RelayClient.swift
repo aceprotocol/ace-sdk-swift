@@ -63,6 +63,10 @@ public actor RelayClient {
         public let cursor: String?
     }
 
+    public enum WebhookStatus: String, Sendable {
+        case active, disabled
+    }
+
     public struct PostedIntent: Sendable, Equatable {
         public let intentId: String
         public let expiresAt: Int
@@ -71,8 +75,7 @@ public actor RelayClient {
     /// The caller's webhook as `GET /v1/webhook` reports it (the secret is never returned).
     public struct Webhook: Sendable, Equatable {
         public let url: String
-        /// `active` or `disabled`.
-        public let status: String
+        public let status: WebhookStatus
         public let failures: Int
         public let updatedAt: Int
         public let lastDeliveredAt: Int?
@@ -131,7 +134,7 @@ public actor RelayClient {
         self.session = session
         self.timeout = timeout
         self.maxResponseBytes = maxResponseBytes
-        self.clock = clock
+        self.clock = wireClock(clock)
         self.sleeper = sleeper
     }
 
@@ -201,7 +204,7 @@ public actor RelayClient {
         for entry in list {
             if let peer = try? verifyPeerRecord(PeerRecord.parse(entry)) { agents.append(peer) } else { rejected += 1 }
         }
-        return DiscoverPage(agents: agents, rejected: rejected, cursor: try optionalCursor(v))
+        return DiscoverPage(agents: agents, rejected: rejected, cursor: try optionalField(v, "cursor") { $0.stringValue })
     }
 
     /// `POST /v1/send`. Exact duplicates are acknowledged by the relay.
@@ -224,7 +227,7 @@ public actor RelayClient {
             }
             return InboxEntry(streamId: id, envelope: JSONWriter.serialize(m))
         }
-        return InboxPage(entries: entries, cursor: try optionalCursor(v))
+        return InboxPage(entries: entries, cursor: try optionalField(v, "cursor") { $0.stringValue })
     }
 
     /// `POST /v1/intents`.
@@ -260,39 +263,33 @@ public actor RelayClient {
             return Intent(intentId: id, from: from, need: need, tags: tags, maxPrice: i["maxPrice"]?.stringValue,
                           currency: i["currency"]?.stringValue, ttl: ttl, createdAt: createdAt, expiresAt: expiresAt)
         }
-        return IntentPage(intents: intents, cursor: try optionalCursor(v))
+        return IntentPage(intents: intents, cursor: try optionalField(v, "cursor") { $0.stringValue })
     }
 
     /// `PUT /v1/webhook`: set or replace the caller's webhook.
     public func setWebhook(_ identity: any ACEIdentity, url: String, secret: String) async throws {
-        let auth = RelayAuthRequest.webhook(method: .put, url: url, secret: secret)
+        let auth = RelayAuthRequest.webhook(.put(url: url, secret: secret))
         let body = JSONWriter.serialize(.object(["url": .string(url), "secret": .string(secret)]))
         _ = try await call("PUT", "/v1/webhook", body: body, auth: (identity, auth))
     }
 
     /// `GET /v1/webhook`; `nil` when none is set.
     public func getWebhook(_ identity: any ACEIdentity) async throws -> Webhook? {
-        let v = try await call("GET", "/v1/webhook", auth: (identity, .webhook(method: .get)))
+        let v = try await call("GET", "/v1/webhook", auth: (identity, .webhook(.get)))
         guard let w = v["webhook"] else { throw ACEError(.relayProtocolError, "unexpected webhook response") }
         if w.isNull { return nil }
-        guard let url = w["url"]?.stringValue, let status = w["status"]?.stringValue, status == "active" || status == "disabled",
+        guard let url = w["url"]?.stringValue, let status = w["status"]?.stringValue.flatMap(WebhookStatus.init),
               let failures = w["failures"]?.wireInt, let updatedAt = w["updatedAt"]?.wireInt else {
             throw ACEError(.relayProtocolError, "malformed webhook")
         }
-        // Optional fields: absent or null is fine; present but malformed is a protocol error.
-        func optional<T>(_ key: String, _ get: (JValue) -> T?) throws -> T? {
-            guard let v = w[key], !v.isNull else { return nil }
-            guard let t = get(v) else { throw ACEError(.relayProtocolError, "malformed webhook \(key)") }
-            return t
-        }
         return Webhook(url: url, status: status, failures: failures, updatedAt: updatedAt,
-                       lastDeliveredAt: try optional("lastDeliveredAt") { $0.wireInt },
-                       lastError: try optional("lastError") { $0.stringValue })
+                       lastDeliveredAt: try optionalField(w, "lastDeliveredAt") { $0.wireInt },
+                       lastError: try optionalField(w, "lastError") { $0.stringValue })
     }
 
     /// `DELETE /v1/webhook` (idempotent).
     public func clearWebhook(_ identity: any ACEIdentity) async throws {
-        _ = try await call("DELETE", "/v1/webhook", auth: (identity, .webhook(method: .delete)))
+        _ = try await call("DELETE", "/v1/webhook", auth: (identity, .webhook(.delete)))
     }
 
     /// `GET /v1/listen` as a stream of `catchup` / `message` events.
@@ -548,10 +545,11 @@ public actor RelayClient {
         return ACEError(.relayProtocolError, "unexpected HTTP \(status)", status: status, relayCode: relayCode)
     }
 
-    private func optionalCursor(_ v: JValue) throws -> String? {
-        guard let c = v["cursor"], !c.isNull else { return nil }
-        guard let s = c.stringValue else { throw ACEError(.relayProtocolError, "cursor must be a string or null") }
-        return s
+    /// Absent or null is `nil`; present but malformed is `relay_protocol_error`.
+    private func optionalField<T>(_ v: JValue, _ key: String, _ get: (JValue) -> T?) throws -> T? {
+        guard let f = v[key], !f.isNull else { return nil }
+        guard let t = get(f) else { throw ACEError(.relayProtocolError, "\(key) is malformed") }
+        return t
     }
 }
 

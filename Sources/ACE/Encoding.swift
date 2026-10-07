@@ -10,7 +10,7 @@ import CryptoKit
 
 // MARK: - Predicates
 
-private func isLowerHex(_ b: UInt8) -> Bool { (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66) }
+func isLowerHex(_ b: UInt8) -> Bool { (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66) }
 
 /// `ace:sha256:<64 lowercase hex>`.
 public func isACEId(_ value: String) -> Bool {

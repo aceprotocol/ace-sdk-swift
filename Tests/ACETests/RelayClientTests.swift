@@ -102,7 +102,7 @@ struct RelayClientTests {
         try await relay.setWebhook(alice, url: "https://agent.example.com/wake", secret: "0123456789abcdef0123456789abcdef")
         let w = try await relay.getWebhook(alice)
         #expect(w?.url == "https://agent.example.com/wake")
-        #expect(w?.status == "active")
+        #expect(w?.status == .active)
         #expect(w?.failures == 0 && w?.lastDeliveredAt == nil && w?.lastError == nil)
         try await relay.clearWebhook(alice)
         #expect(try await relay.getWebhook(alice) == nil)

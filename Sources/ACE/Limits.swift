@@ -41,24 +41,26 @@ let maxSafeInteger = 9_007_199_254_740_991
 /// An integer in [0, 2^53-1], the range every wire integer must fall in.
 func isWireInt(_ v: Int) -> Bool { (0...maxSafeInteger).contains(v) }
 
-/// `|now − ts| <= window`, overflow-safe: a negative window, or a gap too large for `Int`,
-/// is outside the window (never traps, unlike `abs(now - ts)` on extreme clocks).
+/// `|now − ts| <= window`, overflow-safe for any `ts`; a negative window admits nothing.
 func isWithinWindow(now: Int, ts: Int, window: Int) -> Bool {
     guard window >= 0 else { return false }
     let (delta, overflow) = now.subtractingReportingOverflow(ts)
     return !overflow && delta.magnitude <= UInt(window)
 }
 
-/// `a + b`, saturating to `Int.max` / `Int.min` instead of trapping (clock arithmetic).
-func clampedAdd(_ a: Int, _ b: Int) -> Int {
-    let (r, overflow) = a.addingReportingOverflow(b)
-    return overflow ? (b > 0 ? .max : .min) : r
-}
+/// The clock's reading clamped to [0, 2^53 − 1]. Every injected clock is read through this
+/// (or `wireClock`), so `now` ± a window or a stored wire timestamp cannot overflow.
+func wireNow(_ clock: () -> Int) -> Int { min(max(clock(), 0), maxSafeInteger) }
 
-/// `a − b`, saturating to `Int.max` / `Int.min` instead of trapping (clock arithmetic).
-func clampedSub(_ a: Int, _ b: Int) -> Int {
-    let (r, overflow) = a.subtractingReportingOverflow(b)
-    return overflow ? (b < 0 ? .max : .min) : r
+/// `clock` wrapped by `wireNow`, for types that store the clock.
+func wireClock(_ clock: @escaping @Sendable () -> Int) -> @Sendable () -> Int { { wireNow(clock) } }
+
+/// `max(0, now − window)`: the oldest timestamp still inside the window (`window` ≥ 0).
+func windowFloor(now: Int, window: Int = ACELimits.timestampWindowSeconds) -> Int { max(0, now - window) }
+
+/// `windowSeconds` must be a wire integer (`invalid_argument`).
+func checkWindowSeconds(_ windowSeconds: Int) throws {
+    guard isWireInt(windowSeconds) else { throw ACEError.invalidArgument("windowSeconds must be an integer in [0, 2^53-1]") }
 }
 
 /// The default clock: integer Unix seconds.
