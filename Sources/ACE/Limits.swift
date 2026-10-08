@@ -23,6 +23,8 @@ public enum ACELimits {
     public static let maxThreadIdLength = 256
     /// Future bound and relay freshness.
     public static let timestampWindowSeconds = 300
+    /// Longest principal record lifetime, `expiresAt - issuedAt` (366 days, 09-principal).
+    public static let principalMaxLifetimeSeconds = 31_622_400
     /// Default receiver floor = now − 7 days; relay message TTL MUST be ≤ this.
     public static let offlineWindowSeconds = 604800
     public static let maxRegistrationFileBytes = 1048576
