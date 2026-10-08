@@ -306,13 +306,14 @@ public func verifyPeerRecord(_ record: PeerRecord, clock: @Sendable () -> Int = 
     guard ACESigning.verify(signData: signData, signature: sig, scheme: scheme, publicKey: signingKey) else {
         throw ACEError(code, "registrationSignature does not verify")
     }
-    if let profile = record.profile {
-        do { try validateProfile(profile) } catch let e as ACEError { throw ACEError(code, e.message) }
-        if let p = profile.principal { try validatePrincipalRecord(p, subjectSigningPublicKey: signingKey, now: wireNow(clock)) }
+    var profile = record.profile
+    if let pr = profile {
+        do { try validateProfile(pr) } catch let e as ACEError { throw ACEError(code, e.message) }
+        profile = try dropExpiredPrincipal(pr, subjectSigningPublicKey: signingKey, now: wireNow(clock))
     }
     return VerifiedPeer(aceId: record.aceId, scheme: scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
                         registeredAt: record.registeredAt, registrationSignature: record.registrationSignature,
-                        source: .relay, profile: record.profile)
+                        source: .relay, profile: profile)
 }
 
 /// Run all 01 rules (including the ID hash); failures are `invalid_registration`, except a
@@ -353,10 +354,7 @@ public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil
     guard computeACEId(signingKey) == reg.id else { throw ACEError(code, "id does not match the signing key") }
     let encKey = try ACEEncryption.decodeKemPublicKey(s.encryptionPublicKey, code: code)
     let now = wireNow(clock)
-    var profile: AgentProfile?
-    if let p = reg.principal {
-        profile = AgentProfile(principal: try validatePrincipalRecord(p, subjectSigningPublicKey: signingKey, now: now))
-    }
+    let profile = try dropExpiredPrincipal(reg.principal.map { AgentProfile(principal: $0) }, subjectSigningPublicKey: signingKey, now: now)
     return VerifiedPeer(aceId: reg.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
                         registeredAt: pinnedAt ?? now, registrationSignature: nil, source: .registration, profile: profile)
 }

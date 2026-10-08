@@ -355,7 +355,24 @@ struct PrincipalTests {
         let me = try SoftwareIdentity.generate(scheme: .ed25519), other = try SoftwareIdentity.generate(scheme: .ed25519)
         let r = try peerRecord(me, AgentProfile(name: "A", principal: try rec(owner, me, expiresAt: Self.NOW + 50)))
         #expect(try verifyPeerRecord(r, clock: { Self.NOW }).principal?.roles == ["controller", "agent"])
-        expectCode(.invalidPrincipal) { try verifyPeerRecord(r, clock: { Self.NOW + 50 }) }
+        // R-P40: expired-only principal is dropped, other members kept; forged + expired still fails.
+        let dropped = try verifyPeerRecord(r, clock: { Self.NOW + 50 })
+        #expect(dropped.profile?.principal == nil && dropped.profile?.name == "A")
+        let bare = try verifyPeerRecord(try peerRecord(me, AgentProfile(principal: try rec(owner, me, expiresAt: Self.NOW + 50))), clock: { Self.NOW + 50 })
+        #expect(bare.profile == nil)
+        let fbase = try peerRecord(me, AgentProfile(name: "A"))
+        let forged = PeerRecord(aceId: fbase.aceId, scheme: fbase.scheme, encryptionPublicKey: fbase.encryptionPublicKey,
+                                signingPublicKey: fbase.signingPublicKey, registrationSignature: fbase.registrationSignature,
+                                registeredAt: fbase.registeredAt, profile: AgentProfile(name: "A", principal: try rec(owner, other, expiresAt: Self.NOW + 50)))
+        expectCode(.invalidPrincipal) { try verifyPeerRecord(forged, clock: { Self.NOW + 50 }) }
+        let ereg = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: try rec(owner, me, expiresAt: Self.NOW + 50))
+        #expect(try verifyRegistrationFile(ereg, pinnedAt: Self.NOW, clock: { Self.NOW + 50 }).profile == nil)
+        var wrong = ereg
+        wrong.principal = try rec(owner, other, expiresAt: Self.NOW + 50)
+        expectCode(.invalidPrincipal) { try verifyRegistrationFile(wrong, pinnedAt: Self.NOW, clock: { Self.NOW + 50 }) }
+        // A registration request still rejects an expired principal.
+        let ereq = try createRegistrationRequest(identity: me, profile: .replace(AgentProfile(principal: try rec(owner, me, expiresAt: Self.NOW + 50))), timestamp: Self.NOW)
+        expectCode(.invalidPrincipal) { try verifyRegistrationRequest(ereq.jsonData(), clock: { Self.NOW + 50 }) }
         // The binding signature does not cover the profile, so a swapped principal is built by hand.
         let base = try peerRecord(me, AgentProfile(name: "A"))
         let swapped = PeerRecord(aceId: base.aceId, scheme: base.scheme, encryptionPublicKey: base.encryptionPublicKey,
@@ -378,6 +395,20 @@ struct PrincipalTests {
         try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(principal: try rec(owner, me, expiresAt: Self.NOW + 5))), clock: { Self.NOW }))
         clock.now = Self.NOW + 10_000
         #expect(try await PeerStore(store: store, clock: clock.fn).get(me.getACEId())?.principal != nil)
+    }
+
+    @Test func registrationPinWithPrincipalExpiredBeforeFetchedAtLoadsWithoutIt() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        try await peers.pinRegistrationFile(try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace",
+                                                                      principal: try rec(owner, me, expiresAt: Self.NOW + 5)), pinnedAt: 1)
+        let key = PinnedPeer.key(me.getACEId())
+        var o = try JSONValue(json: try #require(try store.read(key))).objectValue!
+        o["fetchedAt"] = .number(Double(Self.NOW + 100))
+        try store.write(key, JSONValue.object(o).jsonData())
+        let loaded = try await PeerStore(store: store, clock: clock.fn).get(me.getACEId())
+        #expect(loaded != nil && loaded?.principal == nil)
     }
 
     @Test func tamperedPinnedPrincipalIsNotRestored() async throws {

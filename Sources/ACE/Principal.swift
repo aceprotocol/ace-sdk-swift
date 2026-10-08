@@ -197,6 +197,25 @@ public func validatePrincipalRecord(_ r: PrincipalRecord, subjectSigningPublicKe
     return r
 }
 
+/// R-P40: true when `r` fails `validatePrincipalRecord` at `now` only at the expiry step (rule 10):
+/// rules 1-9 pass (checked at `expiresAt - 1`) and `expiresAt <= now`. Any other outcome is false.
+func isExpiredOnly(_ r: PrincipalRecord, subjectSigningPublicKey: Data, now: Int) -> Bool {
+    guard r.expiresAt <= now else { return false }
+    return (try? validatePrincipalRecord(r, subjectSigningPublicKey: subjectSigningPublicKey, now: r.expiresAt - 1)) != nil
+}
+
+/// R-P40, fetched records: validate `profile.principal`; one that fails only because it has expired is
+/// dropped (nil when nothing else remains). Any other failure throws `invalid_principal`.
+func dropExpiredPrincipal(_ profile: AgentProfile?, subjectSigningPublicKey: Data, now: Int) throws -> AgentProfile? {
+    guard var p = profile, let pr = p.principal else { return profile }
+    if isExpiredOnly(pr, subjectSigningPublicKey: subjectSigningPublicKey, now: now) {
+        p.principal = nil
+        return p == AgentProfile() ? nil : p
+    }
+    try validatePrincipalRecord(pr, subjectSigningPublicKey: subjectSigningPublicKey, now: now)
+    return p
+}
+
 /// Sign a principal record for a subject key. Roles are canonicalized (deduplicated, `controller`
 /// first); an unknown role is `invalid_argument`. Rules 1-7 run before the (possibly hardware)
 /// signer is asked to sign; the result is validated at `issuedAt` (`invalid_principal`).

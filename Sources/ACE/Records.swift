@@ -249,9 +249,9 @@ struct PinnedPeer {
                 let signingKey = try decodeSigningKey(scheme: scheme, spk, code: .storageFailed)
                 guard computeACEId(signingKey) == id else { throw storageError(key, "aceId does not match the signing key") }
                 let encKey = try ACEEncryption.decodeKemPublicKey(enc, code: .storageFailed)
-                // Never restore a principal without validation; the pin's own fetchedAt is "now" so
-                // an expired principal does not make the store unloadable.
-                if let p = profile?.principal { try validatePrincipalRecord(p, subjectSigningPublicKey: signingKey, now: fetchedAt) }
+                // Never restore a principal without validation; one that expired before fetchedAt is
+                // dropped (R-P40), any other failure makes the pin unloadable.
+                let profile = try dropExpiredPrincipal(profile, subjectSigningPublicKey: signingKey, now: fetchedAt)
                 let peer = VerifiedPeer(aceId: id, scheme: scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
                                         registeredAt: registeredAt, registrationSignature: signature, source: .registration,
                                         profile: profile)
