@@ -22,6 +22,9 @@ private let bodySchemas: [MessageType: [(String, FieldKind)]] = [
     .confirm: [("deliverId", .str), ("message", .optStr)],
     .info: [("message", .str)],
     .text: [("message", .str)],
+    .request: [("action", .str), ("summary", .str), ("ref", .optObj), ("amount", .optStr), ("currency", .optStr), ("details", .optObj), ("ttl", .optTTL)],
+    .decision: [("requestId", .str), ("outcome", .str), ("reason", .optStr), ("result", .optObj)],
+    .report: [("action", .str), ("summary", .str), ("outcome", .str), ("ref", .optObj), ("requestId", .optStr), ("proof", .optObj)],
 ]
 
 /// Validate a body against its type's schema; failures are `invalid_body`.
@@ -45,6 +48,24 @@ public func validateBody(_ type: MessageType, _ body: [String: JSONValue]) throw
         let required = kind == "inline" ? "content" : kind == "reference" ? "uri" : nil
         guard let required else { throw ACEError(.invalidBody, "deliver.type must be 'inline' or 'reference'") }
         guard body[required]?.stringValue != nil else { throw ACEError(.invalidBody, "deliver (\(kind!)) requires \(required)") }
+    }
+    let outcomes: [MessageType: [String]] = [.decision: ["approve", "deny"], .report: ["ok", "failed", "skipped"]]
+    if let allowed = outcomes[type], !allowed.contains(body["outcome"]?.stringValue ?? "") {
+        throw ACEError(.invalidBody, "\(type.rawValue).outcome must be one of \(allowed.joined(separator: ", "))")
+    }
+    if type == .request || type == .report, let ref = body["ref"], !ref.isNull {
+        let r = ref.objectValue!
+        guard let c = r["conversationId"]?.stringValue, isConversationId(c) else {
+            throw ACEError(.invalidBody, "\(type.rawValue).ref.conversationId must be 64 lowercase hex")
+        }
+        guard let m = r["messageId"]?.stringValue, isMessageId(m) else {
+            throw ACEError(.invalidBody, "\(type.rawValue).ref.messageId must be a lowercase UUID v4")
+        }
+        if let t = r["threadId"], !t.isNull {
+            guard let s = t.stringValue, isThreadId(s) else {
+                throw ACEError(.invalidBody, "\(type.rawValue).ref.threadId must be a valid thread ID")
+            }
+        }
     }
 }
 

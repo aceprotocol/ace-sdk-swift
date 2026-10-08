@@ -9,7 +9,7 @@ struct CoreTests {
     let now = 1741000000
 
     @Test func errorCategories() {
-        #expect(ACEError.Code.allCases.count == 37)
+        #expect(ACEError.Code.allCases.count == 39)
         #expect(ACEError(.lockBusy).category == .local && ACEError(.directRejected).category == .permanent
                 && ACEError(.directUnavailable).category == .transient)
         #expect(ACEError(.relayUnavailable).category == .transient)

@@ -267,23 +267,30 @@ public enum MessageType: String, Codable, Sendable, CaseIterable {
     case rfq, offer, accept, reject, invoice, receipt, deliver, confirm
     case info
     case text
+    case request, decision, report
 
     /// The eight economic types (tracked by the thread state machine).
     public var isEconomic: Bool {
         switch self {
-        case .info, .text: return false
+        case .info, .text, .request, .decision, .report: return false
         default: return true
         }
     }
+
+    /// The three principal types (09-principal; same-account rules at step 7).
+    public var isPrincipal: Bool { self == .request || self == .decision || self == .report }
 }
 
-/// All ten message types, in protocol order.
+/// All thirteen message types, in protocol order.
 public let messageTypes: [MessageType] = MessageType.allCases
 /// The eight economic types, in protocol order.
 public let economicTypes: [MessageType] = MessageType.allCases.filter(\.isEconomic)
+/// The three principal types, in protocol order.
+public let principalTypes: [MessageType] = MessageType.allCases.filter(\.isPrincipal)
 
 public func isMessageType(_ value: String) -> Bool { MessageType(rawValue: value) != nil }
 public func isEconomicType(_ type: MessageType) -> Bool { type.isEconomic }
+public func isPrincipalType(_ type: MessageType) -> Bool { type.isPrincipal }
 
 public struct EncryptionEnvelope: Codable, Sendable, Equatable {
     /// Base64(X-Wing ciphertext[1120]).

@@ -36,6 +36,8 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         case invalidKey = "invalid_key"
         case invalidRegistration = "invalid_registration"
         case invalidProfile = "invalid_profile"
+        case invalidPrincipal = "invalid_principal"
+        case wrongPrincipal = "wrong_principal"
         case invalidPeer = "invalid_peer"
         case stalePeerBinding = "stale_peer_binding"
         case unknownPeer = "unknown_peer"
