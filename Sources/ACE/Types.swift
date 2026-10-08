@@ -120,6 +120,7 @@ public struct RegistrationFile: Codable, Sendable, Equatable {
     public var capabilities: [Capability]?
     public var settlement: [String]?
     public var chains: [ChainInfo]?
+    public var principal: PrincipalRecord?
 
     public init(
         ace: String = "1.0",
@@ -132,7 +133,8 @@ public struct RegistrationFile: Codable, Sendable, Equatable {
         signing: SigningConfig,
         capabilities: [Capability]? = nil,
         settlement: [String]? = nil,
-        chains: [ChainInfo]? = nil
+        chains: [ChainInfo]? = nil,
+        principal: PrincipalRecord? = nil
     ) {
         self.ace = ace
         self.id = id
@@ -145,6 +147,7 @@ public struct RegistrationFile: Codable, Sendable, Equatable {
         self.capabilities = capabilities
         self.settlement = settlement
         self.chains = chains
+        self.principal = principal
     }
 
     /// Parse the wire JSON (strict types, unknown fields ignored, optional `null` = absent).
@@ -180,6 +183,7 @@ public struct AgentProfile: Codable, Sendable, Equatable {
     public var chains: [String]?
     public var endpoint: String?
     public var pricing: ProfilePricing?
+    public var principal: PrincipalRecord?
 
     public init(
         name: String? = nil,
@@ -189,7 +193,8 @@ public struct AgentProfile: Codable, Sendable, Equatable {
         capabilities: [String]? = nil,
         chains: [String]? = nil,
         endpoint: String? = nil,
-        pricing: ProfilePricing? = nil
+        pricing: ProfilePricing? = nil,
+        principal: PrincipalRecord? = nil
     ) {
         self.name = name
         self.description = description
@@ -199,6 +204,7 @@ public struct AgentProfile: Codable, Sendable, Equatable {
         self.chains = chains
         self.endpoint = endpoint
         self.pricing = pricing
+        self.principal = principal
     }
 }
 
@@ -210,18 +216,22 @@ public struct DiscoverQuery: Codable, Sendable, Equatable {
     public var chain: String?
     public var scheme: String?
     public var online: Bool?
+    /// CAIP-10 account: only agents whose served principal record names it (02 § Search Parameters).
+    public var account: String?
     public var limit: Int?
     public var cursor: String?
 
     public init(
         q: String? = nil, tags: [String]? = nil, chain: String? = nil,
-        scheme: String? = nil, online: Bool? = nil, limit: Int? = nil, cursor: String? = nil
+        scheme: String? = nil, online: Bool? = nil, limit: Int? = nil, cursor: String? = nil,
+        account: String? = nil
     ) {
         self.q = q
         self.tags = tags
         self.chain = chain
         self.scheme = scheme
         self.online = online
+        self.account = account
         self.limit = limit
         self.cursor = cursor
     }

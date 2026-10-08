@@ -76,10 +76,7 @@ public actor PeerStore {
             let now = clock()
             let pin = try load(peer.aceId)
             let (next, outcome) = try adoptDecision(pin: pin?.peer, candidate: peer, now: now)
-            // An unsigned candidate equal to the pin leaves the record (and its fetchedAt) untouched.
-            if outcome == .unchanged, peer.registrationSignature == nil, let pin {
-                return AdoptResult(peer: pin.peer, outcome: outcome)
-            }
+            // A kept candidate (even an unsigned file) replaces the cached profile and fetchedAt (02).
             try store.checkedWrite(PinnedPeer.key(peer.aceId), PinnedPeer(peer: next, fetchedAt: now).data())
             return AdoptResult(peer: next, outcome: outcome)
         }

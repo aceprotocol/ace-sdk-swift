@@ -198,6 +198,7 @@ public actor RelayClient {
         if let v = query.chain { q.append(("chain", v)) }
         if let v = query.scheme { q.append(("scheme", v)) }
         if let v = query.online { q.append(("online", v ? "true" : "false")) }
+        if let v = query.account { q.append(("account", v)) }
         if let v = query.limit { q.append(("limit", String(v))) }
         if let v = query.cursor { q.append(("cursor", v)) }
         let v = try await call("GET", "/v1/discover", query: q)

@@ -224,13 +224,17 @@ struct PinnedPeer {
                 guard let signature else { throw storageError(key, "relay binding without signature") }
                 let verified = try verifyPeerRecord(PeerRecord(aceId: id, scheme: schemeText, encryptionPublicKey: enc,
                                                                signingPublicKey: spk, registrationSignature: signature,
-                                                               registeredAt: registeredAt, profile: profile))
+                                                               registeredAt: registeredAt, profile: profile),
+                                                clock: { fetchedAt })
                 return PinnedPeer(peer: verified, fetchedAt: fetchedAt)
             case .registration:
                 guard signature == nil else { throw storageError(key, "registration binding with a signature") }
                 let signingKey = try decodeSigningKey(scheme: scheme, spk, code: .storageFailed)
                 guard computeACEId(signingKey) == id else { throw storageError(key, "aceId does not match the signing key") }
                 let encKey = try ACEEncryption.decodeKemPublicKey(enc, code: .storageFailed)
+                // Never restore a principal without validation; the pin's own fetchedAt is "now" so
+                // an expired principal does not make the store unloadable.
+                if let p = profile?.principal { try validatePrincipalRecord(p, subjectSigningPublicKey: signingKey, now: fetchedAt) }
                 let peer = VerifiedPeer(aceId: id, scheme: scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
                                         registeredAt: registeredAt, registrationSignature: signature, source: .registration,
                                         profile: profile)

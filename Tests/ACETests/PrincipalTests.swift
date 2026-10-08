@@ -322,6 +322,110 @@ struct PrincipalTests {
         try store.write(requestKey(CONV, MID), JSONValue.object(o).jsonData())
         expectCode(.storageFailed) { try loadRequestRecord(store, conversationId: CONV, messageId: MID) }
     }
+
+    // MARK: - Task 17: principal in profile, registration file, payload, verify, pin load
+
+    func peerRecord(_ id: SoftwareIdentity, _ profile: AgentProfile, ts: Int = NOW) throws -> PeerRecord {
+        let req = try createRegistrationRequest(identity: id, profile: .replace(profile), timestamp: ts)
+        return PeerRecord(aceId: req.aceId, scheme: req.scheme.rawValue, encryptionPublicKey: req.encryptionPublicKey,
+                          signingPublicKey: req.signingPublicKey, registrationSignature: req.signature, registeredAt: ts, profile: profile)
+    }
+
+    @Test func registrationPayloadAndRequest() throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519)
+        let me = try SoftwareIdentity.generate(scheme: .secp256k1), other = try SoftwareIdentity.generate(scheme: .ed25519)
+        let good = try rec(owner, me, scope: "s", expiresAt: Self.NOW + 99)
+        let p = registrationPayload(encryptionPublicKey: "E", signingPublicKey: "S", scheme: .ed25519,
+                                    profile: .replace(AgentProfile(name: "A", principal: good)))
+        let tail = ACESigning.encodePayload("present", Self.ACC, "controller,agent", "ed25519", good.signer.publicKey,
+                                            String(Self.NOW - 10), String(Self.NOW + 99), "s", good.signature)
+        #expect(p.suffix(tail.count) == tail)
+        let absent = registrationPayload(encryptionPublicKey: "E", signingPublicKey: "S", scheme: .ed25519, profile: .replace(AgentProfile(name: "A")))
+        #expect(absent.suffix(ACESigning.encodePayload("absent", "", "", "", "", "", "", "", "").count) == ACESigning.encodePayload("absent", "", "", "", "", "", "", "", ""))
+        let req = try createRegistrationRequest(identity: me, profile: .replace(AgentProfile(name: "A", principal: good)), timestamp: Self.NOW)
+        let v = try verifyRegistrationRequest(req.jsonData(), clock: { Self.NOW })
+        #expect(v.peer.principal?.account == Self.ACC)
+        expectCode(.invalidPrincipal) {
+            try createRegistrationRequest(identity: me, profile: .replace(AgentProfile(name: "A", principal: try rec(owner, other))), timestamp: Self.NOW)
+        }
+    }
+
+    @Test func peerRecordAndFile() throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519)
+        let me = try SoftwareIdentity.generate(scheme: .ed25519), other = try SoftwareIdentity.generate(scheme: .ed25519)
+        let r = try peerRecord(me, AgentProfile(name: "A", principal: try rec(owner, me, expiresAt: Self.NOW + 50)))
+        #expect(try verifyPeerRecord(r, clock: { Self.NOW }).principal?.roles == ["controller", "agent"])
+        expectCode(.invalidPrincipal) { try verifyPeerRecord(r, clock: { Self.NOW + 50 }) }
+        // The binding signature does not cover the profile, so a swapped principal is built by hand.
+        let base = try peerRecord(me, AgentProfile(name: "A"))
+        let swapped = PeerRecord(aceId: base.aceId, scheme: base.scheme, encryptionPublicKey: base.encryptionPublicKey,
+                                 signingPublicKey: base.signingPublicKey, registrationSignature: base.registrationSignature,
+                                 registeredAt: base.registeredAt, profile: AgentProfile(name: "A", principal: try rec(owner, other)))
+        expectCode(.invalidPrincipal) { try verifyPeerRecord(swapped, clock: { Self.NOW }) }
+        let reg = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: try rec(owner, me))
+        let peer = try verifyRegistrationFile(reg, pinnedAt: Self.NOW, clock: { Self.NOW })
+        #expect(peer.profile == AgentProfile(principal: reg.principal))
+        let wire = try JSONValue(json: try JSONEncoder().encode(reg))
+        #expect(wire.objectValue?["principal"] != nil)
+        let back = try RegistrationFile(json: try JSONEncoder().encode(reg))
+        #expect(back.principal == reg.principal)
+    }
+
+    @Test func expiredPinStillLoads() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(principal: try rec(owner, me, expiresAt: Self.NOW + 5))), clock: { Self.NOW }))
+        clock.now = Self.NOW + 10_000
+        #expect(try await PeerStore(store: store, clock: clock.fn).get(me.getACEId())?.principal != nil)
+    }
+
+    @Test func tamperedPinnedPrincipalIsNotRestored() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let other = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(principal: try rec(owner, me))), clock: { Self.NOW }))
+        let key = PinnedPeer.key(me.getACEId())
+        var o = try JSONValue(json: try #require(try store.read(key))).objectValue!
+        var prof = o["profile"]!.objectValue!
+        prof["principal"] = try JSONValue(json: try rec(owner, other).jsonData())
+        o["profile"] = .object(prof)
+        try store.write(key, JSONValue.object(o).jsonData())
+        await expectCodeAsync(.storageFailed) { try await PeerStore(store: store, clock: clock.fn).get(me.getACEId()) }
+    }
+
+    @Test func registrationFileNeverRemovesOrDowngradesCachedPrincipal() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        let cached = try rec(owner, me, issuedAt: Self.NOW - 10)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "Rel", tags: ["x"], principal: cached)), clock: { Self.NOW }))
+        clock.now = Self.NOW + 100
+        // file without principal: keeps it, other members carry over
+        let bare = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace")
+        var kept = try await peers.pinRegistrationFile(bare, pinnedAt: Self.NOW)
+        #expect(kept.principal == cached && kept.profile?.name == "Rel" && kept.profile?.tags == ["x"])
+        // older issuedAt: keeps the cached one
+        let older = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: try rec(owner, me, issuedAt: Self.NOW - 20))
+        kept = try await peers.pinRegistrationFile(older, pinnedAt: Self.NOW)
+        #expect(kept.principal == cached)
+        // newer issuedAt: replaces
+        let newer = try rec(owner, me, issuedAt: Self.NOW + 50)
+        let reg = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: newer)
+        clock.now = Self.NOW + 60
+        kept = try await peers.pinRegistrationFile(reg, pinnedAt: Self.NOW)
+        #expect(kept.principal == newer && kept.profile?.name == "Rel")
+        // relay record without principal clears it
+        let relay = try peerRecord(me, AgentProfile(name: "Rel2"), ts: Self.NOW + 70)
+        clock.now = Self.NOW + 70
+        try await peers.adopt(try verifyPeerRecord(relay, clock: clock.fn))
+        #expect(try await peers.get(me.getACEId())?.principal == nil)
+    }
+
+    @Test func discoverQueryAccount() {
+        #expect(DiscoverQuery(q: "x", account: Self.ACC).account == Self.ACC)
+    }
 }
 
 final class Counter: @unchecked Sendable {

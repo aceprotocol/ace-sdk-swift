@@ -150,7 +150,8 @@ public func createRegistrationFile(
     hardwareBacking: HardwareBacking? = nil,
     capabilities: [Capability]? = nil,
     settlement: [String]? = nil,
-    chains: [ChainInfo]? = nil
+    chains: [ChainInfo]? = nil,
+    principal: PrincipalRecord? = nil
 ) throws -> RegistrationFile {
     let scheme = identity.getSigningScheme()
     let signingPublicKey = identity.getSigningPublicKey()
@@ -170,8 +171,10 @@ public func createRegistrationFile(
         ),
         capabilities: capabilities,
         settlement: settlement,
-        chains: chains
+        chains: chains,
+        principal: principal
     )
-    _ = try verifyRegistrationFile(reg, pinnedAt: 0)
+    // Verified at the principal's own issuedAt so a fresh record never trips the future-dated rule.
+    _ = try verifyRegistrationFile(reg, pinnedAt: 0, clock: { principal?.issuedAt ?? systemClock() })
     return reg
 }

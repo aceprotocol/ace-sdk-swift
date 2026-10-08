@@ -32,6 +32,9 @@ public struct VerifiedPeer: Sendable, Equatable {
     /// self-asserted and not covered by the binding signature. Never use it for trust decisions.
     public let profile: AgentProfile?
 
+    /// The peer's principal record (verified when the peer was verified, 09).
+    public var principal: PrincipalRecord? { profile?.principal }
+
     init(aceId: String, scheme: SigningScheme, signingPublicKey: Data, encryptionPublicKey: Data, registeredAt: Int,
          registrationSignature: String?, source: PeerSource, profile: AgentProfile?) {
         self.aceId = aceId
@@ -101,7 +104,8 @@ extension AgentProfile {
             capabilities: try optStringList(o, "capabilities", code, "profile"),
             chains: try optStringList(o, "chains", code, "profile"),
             endpoint: try optString(o, "endpoint", code, "profile"),
-            pricing: pricing
+            pricing: pricing,
+            principal: try o["principal"].flatMap { $0.isNull ? nil : try PrincipalRecord.parse($0) }
         )
     }
 
@@ -119,6 +123,7 @@ extension AgentProfile {
             if let m = pricing.maxAmount { p["maxAmount"] = .string(m) }
             o["pricing"] = .object(p)
         }
+        if let principal { o["principal"] = principal.jvalue }
         return .object(o)
     }
 }
@@ -187,7 +192,8 @@ extension RegistrationFile {
             ),
             capabilities: capabilities,
             settlement: try optStringList(d, "settlement", code, "registration"),
-            chains: chains
+            chains: chains,
+            principal: try d["principal"].flatMap { $0.isNull ? nil : try PrincipalRecord.parse($0) }
         )
     }
 }
@@ -206,7 +212,7 @@ extension PeerRecord {
         guard let signature = o["registrationSignature"]?.stringValue else { throw ACEError(code, "registrationSignature must be a string") }
         var profile: AgentProfile?
         if let p = o["profile"], !p.isNull {
-            do { profile = try AgentProfile.parse(p) } catch let e as ACEError { throw ACEError(code, e.message) }
+            do { profile = try AgentProfile.parse(p) } catch let e as ACEError { throw e.code == .invalidPrincipal ? e : ACEError(code, e.message) }
         }
         return PeerRecord(aceId: aceId, scheme: scheme, encryptionPublicKey: enc, signingPublicKey: sig,
                           registrationSignature: signature, registeredAt: registeredAt, profile: profile)
@@ -282,8 +288,9 @@ func bindingSignData(aceId: String, timestamp: Int, encryptionPublicKey: String,
 
 /// Verify a relay `PeerRecord`: ID format, `aceId == sha256(signing key)`, a 1216-byte
 /// encryption key, an integer `registeredAt`, the binding signature and the profile.
-/// Every failure is `invalid_peer`.
-public func verifyPeerRecord(_ record: PeerRecord) throws -> VerifiedPeer {
+/// Every failure is `invalid_peer`, except a present `profile.principal` that fails 09
+/// validation (`invalid_principal`, subject = the record's signing key, `now` from `clock`).
+public func verifyPeerRecord(_ record: PeerRecord, clock: @Sendable () -> Int = systemClock) throws -> VerifiedPeer {
     let code = ACEError.Code.invalidPeer
     guard isACEId(record.aceId) else { throw ACEError(code, "aceId is not an ACE ID") }
     guard let scheme = SigningScheme(rawValue: record.scheme) else { throw ACEError(code, "unsupported scheme") }
@@ -301,13 +308,15 @@ public func verifyPeerRecord(_ record: PeerRecord) throws -> VerifiedPeer {
     }
     if let profile = record.profile {
         do { try validateProfile(profile) } catch let e as ACEError { throw ACEError(code, e.message) }
+        if let p = profile.principal { try validatePrincipalRecord(p, subjectSigningPublicKey: signingKey, now: wireNow(clock)) }
     }
     return VerifiedPeer(aceId: record.aceId, scheme: scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
                         registeredAt: record.registeredAt, registrationSignature: record.registrationSignature,
                         source: .relay, profile: record.profile)
 }
 
-/// Run all 01 rules (including the ID hash); failures are `invalid_registration`.
+/// Run all 01 rules (including the ID hash); failures are `invalid_registration`, except a
+/// `principal` that fails 09 validation (`invalid_principal`; subject = the file's own signing key).
 ///
 /// The peer's `registeredAt` is `pinnedAt` or now (a file has no signed timestamp).
 public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil, clock: @Sendable () -> Int = systemClock) throws -> VerifiedPeer {
@@ -343,8 +352,13 @@ public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil
     }
     guard computeACEId(signingKey) == reg.id else { throw ACEError(code, "id does not match the signing key") }
     let encKey = try ACEEncryption.decodeKemPublicKey(s.encryptionPublicKey, code: code)
+    let now = wireNow(clock)
+    var profile: AgentProfile?
+    if let p = reg.principal {
+        profile = AgentProfile(principal: try validatePrincipalRecord(p, subjectSigningPublicKey: signingKey, now: now))
+    }
     return VerifiedPeer(aceId: reg.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
-                        registeredAt: pinnedAt ?? wireNow(clock), registrationSignature: nil, source: .registration, profile: nil)
+                        registeredAt: pinnedAt ?? now, registrationSignature: nil, source: .registration, profile: profile)
 }
 
 // MARK: - Rollback barrier (02)
@@ -352,6 +366,33 @@ public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil
 /// Outcome of adopting a candidate binding.
 public enum AdoptOutcome: String, Sendable {
     case adopted, unchanged, rotated
+}
+
+private func withProfile(_ pin: VerifiedPeer, _ profile: AgentProfile?) -> VerifiedPeer {
+    VerifiedPeer(aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
+                 encryptionPublicKey: pin.encryptionPublicKey, registeredAt: pin.registeredAt,
+                 registrationSignature: pin.registrationSignature, source: pin.source, profile: profile)
+}
+
+/// A kept registration-file candidate replaces only the profile members it supplies (absent
+/// members carry over, R-P27). `principal` is replaced only by a validated one whose `issuedAt`
+/// is not older than the cached one, and never removed (R-P26).
+private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?) -> AgentProfile? {
+    let old = cached?.principal, new = candidate?.principal
+    let keep: PrincipalRecord? = (old == nil || (new != nil && new!.issuedAt >= old!.issuedAt)) ? new : old
+    var m = cached ?? AgentProfile()
+    if let c = candidate {
+        if let v = c.name { m.name = v }
+        if let v = c.description { m.description = v }
+        if let v = c.image { m.image = v }
+        if let v = c.tags { m.tags = v }
+        if let v = c.capabilities { m.capabilities = v }
+        if let v = c.chains { m.chains = v }
+        if let v = c.endpoint { m.endpoint = v }
+        if let v = c.pricing { m.pricing = v }
+    }
+    m.principal = keep
+    return m == AgentProfile() ? nil : m
 }
 
 /// Pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
@@ -369,13 +410,17 @@ func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws
     }
     let unsigned = candidate.registrationSignature == nil
     if pin.encryptionPublicKey == candidate.encryptionPublicKey {
-        if unsigned { return (pin, .unchanged) }
+        if unsigned {
+            // An unsigned source never changes the binding, but a kept candidate refreshes the
+            // cached profile; it can never remove or downgrade the cached principal (R-P26/R-P27).
+            return (withProfile(pin, fileProfile(cached: pin.profile, candidate: candidate.profile)), .unchanged)
+        }
         let newer = candidate.registeredAt > pin.registeredAt ? candidate : pin
         let merged = VerifiedPeer(
             aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
             encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
             registrationSignature: newer.registrationSignature, source: newer.source,
-            profile: candidate.source == .relay ? candidate.profile : pin.profile
+            profile: candidate.profile
         )
         return (merged, .unchanged)
     }

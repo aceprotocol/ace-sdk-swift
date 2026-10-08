@@ -80,6 +80,11 @@ func registrationPayload(encryptionPublicKey: String, signingPublicKey: String, 
             .data(ACESigning.encodePayload((p.chains ?? []).map { .string($0) })),
             .string(p.endpoint ?? ""), .string(p.pricing == nil ? "absent" : "present"),
             .string(p.pricing?.currency ?? ""), .string(p.pricing?.maxAmount ?? ""),
+            .string(p.principal == nil ? "absent" : "present"),
+            .string(p.principal?.account ?? ""), .string(p.principal?.roles.joined(separator: ",") ?? ""),
+            .string(p.principal?.signer.scheme ?? ""), .string(p.principal?.signer.publicKey ?? ""),
+            .string(p.principal.map { String($0.issuedAt) } ?? ""), .string(p.principal.map { String($0.expiresAt) } ?? ""),
+            .string(p.principal.map { $0.scope ?? "" } ?? ""), .string(p.principal?.signature ?? ""),
         ]
     }
     return ACESigning.encodePayload(fields)
@@ -100,7 +105,12 @@ public func createRegistrationRequest(
     guard enc.count == ACELimits.kemPublicKeySize else {
         throw ACEError(.invalidKey, "identity encryption public key must be \(ACELimits.kemPublicKeySize) bytes")
     }
-    if case .replace(let p) = profile { try validateProfile(p) }
+    if case .replace(let p) = profile {
+        try validateProfile(p)
+        if let pr = p.principal {
+            try validatePrincipalRecord(pr, subjectSigningPublicKey: identity.getSigningPublicKey(), now: ts)
+        }
+    }
     let epk = ACEBase64.encode(enc), spk = ACEBase64.encode(identity.getSigningPublicKey())
     let aceId = identity.getACEId(), scheme = identity.getSigningScheme()
     let signature = try identity.sign(try bindingSignData(aceId: aceId, timestamp: ts, encryptionPublicKey: epk, signingPublicKey: spk))
@@ -126,8 +136,8 @@ public struct VerifiedRegistration: Sendable {
 
 /// Verify a registration request body. Check order (first failure wins): schema →
 /// `invalid_registration`; freshness → `stale_timestamp`; ID hash → `invalid_registration`;
-/// signing / encryption key → `invalid_key`; profile → `invalid_profile`; binding →
-/// `invalid_signature`; authorization → `invalid_authorization`. Unknown fields are ignored.
+/// signing / encryption key → `invalid_key`; profile → `invalid_profile`; principal →
+/// `invalid_principal`; binding → `invalid_signature`; authorization → `invalid_authorization`. Unknown fields are ignored.
 public func verifyRegistrationRequest(
     _ json: Data,
     clock: @Sendable () -> Int = systemClock,
@@ -168,6 +178,7 @@ public func verifyRegistrationRequest(
     if let rawProfile, !rawProfile.isNull {
         let p = try AgentProfile.parse(rawProfile)
         try validateProfile(p)
+        if let pr = p.principal { try validatePrincipalRecord(pr, subjectSigningPublicKey: signingKey, now: now) }
         profile = p
     }
     guard ACESigning.verify(signData: try bindingSignData(aceId: aceId, timestamp: ts, encryptionPublicKey: epk, signingPublicKey: spk),
