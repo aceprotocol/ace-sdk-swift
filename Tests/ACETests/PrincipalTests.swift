@@ -423,6 +423,26 @@ struct PrincipalTests {
         #expect(try await peers.get(me.getACEId())?.principal == nil)
     }
 
+    @Test func expiredCachedPrincipalIsDroppedByKeptFile() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "Rel", principal: try rec(owner, me, expiresAt: Self.NOW + 5))), clock: { Self.NOW }))
+        let bare = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace")
+        clock.now = Self.NOW + 100
+        let kept = try await peers.pinRegistrationFile(bare, pinnedAt: Self.NOW)
+        #expect(kept.principal == nil && kept.profile?.name == "Rel")
+        #expect(try await PeerStore(store: store, clock: clock.fn).get(me.getACEId())?.principal == nil)
+        // unexpired cached principal is still carried
+        let me2 = try SoftwareIdentity.generate(scheme: .ed25519)
+        clock.now = Self.NOW
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me2, AgentProfile(principal: try rec(owner, me2, expiresAt: Self.NOW + 500))), clock: { Self.NOW }))
+        clock.now = Self.NOW + 100
+        let k2 = try await peers.pinRegistrationFile(try createRegistrationFile(for: me2, name: "M", endpoint: "https://m.example/ace"), pinnedAt: Self.NOW)
+        #expect(k2.principal != nil)
+        #expect(try await PeerStore(store: store, clock: clock.fn).get(me2.getACEId())?.principal != nil)
+    }
+
     @Test func discoverQueryAccount() {
         #expect(DiscoverQuery(q: "x", account: Self.ACC).account == Self.ACC)
     }

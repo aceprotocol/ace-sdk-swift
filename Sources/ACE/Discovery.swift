@@ -376,9 +376,10 @@ private func withProfile(_ pin: VerifiedPeer, _ profile: AgentProfile?) -> Verif
 
 /// A kept registration-file candidate replaces only the profile members it supplies (absent
 /// members carry over, R-P27). `principal` is replaced only by a validated one whose `issuedAt`
-/// is not older than the cached one, and never removed (R-P26).
-private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?) -> AgentProfile? {
-    let old = cached?.principal, new = candidate?.principal
+/// is not older than the cached one, and never removed (R-P26) unless expired at `now` (R-P35).
+private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: Int) -> AgentProfile? {
+    // An expired cached principal is dropped (R-P35): the refreshed fetchedAt would otherwise make the pin unloadable.
+    let old = cached?.principal.flatMap { $0.expiresAt > now ? $0 : nil }, new = candidate?.principal
     let keep: PrincipalRecord? = (old == nil || (new != nil && new!.issuedAt >= old!.issuedAt)) ? new : old
     var m = cached ?? AgentProfile()
     if let c = candidate {
@@ -413,7 +414,7 @@ func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws
         if unsigned {
             // An unsigned source never changes the binding, but a kept candidate refreshes the
             // cached profile; it can never remove or downgrade the cached principal (R-P26/R-P27).
-            return (withProfile(pin, fileProfile(cached: pin.profile, candidate: candidate.profile)), .unchanged)
+            return (withProfile(pin, fileProfile(cached: pin.profile, candidate: candidate.profile, now: now)), .unchanged)
         }
         let newer = candidate.registeredAt > pin.registeredAt ? candidate : pin
         let merged = VerifiedPeer(
