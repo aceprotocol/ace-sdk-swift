@@ -368,6 +368,24 @@ public enum AdoptOutcome: String, Sendable {
     case adopted, unchanged, rotated
 }
 
+/// R-P36: a principal replaces the cached one only with a strictly newer `issuedAt`, or the
+/// byte-identical record at the same `issuedAt`.
+private func supersedes(_ new: PrincipalRecord, _ old: PrincipalRecord) -> Bool {
+    new.issuedAt > old.issuedAt || (new.issuedAt == old.issuedAt && new.jsonData() == old.jsonData())
+}
+
+/// Profile a signed (relay) candidate leaves in the pin (R-P36): an older `registeredAt` keeps the
+/// cached profile; otherwise the candidate's replaces it, a principal only per `supersedes`, and a
+/// candidate without one withdraws it (an expired cached principal is dropped first, R-P35).
+private func relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: Int) -> AgentProfile? {
+    guard candidate.registeredAt >= pin.registeredAt else { return pin.profile }
+    guard var p = candidate.profile else { return nil }
+    if let new = p.principal, let old = pin.profile?.principal, old.expiresAt > now, !supersedes(new, old) {
+        p.principal = old
+    }
+    return p
+}
+
 private func withProfile(_ pin: VerifiedPeer, _ profile: AgentProfile?) -> VerifiedPeer {
     VerifiedPeer(aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
                  encryptionPublicKey: pin.encryptionPublicKey, registeredAt: pin.registeredAt,
@@ -380,7 +398,7 @@ private func withProfile(_ pin: VerifiedPeer, _ profile: AgentProfile?) -> Verif
 private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: Int) -> AgentProfile? {
     // An expired cached principal is dropped (R-P35): the refreshed fetchedAt would otherwise make the pin unloadable.
     let old = cached?.principal.flatMap { $0.expiresAt > now ? $0 : nil }, new = candidate?.principal
-    let keep: PrincipalRecord? = (old == nil || (new != nil && new!.issuedAt >= old!.issuedAt)) ? new : old
+    let keep: PrincipalRecord? = old == nil ? new : (new.map { supersedes($0, old!) } == true ? new : old)
     var m = cached ?? AgentProfile()
     if let c = candidate {
         if let v = c.name { m.name = v }
@@ -421,7 +439,7 @@ func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws
             aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
             encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
             registrationSignature: newer.registrationSignature, source: newer.source,
-            profile: candidate.profile
+            profile: relayProfile(pin: pin, candidate: candidate, now: now)
         )
         return (merged, .unchanged)
     }

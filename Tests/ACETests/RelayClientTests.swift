@@ -273,6 +273,20 @@ struct RelayClientTests {
         #expect(page.agents.count == 1 && page.rejected == 1 && page.cursor == "c2")
     }
 
+    @Test func discoverSendsAccount() async throws {
+        let seen = Locked<[String?]>([])
+        let data = json(["agents": [Any]()])
+        let relay = try makeRelay { req, _ in
+            let v = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!.queryItems?.first { $0.name == "account" }?.value
+            seen.mutate { $0.append(v) }
+            return StubResponse(status: 200, chunks: [data])
+        }
+        let acc = "eip155:1:0x" + String(repeating: "ab", count: 20)
+        _ = try await relay.discover(DiscoverQuery(account: acc))
+        _ = try await relay.discover(DiscoverQuery())
+        #expect(seen.mutate { $0 } == [acc, nil])
+    }
+
     // MARK: listen
 
     private func frame(_ id: String, _ env: ACEMessage, event: String = "message") -> String {

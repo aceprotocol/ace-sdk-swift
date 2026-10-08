@@ -443,6 +443,34 @@ struct PrincipalTests {
         #expect(try await PeerStore(store: store, clock: clock.fn).get(me2.getACEId())?.principal != nil)
     }
 
+    @Test func relayRollbackAndPrincipalMonotonicity() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW + 100)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        let cached = try rec(owner, me, scope: "a", issuedAt: Self.NOW - 10)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "New", principal: cached), ts: Self.NOW + 50), clock: { Self.NOW + 100 }))
+        // older relay record: cached profile unchanged
+        clock.now = Self.NOW + 120
+        let old = try peerRecord(me, AgentProfile(name: "Old", principal: try rec(owner, me, issuedAt: Self.NOW - 5)), ts: Self.NOW + 40)
+        try await peers.adopt(try verifyPeerRecord(old, clock: clock.fn))
+        let p1 = try #require(try await peers.get(me.getACEId()))
+        #expect(p1.profile?.name == "New" && p1.principal == cached)
+        let raw = try JSONValue(json: try #require(try store.read(PinnedPeer.key(me.getACEId())))).objectValue!
+        #expect(raw["fetchedAt"] == .number(Double(Self.NOW + 120)))
+        // equal issuedAt, different principal: cached kept
+        let same = try rec(owner, me, scope: "b", issuedAt: Self.NOW - 10)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "Eq", principal: same), ts: Self.NOW + 60), clock: clock.fn))
+        let p2 = try #require(try await peers.get(me.getACEId()))
+        #expect(p2.profile?.name == "Eq" && p2.principal == cached)
+        // strictly newer issuedAt replaces
+        let newer = try rec(owner, me, issuedAt: Self.NOW + 1)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(principal: newer), ts: Self.NOW + 70), clock: clock.fn))
+        #expect(try await peers.get(me.getACEId())?.principal == newer)
+        // newer relay record without principal clears it
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "W"), ts: Self.NOW + 80), clock: clock.fn))
+        #expect(try await peers.get(me.getACEId())?.principal == nil)
+    }
+
     @Test func discoverQueryAccount() {
         #expect(DiscoverQuery(q: "x", account: Self.ACC).account == Self.ACC)
     }
