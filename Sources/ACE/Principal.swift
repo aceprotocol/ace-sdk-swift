@@ -369,7 +369,7 @@ public struct RequestRecord: Sendable, Equatable {
 }
 
 /// `requests/<sha256(conversationId ‖ 0x00 ‖ messageId)>.json`.
-public func requestKey(_ conversationId: String, _ messageId: String) -> String {
+func requestKey(_ conversationId: String, _ messageId: String) -> String {
     "requests/\(sha256Hex(conversationId, messageId)).json"
 }
 
@@ -414,7 +414,7 @@ public func openRequestTo(_ store: any ACEStore, conversationId: String, message
 
 /// Write the ledger entry of a delivered `request` (idempotent: an existing entry is never
 /// overwritten). `ttl` is the request body's `ttl`. Caller holds lock `requests`.
-public func recordRequest(_ store: any ACEStore, message: ACEMessage, sentAt: Int, ttl: Int? = nil) throws {
+func recordRequest(_ store: any ACEStore, message: ACEMessage, sentAt: Int, ttl: Int? = nil) throws {
     guard isConversationId(message.conversationId) else { throw ACEError(.invalidArgument, "invalid conversationId") }
     guard isMessageId(message.messageId) else { throw ACEError(.invalidArgument, "invalid messageId") }
     guard isACEId(message.to) else { throw ACEError(.invalidArgument, "invalid to") }
@@ -444,7 +444,7 @@ public func recordRequest(_ store: any ACEStore, message: ACEMessage, sentAt: In
 /// `bad_reference` (R-P25); a decision from anyone but the request's `to` is `wrong_principal`
 /// (09 step 7, R-P22). The record is unchanged on failure; unknown members are kept.
 /// Caller holds lock `requests`.
-public func fillDecision(_ store: any ACEStore, _ m: ParsedMessage) throws {
+func fillDecision(_ store: any ACEStore, _ m: ParsedMessage) throws {
     guard m.type == .decision, let requestId = m.body["requestId"]?.stringValue, !requestId.isEmpty,
           let outcome = m.body["outcome"]?.stringValue, outcome == "approve" || outcome == "deny" else {
         throw ACEError(.invalidArgument, "fillDecision needs a decision with requestId and outcome approve|deny")

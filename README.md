@@ -21,7 +21,7 @@ Swift implementation of the [ACE Protocol](https://aceprotocol.org): end-to-end 
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/aceprotocol/ace-sdk-swift.git", exact: "0.2.0"),
+    .package(url: "https://github.com/aceprotocol/ace-sdk-swift.git", exact: "0.3.0"),
 ],
 targets: [
     .target(name: "YourTarget", dependencies: [.product(name: "ACE", package: "ace-sdk-swift")]),
@@ -148,6 +148,25 @@ final class EnclaveIdentity: ACEIdentity {
 
 `ACEEncryption` also exposes `publicKey(fromSeed:)`, `generateSeed()` and `computeConversationId(pubA:pubB:)`.
 
+## Principal binding (09-principal)
+
+A principal record binds an agent's signing key to an account (a CAIP-10 string), so agents of one account can exchange `request`, `decision` and `report` messages.
+
+```swift
+let signer = PrincipalSigner(identity: controllerKey)          // or PrincipalSigner(scheme:publicKey:sign:)
+let record = try createPrincipalRecord(signer: signer, subjectSigningPublicKey: agent.getSigningPublicKey(),
+                                       account: "eip155:1:0x…", roles: ["controller", "agent"],
+                                       expiresAt: now + 30 * 86_400)            // issuedAt defaults to the clock
+let checked = try validatePrincipalRecord(record, subjectSigningPublicKey: agent.getSigningPublicKey(), now: now)
+```
+
+`PrincipalRecord(json:)` parses the wire form strictly (`invalid_principal` on failure); `principalPayload` and `principalSignData` expose the signing context. Publish the record as the `principal` of the agent profile in its registration.
+
+- **Fail closed.** `Inbox.open(…, principal: nil)` (the default) rejects every `request`, `decision` and `report` with `wrong_principal`. Pass `principal: InboxPrincipal(account:selfSigner:trustedSigners:)` to accept them from senders whose valid record names the same account and whose signer is an authority of it (the receiver's own `selfSigner`, a host-supplied trusted signer, or for `eip155` accounts the key deriving the account address).
+- **Message types.** `request` (`action`, `summary`, optional `details`, `ttl`), `decision` (`requestId`, `outcome` approve or deny) and `report`. They are not thread-state messages, so `threadId` is optional.
+- **Request ledger.** Delivering a `request` writes `requests/<sha256(conversationId ‖ 0x00 ‖ messageId)>.json`; an accepted `decision` marks it decided. Only the request's addressee may decide it, a request expires at `timestamp + ttl`, and a second different decision is `bad_reference`. Read an entry with `loadRequestRecord(store, conversationId:messageId:)`.
+- **Refresh and retry.** If a sender's pinned principal fails the rules, the inbox looks the sender up on the relay once and re-checks. A transient relay failure makes the delivery retryable (the cursor does not advance); a permanent one keeps the pinned binding, and the message fails with `wrong_principal`.
+
 ## Persistence
 
 All pipeline state lives in the `ACEStore` under the keys of 06-security Appendix A (`replay.json`, `cursors.json`, `threads/`, `outbox/`, `deliveries/`, `quarantine/`, `peers/`, `requests/`). Records are compact JSON with sorted keys; `replay.json` is byte-identical across the TS, Python and Swift SDKs. `FileStore` writes atomically (temp file, fsync, rename) with 0600 files and 0700 directories, and uses `locks/<name>.lock` files for cross-process exclusion.
@@ -166,7 +185,7 @@ Each message uses a fresh encapsulation, but the recipient's static seed decrypt
 
 ## Cross-language compatibility
 
-Wire-compatible with the TypeScript and Python SDKs (0.2.0). All sections of the shared `test-vectors.json` (version 3) run in `Tests/ACETests/VectorTests.swift`, including the three X-Wing draft KATs, byte-exact replay state, webhook signatures, relay URL normalization, blocked addresses, relay error mapping and direct-receive replies.
+Wire-compatible with the TypeScript and Python SDKs (0.3.0). All sections of the shared `test-vectors.json` (version 4) run in `Tests/ACETests/VectorTests.swift`, including the three X-Wing draft KATs, byte-exact replay state, webhook signatures, relay URL normalization, blocked addresses, relay error mapping, direct-receive replies and the principal binding (records, same-account rules).
 
 Signatures are not deterministic: CryptoKit ed25519 signatures are randomized (hedged), so signing the same bytes twice gives different valid signatures. Treat signatures as verify-only: never compare them byte for byte or use them as identifiers. Signature vectors are verified rather than reproduced.
 

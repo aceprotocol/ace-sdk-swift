@@ -1,20 +1,20 @@
 //
-//  Shared cross-language vectors (ace-spec/test-vectors.json, version 3).
+//  Shared cross-language vectors (ace-spec/test-vectors.json, version 4).
 //
 
 import Foundation
 import Testing
 @testable import ACE
 
-@Suite("Vectors v3")
+@Suite("Vectors v4")
 struct VectorTests {
     let V = Fixtures.vectors
 
     @Test func versionAndSections() {
-        #expect(Fixtures.root["version"] as? String == "3")
+        #expect(Fixtures.root["version"] as? String == "4")
         for key in ["envelopes", "bodies", "transitions", "replay", "signatures", "auth", "registrations",
                     "registrationErrors", "urls", "base64", "peerBinding", "webhooks", "relayUrls", "blockedAddresses",
-                    "relayErrors", "directReceive"] {
+                    "relayErrors", "directReceive", "principal", "principalRules"] {
             #expect(V[key] != nil, "missing \(key)")
         }
     }
@@ -262,7 +262,10 @@ struct VectorTests {
     }
 
     @Test func auth() throws {
-        let cases = V["auth"] as! [[String: Any]]
+        let all = V["auth"] as! [[String: Any]]
+        #expect(all.count == 22)
+        // Principal entries carry no headers: the header runner skips them (see principalAuth).
+        let cases = all.filter { $0["action"] as? String != "principal" }
         #expect(cases.count == 18)
         #expect(cases.filter { ($0["request"] as! [String: Any])["action"] as? String == "webhook" }.count == 6)
         for v in cases {
@@ -284,6 +287,102 @@ struct VectorTests {
             let parsed = try parseAuthHeaders(headers)
             try verifyAuthHeaders(parsed, request: req, aceId: ident.getACEId(), scheme: ident.getSigningScheme(),
                                   signingPublicKey: ident.getSigningPublicKey(), clock: { ts })
+        }
+    }
+
+    // MARK: principal (09)
+
+    private var principalAuthEntries: [[String: Any]] { (V["auth"] as! [[String: Any]]).filter { $0["action"] as? String == "principal" } }
+
+    @Test func principalAuth() throws {
+        let entries = principalAuthEntries
+        #expect(entries.count == 4)
+        for v in entries {
+            let r = v["request"] as! [String: Any]
+            let spk = try ACEBase64.decode(v["subjectSigningPublicKey"] as! String)
+            #expect(r["subjectSigningPublicKey"] as? String == v["subjectSigningPublicKey"] as? String)
+            let ts = v["timestamp"] as! Int, now = v["now"] as! Int
+            let payload = ACESigning.encodePayload([
+                .string(r["account"] as! String), .string((r["roles"] as! [String]).joined(separator: ",")),
+                .string(r["signerScheme"] as! String), .string(r["signerPublicKey"] as! String),
+                .string(r["subjectSigningPublicKey"] as! String), .string(r["scope"] as? String ?? ""),
+                .string(String(r["expiresAt"] as! Int)),
+            ])
+            #expect(hexEncode(payload) == v["payloadHex"] as? String)
+            #expect(hexEncode(try ACESigning.buildSignData(action: "principal", aceId: r["subjectAceId"] as! String,
+                                                           timestamp: ts, payload: payload)) == v["signDataHex"] as? String)
+            let rec = try validatePrincipalRecord(try PrincipalRecord(json: json(v["record"]!)), subjectSigningPublicKey: spk, now: now)
+            #expect(rec.signature == v["signature"] as? String)
+            #expect(hexEncode(try principalSignData(rec, subjectSigningPublicKey: spk)) == v["signDataHex"] as? String)
+            if !(v["verifyOnly"] as? Bool ?? false) {
+                // ed25519 signatures are hedged: every member but the signature must match, and the
+                // fresh signature must validate (createPrincipalRecord validates its own output).
+                let mine = try createPrincipalRecord(signer: PrincipalSigner(identity: Fixtures.agent(v["agent"] as! String)),
+                                                     subjectSigningPublicKey: spk, account: r["account"] as! String,
+                                                     roles: r["roles"] as! [String], expiresAt: r["expiresAt"] as! Int,
+                                                     scope: r["scope"] as? String, issuedAt: ts)
+                var a = mine, b = rec
+                a.signature = ""; b.signature = ""
+                #expect(a == b)
+                _ = try validatePrincipalRecord(mine, subjectSigningPublicKey: spk, now: now)
+            }
+        }
+    }
+
+    @Test func principalValidAndInvalid() throws {
+        let p = V["principal"] as! [String: Any]
+        let valid = p["valid"] as! [[String: Any]], invalid = p["invalid"] as! [[String: Any]]
+        #expect(!valid.isEmpty && !invalid.isEmpty)
+        for v in valid {
+            let spk = try ACEBase64.decode(v["subjectSigningPublicKey"] as! String)
+            let r = try validatePrincipalRecord(try PrincipalRecord(json: json(v["record"]!)), subjectSigningPublicKey: spk,
+                                                now: v["now"] as? Int ?? p["now"] as! Int)
+            #expect(hexEncode(principalPayload(r, subjectSigningPublicKey: spk)) == v["payloadHex"] as? String, "\(v["name"]!)")
+            #expect(hexEncode(try principalSignData(r, subjectSigningPublicKey: spk)) == v["signDataHex"] as? String, "\(v["name"]!)")
+        }
+        for v in invalid {
+            let spk = try ACEBase64.decode(v["subjectSigningPublicKey"] as! String)
+            var got = "ok"
+            do {
+                try validatePrincipalRecord(try PrincipalRecord(json: json(v["record"]!)), subjectSigningPublicKey: spk, now: v["now"] as! Int)
+            } catch let e as ACEError { got = e.code.rawValue }
+            #expect(got == v["error"] as? String, "\(v["name"]!)")
+        }
+    }
+
+    @Test func principalRules() throws {
+        let pr = V["principalRules"] as! [String: Any]
+        let conv = pr["conversationId"] as! String
+        let senders = pr["senders"] as! [String: [String: Any]]
+        let all = pr["cases"] as! [[String: Any]]
+        #expect(all.count == 28)
+        func key(_ v: Any) -> PrincipalKey { let d = v as! [String: String]; return PrincipalKey(scheme: d["scheme"]!, publicKey: d["publicKey"]!) }
+        for c in all {
+            let name = c["name"] as! String
+            let now = c["now"] as? Int ?? pr["now"] as! Int
+            var open = c["openRequests"] as! [String: [String: Any]]
+            let selfSigner = (c["selfSigner"]).flatMap { $0 is NSNull ? nil : key($0) }
+            let trusted = Set(((c["trustedSigners"] as? [Any]) ?? []).map(key))
+            for s in c["steps"] as! [[String: Any]] {
+                let snd = senders[s["sender"] as! String]!
+                let principal = try (snd["principal"] as? [String: Any]).map { try PrincipalRecord(json: json($0)) }
+                let type = MessageType(rawValue: s["type"] as! String)!
+                let body = jsonBody(s["body"]!)
+                _ = try decodeBody(type, json(s["body"]!))
+                var got = "ok"
+                do {
+                    try checkPrincipalRules(type: type, body: body, conversationId: conv, senderPrincipal: principal,
+                                            senderSigningPublicKey: try ACEBase64.decode(snd["signingPublicKey"] as! String),
+                                            selfAccount: c["selfAccount"] as? String,
+                                            openRequestTo: { cv, rid, at in
+                                                guard cv == conv, let e = open[rid] else { return nil }
+                                                if let exp = e["expiresAt"] as? Int, at > exp { return nil }
+                                                return e["to"] as? String
+                                            }, now: now, selfSigner: selfSigner, trustedSigners: trusted)
+                } catch let e as ACEError { got = "error:" + e.code.rawValue }
+                #expect(got == s["expect"] as? String, "\(name): \(s["type"]!)")
+                if got == "ok", type == .decision { open[body["requestId"]!.stringValue!] = nil }
+            }
         }
     }
 
