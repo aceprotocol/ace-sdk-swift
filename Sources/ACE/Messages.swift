@@ -193,10 +193,15 @@ func resign(_ env: ACEMessage, sender: any ACEIdentity, timestamp: Int) throws -
 ///
 /// decode → `wrong_recipient` → from (`invalid_envelope`) → `scheme_mismatch` →
 /// conversationId (`invalid_envelope`) → floor / timestamp (`stale_timestamp`) → `replay` →
-/// `invalid_signature` → replay commit → decrypt → `invalid_body` → state machine.
+/// `invalid_signature` → replay commit → decrypt → `invalid_body` → state machine /
+/// principal rules.
 ///
 /// `floor` defaults to `max(0, now − 300)` and must lie in `[0, now]` (`invalid_argument`).
 /// A non-`ACEError` thrown by `receiver.decrypt` is `identity_unavailable`.
+///
+/// Principal types (`request`, `decision`, `report`) need `principal` (the receiver's
+/// `PrincipalContext`, 09 § Same-Account Rules); without it they are `wrong_principal`. They
+/// never enter the thread state machine.
 public func parseMessage(
     _ env: ACEMessage,
     receiver: any ACEIdentity,
@@ -204,7 +209,8 @@ public func parseMessage(
     threads: ThreadStateMachine,
     replay: ReplayDetector,
     floor: Int? = nil,
-    clock: @Sendable () -> Int = systemClock
+    clock: @Sendable () -> Int = systemClock,
+    principal: PrincipalContext? = nil
 ) throws -> ParsedMessage {
     let receiverId = receiver.getACEId()
     guard threads.localAceId == receiverId else { throw ACEError(.invalidArgument, "threads.localAceId must be the receiver") }
@@ -258,7 +264,31 @@ public func parseMessage(
     // 13
     if env.type.isEconomic {
         try threads.apply(event(env), body: body)
+    } else if env.type.isPrincipal {
+        try checkPrincipal(env, body: body, sender: sender, context: principal, now: now)
     }
     return ParsedMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
                          type: env.type, threadId: env.threadId, timestamp: env.timestamp, body: body)
+}
+
+/// 06 step 7 for principal types (09 § Same-Account Rules). When the pinned sender principal
+/// fails steps 2-5 and `context.refreshSender` is set, the sender's binding is refreshed once
+/// (R-P20) before the rules run; a refresh returning nil or another binding leaves the pinned
+/// binding to decide. The `Inbox` refreshes before parsing instead (outside any store lock) and
+/// leaves `refreshSender` nil.
+private func checkPrincipal(_ env: ACEMessage, body: [String: JSONValue], sender: VerifiedPeer,
+                            context: PrincipalContext?, now: Int) throws {
+    var sender = sender
+    if let context, let refresh = context.refreshSender,
+       !senderPrincipalUsable(sender.principal, senderSigningPublicKey: sender.signingPublicKey,
+                              principal: context.inboxPrincipal, now: now),
+       let fresh = try refresh(sender.aceId),
+       fresh.aceId == sender.aceId, fresh.signingPublicKey == sender.signingPublicKey {
+        sender = fresh
+    }
+    try checkPrincipalRules(
+        type: env.type, body: body, conversationId: env.conversationId, senderPrincipal: sender.principal,
+        senderSigningPublicKey: sender.signingPublicKey, selfAccount: context?.account,
+        openRequestTo: context?.openRequestTo, now: now,
+        selfSigner: context?.selfSigner, trustedSigners: context?.trustedSigners ?? [])
 }

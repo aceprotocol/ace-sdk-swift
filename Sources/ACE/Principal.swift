@@ -233,6 +233,46 @@ public struct InboxPrincipal: Sendable, Equatable {
         self.selfSigner = selfSigner
         self.trustedSigners = trustedSigners
     }
+
+    /// `Inbox.open` check: `account` is CAIP-10 and every signer key is well-formed (a supported
+    /// scheme and a valid public key for it, base64); else `invalid_argument`.
+    func validate() throws {
+        guard isCAIP10(account) else { throw ACEError(.invalidArgument, "principal.account must be a CAIP-10 account") }
+        for (k, what) in (selfSigner.map { [($0, "principal.selfSigner")] } ?? []) + trustedSigners.map({ ($0, "principal.trustedSigners[]") }) {
+            guard let scheme = SigningScheme(rawValue: k.scheme),
+                  let key = try? decodeB64(k.publicKey, code: .invalidArgument, what: what, maxBytes: 64),
+                  ACESigning.isValidSigningPublicKey(scheme, key) else {
+                throw ACEError(.invalidArgument, "\(what) must be {scheme, publicKey} with a valid key for a supported scheme")
+            }
+        }
+    }
+}
+
+/// The receiver's context for 06 step 7 (`parseMessage(principal:)`): its principal `account`,
+/// the step-4 authorities (`selfSigner`, `trustedSigners`, see `InboxPrincipal`), the open-request
+/// lookup for step 7 (`openRequestTo(conversationId, requestId, now)` → the request's `to`, or nil;
+/// bind `openRequestTo(_:conversationId:messageId:now:)` to a store) and an optional one-shot
+/// sender refresh (`refreshSender(aceId)` → a freshly adopted binding or nil, R-P20).
+public struct PrincipalContext: Sendable {
+    public let account: String
+    public let openRequestTo: (@Sendable (String, String, Int) throws -> String?)?
+    public let selfSigner: PrincipalKey?
+    public let trustedSigners: Set<PrincipalKey>
+    public let refreshSender: (@Sendable (String) throws -> VerifiedPeer?)?
+
+    public init(account: String, openRequestTo: (@Sendable (String, String, Int) throws -> String?)? = nil,
+                selfSigner: PrincipalKey? = nil, trustedSigners: Set<PrincipalKey> = [],
+                refreshSender: (@Sendable (String) throws -> VerifiedPeer?)? = nil) {
+        self.account = account
+        self.openRequestTo = openRequestTo
+        self.selfSigner = selfSigner
+        self.trustedSigners = trustedSigners
+        self.refreshSender = refreshSender
+    }
+
+    var inboxPrincipal: InboxPrincipal {
+        InboxPrincipal(account: account, selfSigner: selfSigner, trustedSigners: trustedSigners)
+    }
 }
 
 /// 09 step 4 (R-P21): `p.signer` is an authority of `p.account` when it is the receiver's own
@@ -377,6 +417,7 @@ public func openRequestTo(_ store: any ACEStore, conversationId: String, message
 public func recordRequest(_ store: any ACEStore, message: ACEMessage, sentAt: Int, ttl: Int? = nil) throws {
     guard isConversationId(message.conversationId) else { throw ACEError(.invalidArgument, "invalid conversationId") }
     guard isMessageId(message.messageId) else { throw ACEError(.invalidArgument, "invalid messageId") }
+    guard isACEId(message.to) else { throw ACEError(.invalidArgument, "invalid to") }
     guard isWireInt(sentAt) else { throw ACEError(.invalidArgument, "sentAt must be an integer in [0, 2^53-1]") }
     var expiresAt: JValue = .null
     if let ttl {
@@ -404,8 +445,9 @@ public func recordRequest(_ store: any ACEStore, message: ACEMessage, sentAt: In
 /// (09 step 7, R-P22). The record is unchanged on failure; unknown members are kept.
 /// Caller holds lock `requests`.
 public func fillDecision(_ store: any ACEStore, _ m: ParsedMessage) throws {
-    guard let requestId = m.body["requestId"]?.stringValue, let outcome = m.body["outcome"]?.stringValue else {
-        throw ACEError(.invalidArgument, "decision body needs requestId and outcome")
+    guard m.type == .decision, let requestId = m.body["requestId"]?.stringValue, !requestId.isEmpty,
+          let outcome = m.body["outcome"]?.stringValue, outcome == "approve" || outcome == "deny" else {
+        throw ACEError(.invalidArgument, "fillDecision needs a decision with requestId and outcome approve|deny")
     }
     guard let (raw, rec) = try loadRequestObject(store, m.conversationId, requestId) else { return }
     if let d = rec.decision {

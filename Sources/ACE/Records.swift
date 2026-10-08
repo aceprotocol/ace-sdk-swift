@@ -28,12 +28,22 @@ public struct PendingSend: Sendable, Equatable {
     public let status: PendingStatus
     public let stagedAt: Int
     public let message: ACEMessage
+    /// The body `ttl` of a principal `request` (the body is encrypted to the recipient, so the
+    /// Outbox keeps it to write the `requests/` record after delivery). Persisted as
+    /// `requestTtl` only when present (06 Appendix A).
+    public let requestTtl: Int?
 
-    public init(requestId: String, status: PendingStatus, stagedAt: Int, message: ACEMessage) {
+    public init(requestId: String, status: PendingStatus, stagedAt: Int, message: ACEMessage, requestTtl: Int? = nil) {
         self.requestId = requestId
         self.status = status
         self.stagedAt = stagedAt
         self.message = message
+        self.requestTtl = requestTtl
+    }
+
+    /// The same send with another status / message (keeps `requestId`, `stagedAt`, `requestTtl`).
+    func with(status: PendingStatus, message: ACEMessage? = nil) -> PendingSend {
+        PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message ?? self.message, requestTtl: requestTtl)
     }
 
     func jvalue(version: Bool) -> JValue {
@@ -41,6 +51,7 @@ public struct PendingSend: Sendable, Equatable {
             "message": message.jvalue, "requestId": .string(requestId),
             "stagedAt": num(stagedAt), "status": .string(status.rawValue),
         ]
+        if let requestTtl { o["requestTtl"] = num(requestTtl) }
         if version { o["version"] = num(1) }
         return .object(o)
     }
@@ -55,7 +66,13 @@ public struct PendingSend: Sendable, Equatable {
         }
         let message: ACEMessage
         do { message = try decodeEnvelope(value: m) } catch { throw storageError(key, "pending envelope is invalid") }
-        return PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message)
+        var requestTtl: Int?
+        if let t = o["requestTtl"], !t.isNull {
+            guard let n = t.wireInt else { throw storageError(key, "requestTtl must be an integer in [0, 2^53-1]") }
+            guard message.type == .request else { throw storageError(key, "requestTtl belongs to a request only") }
+            requestTtl = n
+        }
+        return PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message, requestTtl: requestTtl)
     }
 }
 

@@ -95,8 +95,12 @@ public struct PullResult: Sendable {
 ///
 /// `onMessage` must persist the host effect durably and idempotently, keyed by
 /// `(from, messageId)`, then return; throwing means "retry later". Commit order per message:
-/// delivery record, thread state, replay state, `onMessage`, ack, cursor. The instance holds
-/// the store's `receive` lock until `close()`.
+/// delivery record, `requests/` decision fill (`decision` only), thread state, replay state,
+/// `onMessage`, ack, cursor. The instance holds the store's `receive` lock until `close()`.
+///
+/// `principal` (09) is the receiver's own principal account and its step-4 authorities. With
+/// neither `selfSigner` nor `trustedSigners`, only an `eip155` account whose address is the
+/// signer's passes; without `principal` every principal-type message is `wrong_principal`.
 public actor Inbox {
     public typealias MessageHandler = @Sendable (ParsedMessage) async throws -> Void
 
@@ -113,6 +117,7 @@ public actor Inbox {
     private let offlineWindow: Int
     private let clock: @Sendable () -> Int
     private let threads: ThreadStore
+    private let principal: InboxPrincipal?
     private let receiveLock: any ACEStoreLock
     private var replay: ReplayDetector
     private var cursors: [String: String]
@@ -122,10 +127,12 @@ public actor Inbox {
     /// `quarantine/` record count, listed once and then maintained (this instance holds
     /// the `receive` lock, so it is the only writer).
     private var quarantineCount: Int?
-    private var heldThreadsLock: (any ACEStoreLock)?
+    /// `threads` or `requests`, kept after a failure until `close()`.
+    private var heldLock: (any ACEStoreLock)?
 
     /// Open the inbox: take the `receive` lock (`receiver_busy` if held), load or create
-    /// `replay.json`, load cursors and run recovery from delivery records.
+    /// `replay.json`, load cursors and run recovery from delivery records. An invalid
+    /// `principal` (non-CAIP-10 account, malformed signer key) is `invalid_argument`.
     public static func open(
         identity: any ACEIdentity,
         store: any ACEStore,
@@ -133,8 +140,10 @@ public actor Inbox {
         onMessage: @escaping MessageHandler,
         capacity: Int = ACELimits.defaultReplayCapacity,
         offlineWindowSeconds: Int = ACELimits.offlineWindowSeconds,
-        clock: @escaping @Sendable () -> Int = systemClock
+        clock: @escaping @Sendable () -> Int = systemClock,
+        principal: InboxPrincipal? = nil
     ) async throws -> Inbox {
+        try principal?.validate()
         guard offlineWindowSeconds >= ACELimits.timestampWindowSeconds, isWireInt(offlineWindowSeconds) else {
             throw ACEError(.invalidArgument, "offlineWindowSeconds must be an integer in [\(ACELimits.timestampWindowSeconds), 2^53-1]")
         }
@@ -148,7 +157,7 @@ public actor Inbox {
                                         offlineWindow: offlineWindowSeconds, clock: clock)
             let cursors = try loadCursors(store)
             inbox = Inbox(identity: identity, store: store, peers: peers, onMessage: onMessage, offlineWindow: offlineWindowSeconds,
-                          clock: clock, threads: threads, lock: lock, replay: replay, cursors: cursors)
+                          clock: clock, threads: threads, principal: principal, lock: lock, replay: replay, cursors: cursors)
         } catch {
             lock.release()
             throw error
@@ -163,7 +172,8 @@ public actor Inbox {
     }
 
     private init(identity: any ACEIdentity, store: any ACEStore, peers: PeerStore, onMessage: @escaping MessageHandler,
-                 offlineWindow: Int, clock: @escaping @Sendable () -> Int, threads: ThreadStore, lock: any ACEStoreLock,
+                 offlineWindow: Int, clock: @escaping @Sendable () -> Int, threads: ThreadStore, principal: InboxPrincipal?,
+                 lock: any ACEStoreLock,
                  replay: ReplayDetector, cursors: [String: String]) {
         self.identity = identity
         self.localAceId = identity.getACEId()
@@ -173,13 +183,14 @@ public actor Inbox {
         self.offlineWindow = offlineWindow
         self.clock = clock
         self.threads = threads
+        self.principal = principal
         self.receiveLock = lock
         self.replay = replay
         self.cursors = cursors
     }
 
     deinit {
-        heldThreadsLock?.release()
+        heldLock?.release()
         if !closed { receiveLock.release() }
     }
 
@@ -187,8 +198,8 @@ public actor Inbox {
     public func close() {
         guard !closed else { return }
         closed = true
-        heldThreadsLock?.release()
-        heldThreadsLock = nil
+        heldLock?.release()
+        heldLock = nil
         receiveLock.release()
     }
 
@@ -252,10 +263,13 @@ public actor Inbox {
         }
     }
 
-    /// Repair thread / replay state from delivery records (by timestamp, key), then hand
-    /// over pending records; the first handler failure throws `handler_failed`.
+    /// Repair thread state, `requests/` decision fills (1a) and replay state from delivery
+    /// records (by timestamp, key), then hand over pending records; the first handler failure
+    /// throws `handler_failed`. A fill that is `bad_reference` / `wrong_principal` (only with a
+    /// corrupted store: step 7 and the fill run under one `requests` lock) fails `open`.
     private func recover() async throws {
         var pending: [(String, DeliveryRecord)] = []
+        var decisions: [ParsedMessage] = []
         var replayChanged = false
         for (key, rec) in try threads.deliveryRecords() {
             let m = rec.message
@@ -266,11 +280,15 @@ public actor Inbox {
             if let snap = rec.thread {
                 try store.withLock("threads") { try threads.repair(from: snap, recordKey: key) }
             }
+            if m.type == .decision { decisions.append(m) }
             if try replay.accepts(m.messageId, from: m.from, timestamp: m.timestamp) {
                 try replay.commit(m.messageId, from: m.from, timestamp: m.timestamp, floor: floor)
                 replayChanged = true
             }
             if rec.status == .pending { pending.append((key, rec)) } else if covered(m) { try store.checkedDelete(key) }
+        }
+        if !decisions.isEmpty {  // 1a: no-op when already filled
+            try store.withLock("requests") { for m in decisions { try fillDecision(store, m) } }
         }
         if replayChanged { try writeReplay(replay) }
         for (key, rec) in pending {
@@ -423,7 +441,7 @@ public actor Inbox {
                                 fingerprint: envelopeFingerprint(env))
         }
         // 3. peer (before taking `threads`)
-        let peer: VerifiedPeer
+        var peer: VerifiedPeer
         do {
             var p = try await peers.resolve(env.from)
             let mine = identity.getEncryptionPublicKey()
@@ -447,16 +465,31 @@ public actor Inbox {
             if stored.status == .pending { return await handOver(stored, key: key) }
             return .duplicate(from: env.from, messageId: env.messageId)
         }
-        // 5–7
+        // 5 (principal types): one refresh of a sender whose pinned principal fails 09 steps
+        // 2-5 (R-P20), before any store lock. Transient → retryable (cursor stays); permanent →
+        // quarantined.
+        if env.type.isPrincipal {
+            do {
+                peer = try await refreshPrincipalSender(env, peer: peer, now: now)
+            } catch let e as ACEError {
+                if e.isTransient { return .retryable(e) }
+                do { return try quarantine(e, env, source) } catch { return .retryable(.wrap(error)) }
+            } catch {
+                return .retryable(ACEError(.relayUnavailable, "peer refresh failed: \(error)"))
+            }
+        }
+        // 5–7: economic types under `threads`; a decision under `requests` from the
+        // open-request check through the requests/ fill (R-P25)
+        let lockName: String? = env.type.isEconomic ? "threads" : env.type == .decision ? "requests" : nil
         let lock: (any ACEStoreLock)?
-        do { lock = env.type.isEconomic ? try store.checkedLock("threads", timeout: ACELimits.defaultLockTimeoutSeconds) : nil } catch {
+        do { lock = try lockName.map { try store.checkedLock($0, timeout: ACELimits.defaultLockTimeoutSeconds) } } catch {
             return .retryable(.wrap(error))
         }
         let committed = parseAndCommit(env, peer: peer, key: key, source: source, now: now)
         if failed, let lock {
-            // Keep `threads` until close so concurrent writers cannot diverge from the
-            // unrepaired history.
-            heldThreadsLock = lock
+            // Keep the lock until close so concurrent writers cannot diverge from the
+            // unrepaired history / ledger.
+            heldLock = lock
         } else {
             lock?.release()
         }
@@ -481,7 +514,7 @@ public actor Inbox {
         case handOver(DeliveryRecord)
     }
 
-    /// Steps 5–7.3 (caller holds `threads` for economic types).
+    /// Steps 5–7.3 (caller holds `threads` for economic types, `requests` for a decision).
     private func parseAndCommit(_ env: ACEMessage, peer: VerifiedPeer, key: String, source: ReceiveSource, now: Int) -> Committed {
         let machine: ThreadStateMachine
         let rec: StoredThread?
@@ -498,7 +531,8 @@ public actor Inbox {
         let tr = replay.clone()
         let parsed: ParsedMessage
         do {
-            parsed = try parseMessage(env, receiver: identity, sender: peer, threads: machine, replay: tr, floor: floor, clock: clock)
+            parsed = try parseMessage(env, receiver: identity, sender: peer, threads: machine, replay: tr, floor: floor, clock: clock,
+                                      principal: principalContext())
             // A verified message that opens a thread counts against the peer's open threads.
             if env.type.isEconomic && rec == nil { try threads.checkCanOpenThread(peer: env.from) }
         } catch let e as ACEError {
@@ -526,6 +560,7 @@ public actor Inbox {
             return .done(.retryable(.wrap(error)))
         }
         do {
+            if parsed.type == .decision { try fillDecision(store, parsed) } // 7.1a: mark the request decided
             if let snap { try threads.write(StoredThread(snapshot: snap, pending: ThreadStore.clearProvenPending(rec, snap))) } // 7.2
             try writeReplay(tr) // 7.3
             replay = tr
@@ -534,6 +569,48 @@ public actor Inbox {
             return .done(.retryable(.wrap(error)))
         }
         return .handOver(delivery)
+    }
+
+    /// Step-7 context. No `refreshSender`: `receiveOne` refreshes the sender before parsing,
+    /// outside the `requests` lock.
+    private func principalContext() -> PrincipalContext? {
+        guard let principal else { return nil }
+        let store = self.store
+        return PrincipalContext(account: principal.account,
+                                openRequestTo: { c, r, now in try openRequestTo(store, conversationId: c, messageId: r, now: now) },
+                                selfSigner: principal.selfSigner, trustedSigners: principal.trustedSigners)
+    }
+
+    /// R-P20 / R-P29 / R-P30 (09 § Same-Account Rules, SDK note): when the pinned sender
+    /// principal fails steps 2-5 and the envelope verifies under the pinned key and scheme,
+    /// refresh the sender from the relay once (rollback barrier) and return the binding the
+    /// rules run on. A transient error propagates (retryable); a permanent error from the relay
+    /// or adopt, no relay, or a refresh that changes the binding leaves the pinned binding to
+    /// decide. A forged envelope triggers no relay call; the pipeline rejects it later.
+    private func refreshPrincipalSender(_ env: ACEMessage, peer: VerifiedPeer, now: Int) async throws -> VerifiedPeer {
+        guard let principal,
+              !senderPrincipalUsable(peer.principal, senderSigningPublicKey: peer.signingPublicKey, principal: principal, now: now),
+              Self.authenticated(env, by: peer) else { return peer }
+        let fresh: VerifiedPeer?
+        do {
+            fresh = try await peers.refresh(peer.aceId)
+        } catch let e as ACEError {
+            if e.isTransient { throw e }
+            return peer
+        } catch {
+            throw ACEError(.relayUnavailable, "peer refresh failed: \(error)")
+        }
+        guard let fresh, fresh.aceId == peer.aceId, fresh.signingPublicKey == peer.signingPublicKey else { return peer }
+        return fresh
+    }
+
+    /// The envelope signature verifies under `peer`'s pinned key and scheme (as parse steps
+    /// 2-4 and 8); malformed signatures are false.
+    private static func authenticated(_ env: ACEMessage, by peer: VerifiedPeer) -> Bool {
+        guard env.from == peer.aceId, env.signature.scheme == peer.scheme,
+              let sig = try? decodeSignature(env.signature.value, scheme: env.signature.scheme, code: .invalidEnvelope),
+              let data = try? messageSignData(env) else { return false }
+        return ACESigning.verify(signData: data, signature: sig, scheme: peer.scheme, publicKey: peer.signingPublicKey)
     }
 
     /// Delete `acked` delivery records covered by a replay horizon (every

@@ -13,7 +13,8 @@ import Foundation
 ///   write (economic: in the thread record; otherwise `outbox/<sha256(requestId)>.json`).
 ///   Staging an existing `requestId` returns the pending send unchanged.
 /// - `deliver(_:transport:)` calls the transport (e.g. `relay.send` or
-///   `deliverDirectOrRelay`); success clears the pending send, `envelope_expired` marks it
+///   `deliverDirectOrRelay`); success records a principal `request` in `requests/` (lock
+///   `requests`; a write failure leaves the send pending) and then clears the pending send, `envelope_expired` marks it
 ///   `expired`, any other error leaves it unchanged. An `expired` send is refused with
 ///   `envelope_expired` before any transport call. A pending send is never abandoned
 ///   automatically.
@@ -145,7 +146,8 @@ public actor Outbox {
             }
             let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
                                         threads: try ThreadStateMachine(localAceId: local), threadId: threadId, timestamp: now)
-            let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env)
+            let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env,
+                                      requestTtl: type == .request ? body["ttl"]?.wireInt : nil)
             try writeOutbox(pending)
             return pending
         }
@@ -168,10 +170,15 @@ public actor Outbox {
         do {
             result = try await transport(message)
         } catch let e as ACEError where e.code == .envelopeExpired {
-            try update(rid, messageId: message.messageId) {
-                PendingSend(requestId: $0.requestId, status: .expired, stagedAt: $0.stagedAt, message: $0.message)
-            }
+            try update(rid, messageId: message.messageId) { $0.with(status: .expired) }
             throw e
+        }
+        if message.type == .request {
+            // 06 § Durable Delivery, Sender: recorded before the pending send is cleared; a failure
+            // here leaves it pending and the retry writes it.
+            try store.withLock("requests") {
+                try recordRequest(store, message: message, sentAt: clock(), ttl: found.0.requestTtl)
+            }
         }
         try update(rid, messageId: message.messageId) { _ in nil }
         return result
@@ -202,7 +209,7 @@ public actor Outbox {
             guard p.status == .expired else { throw ACEError(.invalidArgument, "only an expired pending send can be re-signed") }
             let now = clock()
             let env = try ACE.resign(p.message, sender: identity, timestamp: now)
-            let new = PendingSend(requestId: rid, status: .pending, stagedAt: p.stagedAt, message: env)
+            let new = p.with(status: .pending, message: env)
             guard let rec else {
                 try writeOutbox(new)
                 return new

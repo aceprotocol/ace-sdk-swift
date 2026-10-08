@@ -69,6 +69,15 @@ public actor PeerStore {
         }
     }
 
+    /// Look the peer up on the relay now and adopt it under the rollback barrier; nil without a
+    /// relay. Errors propagate. (`resolve(maxAgeSeconds: 0)` returns a pin fetched in the same
+    /// second, so it is not a forced refresh.) Used by the Inbox's one-shot principal refresh (R-P20).
+    func refresh(_ aceId: String) async throws -> VerifiedPeer? {
+        guard isACEId(aceId) else { throw ACEError(.invalidArgument, "aceId must be an ACE ID") }
+        guard let relay else { return nil }
+        return try adopt(try await relay.lookupPeer(aceId)).peer
+    }
+
     /// Adopt a verified binding under the rollback barrier (lock `peers`).
     @discardableResult
     public func adopt(_ peer: VerifiedPeer) throws -> AdoptResult {

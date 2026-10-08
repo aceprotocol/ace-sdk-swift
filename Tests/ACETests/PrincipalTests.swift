@@ -476,6 +476,525 @@ struct PrincipalTests {
     }
 }
 
+// MARK: - Task 18: step 7 in the pipeline, Inbox principal + decision fill, Outbox request ledger
+
+/// Relay lookups verify principals at the wall clock, so these tests run at it.
+private let T0 = systemClock()
+private let RELAY_URL = "https://relay.example"
+private let ACC = PrincipalTests.ACC
+
+/// Fake `/v1/peer` endpoint: serves `record`, or fails with `status` / a network error.
+final class PeerLookupStub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _record: PeerRecord?
+    private var _status = 200
+    private var _calls = 0
+    var onLookup: (@Sendable () -> Void)?
+
+    var record: PeerRecord? { get { lock.withLock { _record } } set { lock.withLock { _record = newValue } } }
+    /// 200 = serve `record` (404 `unknown_peer` when nil); < 0 = network failure; else that HTTP error.
+    var status: Int { get { lock.withLock { _status } } set { lock.withLock { _status = newValue } } }
+    var calls: Int { lock.withLock { _calls } }
+
+    func client() throws -> RelayClient {
+        try makeRelay({ [self] req, _ in
+            guard req.url?.path == "/v1/peer" else { return .error(404, "not_found") }
+            lock.withLock { _calls += 1 }
+            onLookup?()
+            let (st, rec) = lock.withLock { (_status, _record) }
+            if st < 0 { return StubResponse(status: -1) }
+            if st != 200 { return .error(st, st == 404 ? "unknown_peer" : "relay_unavailable") }
+            guard let rec else { return .error(404, "unknown_peer") }
+            return .json(200, peerRecordJSON(rec))
+        })
+    }
+}
+
+/// Counts held locks by name and audits `requests/` accesses.
+final class AuditStore: ACEStore, @unchecked Sendable {
+    let inner: any ACEStore
+    private let mutex = NSLock()
+    private var held: [String: Int] = [:]
+    private(set) var requestAccesses: [(op: String, underLock: Bool)] = []
+    private(set) var log: [(op: String, key: String)] = []
+    var failWritePrefix: String?
+
+    init(_ inner: any ACEStore) { self.inner = inner }
+
+    func heldCount(_ name: String) -> Int { mutex.withLock { held[name] ?? 0 } }
+    var heldExceptReceive: [String] { mutex.withLock { held.filter { $0.key != "receive" && $0.value > 0 }.map(\.key) } }
+
+    private func audit(_ op: String, _ key: String) {
+        mutex.withLock {
+            log.append((op, key))
+            if key.hasPrefix("requests/") { requestAccesses.append((op, (held["requests"] ?? 0) > 0)) }
+        }
+    }
+
+    func read(_ key: String) throws -> Data? { audit("read", key); return try inner.read(key) }
+    func write(_ key: String, _ value: Data) throws {
+        let fail: Bool = mutex.withLock {
+            if let p = failWritePrefix, key.hasPrefix(p) { failWritePrefix = nil; return true }
+            return false
+        }
+        if fail { throw ACEError(.storageFailed, "injected") }
+        audit("write", key)
+        try inner.write(key, value)
+    }
+    func delete(_ key: String) throws { audit("delete", key); try inner.delete(key) }
+    func list(prefix: String) throws -> [String] { try inner.list(prefix: prefix) }
+    func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
+        let l = try inner.lock(name, timeout: timeout)
+        mutex.withLock { held[name, default: 0] += 1 }
+        return AuditLock(inner: l) { [self] in mutex.withLock { held[name, default: 0] -= 1 } }
+    }
+
+    struct AuditLock: ACEStoreLock {
+        let inner: any ACEStoreLock
+        let onRelease: @Sendable () -> Void
+        func release() { onRelease(); inner.release() }
+    }
+}
+
+@Suite("PrincipalPipeline")
+struct PrincipalPipelineTests {
+    struct Party {
+        let id: SoftwareIdentity
+        let store: any ACEStore
+        let sink = Sink()
+    }
+
+    struct World {
+        let clock: TestClock
+        let owner: SoftwareIdentity
+        let a: Party
+        let b: Party
+        let pa: PrincipalRecord
+        let pb: PrincipalRecord
+    }
+
+    static func rec(_ owner: SoftwareIdentity, _ subject: SoftwareIdentity, roles: [String] = ["controller", "agent"],
+                    account: String = ACC) throws -> PrincipalRecord {
+        try createPrincipalRecord(signer: PrincipalSigner(identity: owner), subjectSigningPublicKey: subject.getSigningPublicKey(),
+                                  account: account, roles: roles, expiresAt: T0 + 3600, issuedAt: T0 - 10)
+    }
+
+    static func key(_ id: SoftwareIdentity) -> PrincipalKey {
+        PrincipalKey(scheme: id.getSigningScheme().rawValue, publicKey: ACEBase64.encode(id.getSigningPublicKey()))
+    }
+
+    static func relayRecord(_ id: SoftwareIdentity, _ profile: AgentProfile, ts: Int = T0) throws -> PeerRecord {
+        let req = try createRegistrationRequest(identity: id, profile: .replace(profile), timestamp: ts)
+        return PeerRecord(aceId: req.aceId, scheme: req.scheme.rawValue, encryptionPublicKey: req.encryptionPublicKey,
+                          signingPublicKey: req.signingPublicKey, registrationSignature: req.signature, registeredAt: ts, profile: profile)
+    }
+
+    static func pin(_ store: any ACEStore, _ clock: TestClock, _ id: SoftwareIdentity, _ principal: PrincipalRecord?, name: String) async throws {
+        let r = try relayRecord(id, AgentProfile(name: name, principal: principal))
+        try await PeerStore(store: store, clock: clock.fn).adopt(try verifyPeerRecord(r, clock: { T0 }))
+    }
+
+    /// a (ed25519) and b (secp256k1) under one owner; each pins the other via a relay record.
+    static func world(rolesA: [String] = ["controller", "agent"], rolesB: [String] = ["agent"], accB: String = ACC,
+                      pinBPrincipal: Bool = true, pinAPrincipal: Bool = true, ownerScheme: SigningScheme = .ed25519,
+                      account: String? = nil, aStore: (any ACEStore)? = nil) async throws -> World {
+        let clock = TestClock(T0)
+        let owner = try SoftwareIdentity.generate(scheme: ownerScheme)
+        let a = Party(id: try SoftwareIdentity.generate(scheme: .ed25519), store: aStore ?? MemoryStore())
+        let b = Party(id: try SoftwareIdentity.generate(scheme: .secp256k1), store: MemoryStore())
+        let pa = try rec(owner, a.id, roles: rolesA, account: account ?? ACC)
+        let pb = try rec(owner, b.id, roles: rolesB, account: account ?? accB)
+        try await pin(a.store, clock, b.id, pinBPrincipal ? pb : nil, name: "b")
+        try await pin(b.store, clock, a.id, pinAPrincipal ? pa : nil, name: "a")
+        return World(clock: clock, owner: owner, a: a, b: b, pa: pa, pb: pb)
+    }
+
+    static func inbox(_ w: World, _ p: Party, store: (any ACEStore)? = nil, relay: RelayClient? = nil,
+                      principal: InboxPrincipal?? = .none) async throws -> Inbox {
+        let s = store ?? p.store
+        let pr: InboxPrincipal? = principal ?? InboxPrincipal(account: ACC, selfSigner: key(w.owner))
+        return try await Inbox.open(identity: p.id, store: s, peers: try PeerStore(store: s, relay: relay, clock: w.clock.fn),
+                                    onMessage: p.sink.handler, clock: w.clock.fn, principal: pr)
+    }
+
+    static func stage(_ w: World, _ from: Party, _ to: Party, _ type: MessageType, _ body: String,
+                      store: (any ACEStore)? = nil) async throws -> (Outbox, PendingSend) {
+        let outbox = try await Outbox.open(identity: from.id, store: store ?? from.store, clock: w.clock.fn)
+        let peer = try #require(try await PeerStore(store: from.store, clock: w.clock.fn).get(to.id.getACEId()))
+        let p = try await outbox.stage(recipient: peer, type: type, body: try JSONValue(json: Data(body.utf8)).objectValue!)
+        return (outbox, p)
+    }
+
+    static func send(_ w: World, _ from: Party, _ to: Party, _ rx: Inbox, _ type: MessageType, _ body: String,
+                     _ n: Int) async throws -> (ReceiveOutcome, PendingSend) {
+        let (outbox, p) = try await stage(w, from, to, type, body)
+        let out = try await outbox.deliver(p.requestId) { env in
+            try await rx.receive(env.jsonData(), source: .relay(url: RELAY_URL, streamId: "\(n)-0"))
+        }
+        return (out, p)
+    }
+
+    static func receive(_ rx: Inbox, _ env: ACEMessage, _ n: Int) async throws -> ReceiveOutcome {
+        try await rx.receive(env.jsonData(), source: .relay(url: RELAY_URL, streamId: "\(n)-0"))
+    }
+
+    static func cursor(_ rx: Inbox) async throws -> String? {
+        await rx.cursor(for: try RelayClient(baseURL: URL(string: RELAY_URL)!))
+    }
+
+    static func request(_ store: any ACEStore, _ p: PendingSend) throws -> RequestRecord? {
+        try loadRequestRecord(store, conversationId: p.message.conversationId, messageId: p.message.messageId)
+    }
+
+    // MARK: parse
+
+    @Test func parseMessageWithoutContextIsWrongPrincipal() async throws {
+        let w = try await Self.world()
+        let peerA = try #require(try await PeerStore(store: w.b.store).get(w.a.id.getACEId()))
+        let env = try createMessage(sender: w.b.id, recipient: peerA, type: .request, body: jsonBody(["action": "pay", "summary": "s"]),
+                                    threads: try ThreadStateMachine(localAceId: w.b.id.getACEId()), timestamp: T0)
+        #expect(env.threadId == nil)
+        let peerB = try #require(try await PeerStore(store: w.a.store).get(w.b.id.getACEId()))
+        func parse(_ ctx: PrincipalContext?) throws -> ParsedMessage {
+            try parseMessage(env, receiver: w.a.id, sender: peerB, threads: try ThreadStateMachine(localAceId: w.a.id.getACEId()),
+                             replay: try ReplayDetector(capacity: 100, horizon: T0 - 100, clock: w.clock.fn), clock: w.clock.fn,
+                             principal: ctx)
+        }
+        expectCode(.wrongPrincipal) { try parse(nil) }
+        expectCode(.wrongPrincipal) { try parse(PrincipalContext(account: ACC)) }  // fail closed: no authority
+        #expect(try parse(PrincipalContext(account: ACC, selfSigner: Self.key(w.owner))).type == .request)
+        // direct callers may plug a one-shot refresh (R-P20)
+        let bare = try verifyPeerRecord(try Self.relayRecord(w.b.id, AgentProfile(name: "b")), clock: { T0 })
+        let calls = Counter()
+        let refreshed = try parseMessage(
+            env, receiver: w.a.id, sender: bare, threads: try ThreadStateMachine(localAceId: w.a.id.getACEId()),
+            replay: try ReplayDetector(capacity: 100, horizon: T0 - 100, clock: w.clock.fn), clock: w.clock.fn,
+            principal: PrincipalContext(account: ACC, selfSigner: Self.key(w.owner), refreshSender: { _ in calls.bump(); return peerB }))
+        #expect(refreshed.type == .request && calls.value == 1)
+    }
+
+    // MARK: round trip, ledger, R-P25
+
+    @Test func requestDecisionRoundTripAndSecondDecision() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a), ib = try await Self.inbox(w, w.b)
+        let (out, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"Pay 1 USDC","ttl":600}"#, 1)
+        guard case .delivered(let m) = out else { Issue.record("\(out)"); return }
+        #expect(m.threadId == nil && w.a.sink.count == 1)
+        let r = try #require(try Self.request(w.b.store, req))
+        #expect(r.decision == nil && r.to == w.a.id.getACEId() && r.expiresAt == req.message.timestamp + 600 && r.sentAt == T0)
+        #expect(try await Outbox.open(identity: w.b.id, store: w.b.store, clock: w.clock.fn).pending().isEmpty)
+        let (d1, p1) = try await Self.send(w, w.a, w.b, ib, .decision,
+                                           #"{"requestId":"\#(req.message.messageId)","outcome":"approve","result":{"tx":"0x1"}}"#, 1)
+        guard case .delivered = d1 else { Issue.record("\(d1)"); return }
+        #expect(w.b.sink.has(p1.message))
+        let filled = try #require(try Self.request(w.b.store, req)?.decision)
+        #expect(filled == RequestDecision(messageId: p1.message.messageId, outcome: "approve", timestamp: p1.message.timestamp))
+        // a second, different decision: bad_reference, record unchanged
+        let (d2, _) = try await Self.send(w, w.a, w.b, ib, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"deny"}"#, 2)
+        guard case .quarantined(let e, _) = d2 else { Issue.record("\(d2)"); return }
+        #expect(e.code == .badReference)
+        #expect(try Self.request(w.b.store, req)?.decision == filled)
+        // the accepted decision again: duplicate, no change
+        #expect(isDuplicate(try await Self.receive(ib, p1.message, 3)))
+        #expect(try Self.request(w.b.store, req)?.decision == filled)
+    }
+
+    @Test func decisionForExpiredOrUnknownRequestIsBadReference() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a), ib = try await Self.inbox(w, w.b)
+        let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s","ttl":10}"#, 1)
+        w.clock.now = T0 + 11
+        let (d, _) = try await Self.send(w, w.a, w.b, ib, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#, 1)
+        #expect(code(d) == .badReference)
+        let (u, _) = try await Self.send(w, w.a, w.b, ib, .decision, #"{"requestId":"00000000-0000-4000-8000-0000000000bb","outcome":"approve"}"#, 2)
+        #expect(code(u) == .badReference)
+    }
+
+    @Test func concurrentDifferentDecisionsAcceptExactlyOne() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a), ib = try await Self.inbox(w, w.b)
+        let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        let (_, p1) = try await Self.stage(w, w.a, w.b, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#)
+        let (_, p2) = try await Self.stage(w, w.a, w.b, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"deny"}"#)
+        async let r1 = Self.receive(ib, p1.message, 1)
+        async let r2 = Self.receive(ib, p2.message, 2)
+        let results = try await [r1, r2]
+        #expect(results.filter(isDelivered).count == 1 && results.filter { code($0) == .badReference }.count == 1)
+        let winner = isDelivered(results[0]) ? p1 : p2
+        #expect(try Self.request(w.b.store, req)?.decision?.messageId == winner.message.messageId)
+    }
+
+    // MARK: wrong principal, Inbox option
+
+    @Test func wrongPrincipalCases() async throws {
+        let w = try await Self.world(rolesA: ["agent"])
+        let ia = try await Self.inbox(w, w.a), ib = try await Self.inbox(w, w.b)
+        let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        let (d, _) = try await Self.send(w, w.a, w.b, ib, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#, 1)
+        #expect(code(d) == .wrongPrincipal)
+        // another account
+        let x = try await Self.world(accB: "eip155:1:0x" + String(repeating: "ab", count: 20))
+        let ix = try await Self.inbox(x, x.a)
+        let (r, _) = try await Self.send(x, x.b, x.a, ix, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 1)
+        #expect(code(r) == .wrongPrincipal)
+        // an Inbox without principal
+        let y = try await Self.world()
+        let none = try await Self.inbox(y, y.a, principal: .some(nil))
+        let (r2, _) = try await Self.send(y, y.b, y.a, none, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 1)
+        #expect(code(r2) == .wrongPrincipal)
+        await none.close()
+    }
+
+    @Test func openValidatesPrincipal() async throws {
+        let y = try await Self.world()
+        let good = Self.key(y.owner)
+        for bad in [
+            InboxPrincipal(account: "nope"),
+            InboxPrincipal(account: ACC, selfSigner: PrincipalKey(scheme: "rsa", publicKey: good.publicKey)),
+            InboxPrincipal(account: ACC, selfSigner: PrincipalKey(scheme: "ed25519", publicKey: "")),
+            InboxPrincipal(account: ACC, selfSigner: PrincipalKey(scheme: "ed25519", publicKey: "AAAA")),
+            InboxPrincipal(account: ACC, selfSigner: PrincipalKey(scheme: "secp256k1", publicKey: good.publicKey)),
+            InboxPrincipal(account: ACC, trustedSigners: [good, PrincipalKey(scheme: "ed25519", publicKey: "!!")]),
+        ] {
+            await expectCodeAsync(.invalidArgument) { try await Self.inbox(y, y.a, principal: .some(bad)) }
+        }
+        // a failed open releases the receive lock
+        await (try await Self.inbox(y, y.a, principal: .some(InboxPrincipal(account: ACC, selfSigner: nil, trustedSigners: [good])))).close()
+    }
+
+    @Test func withoutSelfSignerFailsClosed() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a, principal: .some(InboxPrincipal(account: ACC)))  // solana account, no authority
+        let (r, _) = try await Self.send(w, w.b, w.a, ia, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 1)
+        #expect(code(r) == .wrongPrincipal)
+        await ia.close()
+        let it = try await Self.inbox(w, w.a, principal: .some(InboxPrincipal(account: ACC, trustedSigners: [Self.key(w.owner)])))
+        let (r2, _) = try await Self.send(w, w.b, w.a, it, .report, #"{"action":"pay","summary":"s2","outcome":"ok"}"#, 2)
+        #expect(isDelivered(r2))
+    }
+
+    @Test func eip155AccountPassesWithoutSelfSigner() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .secp256k1)
+        let acc = "eip155:1:" + (try secp256k1Address(owner.getSigningPublicKey()))
+        let clock = TestClock(T0)
+        let a = Party(id: try SoftwareIdentity.generate(scheme: .ed25519), store: MemoryStore())
+        let b = Party(id: try SoftwareIdentity.generate(scheme: .ed25519), store: MemoryStore())
+        try await Self.pin(a.store, clock, b.id, try Self.rec(owner, b.id, account: acc), name: "b")
+        try await Self.pin(b.store, clock, a.id, try Self.rec(owner, a.id, account: acc), name: "a")
+        let w = World(clock: clock, owner: owner, a: a, b: b, pa: try Self.rec(owner, a.id, account: acc), pb: try Self.rec(owner, b.id, account: acc))
+        let ia = try await Self.inbox(w, a, principal: .some(InboxPrincipal(account: acc)))
+        let (r, _) = try await Self.send(w, b, a, ia, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 1)
+        #expect(isDelivered(r))
+    }
+
+    // MARK: R-P20 / R-P29 / R-P30 refresh
+
+    @Test func refreshesPeerOnceThenAccepts() async throws {
+        let w = try await Self.world(pinBPrincipal: false)
+        let stub = PeerLookupStub()
+        stub.record = try Self.relayRecord(w.b.id, AgentProfile(name: "b2", principal: w.pb))
+        let ia = try await Self.inbox(w, w.a, relay: try stub.client())
+        let (r, _) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        #expect(isDelivered(r) && stub.calls == 1)
+        let pinned = try #require(try await PeerStore(store: w.a.store, clock: w.clock.fn).get(w.b.id.getACEId()))
+        #expect(pinned.principal == w.pb && pinned.profile?.name == "b2")
+        let (r2, _) = try await Self.send(w, w.b, w.a, ia, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 2)
+        #expect(isDelivered(r2) && stub.calls == 1)  // pin now valid: no refresh
+    }
+
+    @Test func transientRefreshFailureIsRetryableThenAccepted() async throws {
+        let w = try await Self.world(pinBPrincipal: false)
+        let stub = PeerLookupStub()
+        stub.status = 503
+        let ia = try await Self.inbox(w, w.a, relay: try stub.client())
+        let (_, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s"}"#)
+        let r = try await Self.receive(ia, p.message, 1)
+        guard case .retryable(let e) = r else { Issue.record("\(r)"); return }
+        #expect(e.code == .relayUnavailable && stub.calls == 1)
+        #expect(try await Self.cursor(ia) == nil && w.a.sink.count == 0)
+        stub.status = -1  // network failure
+        let r2 = try await Self.receive(ia, p.message, 1)
+        guard case .retryable = r2 else { Issue.record("\(r2)"); return }
+        #expect(try await Self.cursor(ia) == nil)
+        stub.status = 200
+        stub.record = try Self.relayRecord(w.b.id, AgentProfile(principal: w.pb))
+        let r3 = try await Self.receive(ia, p.message, 1)
+        #expect(isDelivered(r3) && stub.calls == 3)
+        #expect(try await Self.cursor(ia) == "1-0")
+    }
+
+    @Test func wrongPrincipalAfterPermanentOrUselessRefresh() async throws {
+        let w = try await Self.world(pinBPrincipal: false)
+        let stub = PeerLookupStub()
+        stub.status = 404
+        let ia = try await Self.inbox(w, w.a, relay: try stub.client())
+        let (r, _) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        #expect(code(r) == .wrongPrincipal && stub.calls == 1)
+        #expect(try await Self.cursor(ia) == "1-0")
+        stub.status = 200
+        stub.record = try Self.relayRecord(w.b.id, AgentProfile(name: "b"))  // useless: still no principal
+        let (r2, _) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s2"}"#, 2)
+        #expect(code(r2) == .wrongPrincipal && stub.calls == 2)
+        // another account: refreshed once, still another account
+        let x = try await Self.world(accB: "solana:x:other")
+        let stub2 = PeerLookupStub()
+        stub2.record = try Self.relayRecord(x.b.id, AgentProfile(principal: x.pb))
+        let ix = try await Self.inbox(x, x.a, relay: try stub2.client())
+        let (r3, _) = try await Self.send(x, x.b, x.a, ix, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 1)
+        #expect(code(r3) == .wrongPrincipal && stub2.calls == 1)
+    }
+
+    @Test func forgedPrincipalEnvelopeTriggersNoRefresh() async throws {
+        let w = try await Self.world(pinBPrincipal: false)
+        let stub = PeerLookupStub()
+        stub.record = try Self.relayRecord(w.b.id, AgentProfile(principal: w.pb))
+        let ia = try await Self.inbox(w, w.a, relay: try stub.client())
+        let (_, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s"}"#)
+        var o = try JSONValue(json: p.message.jsonData()).objectValue!
+        var sigObj = o["signature"]!.objectValue!
+        var sig = try ACEBase64.decode(sigObj["value"]!.stringValue!)
+        sig[5] ^= 0x01
+        sigObj["value"] = .string(ACEBase64.encode(sig))
+        o["signature"] = .object(sigObj)
+        let r = try await ia.receive(JSONValue.object(o).jsonData(), source: .relay(url: RELAY_URL, streamId: "1-0"))
+        #expect(code(r) == .invalidSignature && stub.calls == 0)
+        let r2 = try await Self.receive(ia, p.message, 2)
+        #expect(isDelivered(r2) && stub.calls == 1)
+    }
+
+    @Test func decisionRefreshRunsWithNoStoreLockHeldAndLedgerUnderRequestsLock() async throws {
+        // b's pin of a lacks the principal: b's Inbox refreshes a before accepting a's decision.
+        let w = try await Self.world(pinAPrincipal: false)
+        let ia = try await Self.inbox(w, w.a)
+        let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        let audit = AuditStore(w.b.store)
+        let stub = PeerLookupStub()
+        stub.record = try Self.relayRecord(w.a.id, AgentProfile(principal: w.pa))
+        let heldAtLookup = LockedBox<[[String]]>([])
+        stub.onLookup = { heldAtLookup.mutate { $0.append(audit.heldExceptReceive) } }
+        let ib = try await Self.inbox(w, w.b, store: audit, relay: try stub.client())
+        let (d, _) = try await Self.send(w, w.a, w.b, ib, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#, 1)
+        #expect(isDelivered(d))
+        #expect(heldAtLookup.value == [[]])
+        let ops = audit.requestAccesses.map(\.op)
+        #expect(ops.contains("read") && ops.contains("write") && audit.requestAccesses.allSatisfy(\.underLock))
+        #expect(try Self.request(w.b.store, req)?.decision != nil)
+    }
+
+    @Test func forgedSecp256k1SignatureIsRejectedNotTrapped() throws {
+        // P256K's recovery traps on an `r` that is no curve x-coordinate; verify must return false.
+        let id = try SoftwareIdentity.generate(scheme: .secp256k1)
+        let data = Data(repeating: 7, count: 32)
+        let sig = try id.sign(data)
+        #expect(ACESigning.verify(signData: data, signature: sig, scheme: .secp256k1, publicKey: id.getSigningPublicKey()))
+        for i in 0..<32 {
+            var bad = sig
+            bad[i] ^= 0x01
+            #expect(!ACESigning.verify(signData: data, signature: bad, scheme: .secp256k1, publicKey: id.getSigningPublicKey()))
+        }
+        var wrongV = sig
+        wrongV[64] ^= 0x01
+        #expect(!ACESigning.verify(signData: data, signature: wrongV, scheme: .secp256k1, publicKey: id.getSigningPublicKey()))
+    }
+
+    // MARK: durability
+
+    @Test func decisionFillRecoveredAfterCrash() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a)
+        let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        let failing = FailingStore()
+        for k in try w.b.store.list(prefix: "") { try failing.inner.write(k, try #require(try w.b.store.read(k))) }
+        let ib = try await Self.inbox(w, w.b, store: failing)
+        let (_, p) = try await Self.stage(w, w.a, w.b, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#)
+        failing.arm(failWrite: 2)  // 1 = delivery record, 2 = requests/ fill
+        let out = try await Self.receive(ib, p.message, 1)
+        guard case .retryable = out else { Issue.record("\(out)"); return }
+        await ib.close()
+        failing.arm(failWrite: nil)
+        #expect(try failing.list(prefix: "deliveries/").count == 1)
+        #expect(try Self.request(failing, req)?.decision == nil && w.b.sink.count == 0)
+        let ib2 = try await Self.inbox(w, w.b, store: failing)  // recovery fills, then hands over
+        let dec = try #require(try Self.request(failing, req)?.decision)
+        #expect(dec.messageId == p.message.messageId && dec.outcome == "approve" && w.b.sink.has(p.message))
+        #expect(isDuplicate(try await Self.receive(ib2, p.message, 1)))
+        await ib2.close()
+        await (try await Self.inbox(w, w.b, store: failing)).close()  // recovery again: same decision is a no-op
+        #expect(try Self.request(failing, req)?.decision == dec)
+    }
+
+    @Test func requestRecordWrittenBeforeAck() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a)
+        let store = AuditStore(w.b.store)
+        store.failWritePrefix = "requests/"
+        let (outbox, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s","ttl":30}"#, store: store)
+        let transport: @Sendable (ACEMessage) async throws -> ReceiveOutcome = { env in try await Self.receive(ia, env, 1) }
+        // transport succeeds, the requests/ write fails: the send stays pending, no record
+        await expectCodeAsync(.storageFailed) { try await outbox.deliver(p.requestId, transport: transport) }
+        #expect(try Self.request(w.b.store, p) == nil)
+        #expect(try await outbox.pending().map(\.requestId) == [p.requestId])
+        // restart keeps the ttl; the retry writes the record, then clears the send
+        let outbox2 = try await Outbox.open(identity: w.b.id, store: store, clock: w.clock.fn)
+        #expect(try await outbox2.pending().first?.requestTtl == 30)
+        let res = try await outbox2.deliver(p.requestId, transport: transport)
+        #expect(isDuplicate(res))
+        let r = try #require(try Self.request(w.b.store, p))
+        #expect(r.to == w.a.id.getACEId() && r.expiresAt == p.message.timestamp + 30 && r.sentAt == T0)
+        let log = store.log
+        let iReq = try #require(log.firstIndex { $0.op == "write" && $0.key == requestKey(p.message.conversationId, p.message.messageId) })
+        let iDel = try #require(log.firstIndex { $0.op == "delete" && $0.key.hasPrefix("outbox/") })
+        #expect(iReq < iDel)
+        #expect(try await outbox2.pending().isEmpty)
+    }
+
+    @Test func requestTtlSurvivesResign() async throws {
+        let w = try await Self.world()
+        let (outbox, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s","ttl":30}"#)
+        await expectCodeAsync(.envelopeExpired) {
+            try await outbox.deliver(p.requestId) { _ -> Int in throw ACEError(.envelopeExpired, "x") }
+        }
+        #expect(try await outbox.pending().first?.requestTtl == 30)
+        w.clock.now = T0 + 50
+        let q = try await outbox.resign(p.requestId)
+        #expect(q.requestTtl == 30 && q.jvalue(version: true).objectValue?["requestTtl"] == .number("30"))
+        try await outbox.deliver(p.requestId) { _ in 0 }
+        #expect(try Self.request(w.b.store, p)?.expiresAt == T0 + 50 + 30)
+    }
+
+    @Test func pendingRequestTtlNormalizedAndTyped() async throws {
+        let w = try await Self.world()
+        let (outbox, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s","ttl":30.0}"#)
+        #expect(p.requestTtl == 30)
+        var o = p.jvalue(version: true).objectValue!
+        #expect(o["requestTtl"] == .number("30"))
+        o["requestTtl"] = .number("30.0")
+        #expect(try PendingSend.parse(.object(o), key: "k", versioned: true).requestTtl == 30)
+        o["requestTtl"] = .null
+        #expect(try PendingSend.parse(.object(o), key: "k", versioned: true).requestTtl == nil)
+        for bad: JValue in [.number("-1"), .string("30"), .bool(true), .number("1.5")] {
+            o["requestTtl"] = bad
+            expectCode(.storageFailed) { try PendingSend.parse(.object(o), key: "k", versioned: true) }
+        }
+        let (_, t) = try await Self.stage(w, w.b, w.a, .report, #"{"action":"pay","summary":"s","outcome":"ok","ttl":5}"#)
+        var to = t.jvalue(version: true).objectValue!
+        #expect(t.requestTtl == nil && to["requestTtl"] == nil)
+        to["requestTtl"] = .number("30")
+        expectCode(.storageFailed) { try PendingSend.parse(.object(to), key: "k", versioned: true) }
+        _ = outbox
+    }
+}
+
+/// A lock-protected value for `@Sendable` callbacks.
+final class LockedBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: T
+    init(_ v: T) { self.v = v }
+    var value: T { lock.withLock { v } }
+    func mutate(_ f: (inout T) -> Void) { lock.withLock { f(&v) } }
+}
+
 final class Counter: @unchecked Sendable {
     private let lock = NSLock()
     private var n = 0

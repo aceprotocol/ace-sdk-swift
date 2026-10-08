@@ -142,8 +142,16 @@ enum ACESigning {
         guard r.contains(where: { $0 != 0 }), compareBE(r, secpN) < 0 else { return false }
         guard s.contains(where: { $0 != 0 }), compareBE(s, secpHalfN) <= 0 else { return false }
         do {
+            // Plain verification under the expected key first: P256K's recovery initializer
+            // traps (fatalError) when `r` is not the x-coordinate of a curve point, so a forged
+            // signature must never reach it. A signature valid here always recovers.
+            let digest = HashDigest([UInt8](signData))
+            let expected = try P256K.Signing.PublicKey(dataRepresentation: publicKey, format: .compressed)
+            guard expected.isValidSignature(try P256K.Signing.ECDSASignature(compactRepresentation: r + s), for: digest) else {
+                return false
+            }
             let rs = try P256K.Recovery.ECDSASignature(compactRepresentation: r + s, recoveryId: Int32(v))
-            let recovered = P256K.Recovery.PublicKey(HashDigest([UInt8](signData)), signature: rs)
+            let recovered = P256K.Recovery.PublicKey(digest, signature: rs)
             return constantTimeEqual(Data(recovered.dataRepresentation), publicKey)
         } catch {
             return false
