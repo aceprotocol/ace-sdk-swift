@@ -55,6 +55,14 @@ struct PrincipalTests {
                                   account: account, roles: roles, expiresAt: expiresAt, scope: scope, issuedAt: issuedAt)
     }
 
+    /// A registration file carrying a principal pinned to the fixed `NOW` clock. `createRegistrationFile`
+    /// validates a principal at the real now (R-P44), so it is attached after creation.
+    func regFile(_ id: SoftwareIdentity, _ principal: PrincipalRecord) throws -> RegistrationFile {
+        var reg = try createRegistrationFile(for: id, name: "M", endpoint: "https://m.example/ace")
+        reg.principal = principal
+        return reg
+    }
+
     func key(_ id: SoftwareIdentity) -> PrincipalKey {
         PrincipalKey(scheme: id.getSigningScheme().rawValue, publicKey: ACEBase64.encode(id.getSigningPublicKey()))
     }
@@ -365,7 +373,7 @@ struct PrincipalTests {
                                 signingPublicKey: fbase.signingPublicKey, registrationSignature: fbase.registrationSignature,
                                 registeredAt: fbase.registeredAt, profile: AgentProfile(name: "A", principal: try rec(owner, other, expiresAt: Self.NOW + 50)))
         expectCode(.invalidPrincipal) { try verifyPeerRecord(forged, clock: { Self.NOW + 50 }) }
-        let ereg = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: try rec(owner, me, expiresAt: Self.NOW + 50))
+        let ereg = try regFile(me, try rec(owner, me, expiresAt: Self.NOW + 50))
         #expect(try verifyRegistrationFile(ereg, pinnedAt: Self.NOW, clock: { Self.NOW + 50 }).profile == nil)
         var wrong = ereg
         wrong.principal = try rec(owner, other, expiresAt: Self.NOW + 50)
@@ -379,7 +387,7 @@ struct PrincipalTests {
                                  signingPublicKey: base.signingPublicKey, registrationSignature: base.registrationSignature,
                                  registeredAt: base.registeredAt, profile: AgentProfile(name: "A", principal: try rec(owner, other)))
         expectCode(.invalidPrincipal) { try verifyPeerRecord(swapped, clock: { Self.NOW }) }
-        let reg = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: try rec(owner, me))
+        let reg = try regFile(me, try rec(owner, me))
         let peer = try verifyRegistrationFile(reg, pinnedAt: Self.NOW, clock: { Self.NOW })
         #expect(peer.profile == AgentProfile(principal: reg.principal))
         let wire = try JSONValue(json: try JSONEncoder().encode(reg))
@@ -401,8 +409,7 @@ struct PrincipalTests {
         let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
         let store = MemoryStore(), clock = TestClock(Self.NOW)
         let peers = try PeerStore(store: store, clock: clock.fn)
-        try await peers.pinRegistrationFile(try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace",
-                                                                      principal: try rec(owner, me, expiresAt: Self.NOW + 5)), pinnedAt: 1)
+        try await peers.pinRegistrationFile(try regFile(me, try rec(owner, me, expiresAt: Self.NOW + 5)), pinnedAt: 1)
         let key = PinnedPeer.key(me.getACEId())
         var o = try JSONValue(json: try #require(try store.read(key))).objectValue!
         o["fetchedAt"] = .number(Double(Self.NOW + 100))
@@ -438,12 +445,12 @@ struct PrincipalTests {
         var kept = try await peers.pinRegistrationFile(bare, pinnedAt: Self.NOW)
         #expect(kept.principal == cached && kept.profile?.name == "Rel" && kept.profile?.tags == ["x"])
         // older issuedAt: keeps the cached one
-        let older = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: try rec(owner, me, issuedAt: Self.NOW - 20))
+        let older = try regFile(me, try rec(owner, me, issuedAt: Self.NOW - 20))
         kept = try await peers.pinRegistrationFile(older, pinnedAt: Self.NOW)
         #expect(kept.principal == cached)
         // newer issuedAt: replaces
         let newer = try rec(owner, me, issuedAt: Self.NOW + 50)
-        let reg = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace", principal: newer)
+        let reg = try regFile(me, newer)
         clock.now = Self.NOW + 60
         kept = try await peers.pinRegistrationFile(reg, pinnedAt: Self.NOW)
         #expect(kept.principal == newer && kept.profile?.name == "Rel")
@@ -500,6 +507,51 @@ struct PrincipalTests {
         // newer relay record without principal clears it
         try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "W"), ts: Self.NOW + 80), clock: clock.fn))
         #expect(try await peers.get(me.getACEId())?.principal == nil)
+    }
+
+    @Test func olderRelayCandidateDropsExpiredCachedPrincipal() async throws {
+        // R-P35: an older relay record keeps the cached profile, minus a principal expired at now.
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519)
+        let me = try SoftwareIdentity.generate(scheme: .ed25519), solo = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW + 60)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "New", principal: try rec(owner, me, expiresAt: Self.NOW + 100)),
+                                                              ts: Self.NOW + 50), clock: clock.fn))
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(solo, AgentProfile(principal: try rec(owner, solo, expiresAt: Self.NOW + 100)),
+                                                              ts: Self.NOW + 50), clock: clock.fn))
+        clock.now = Self.NOW + 200
+        let a = try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "Old"), ts: Self.NOW + 40), clock: clock.fn)).peer
+        #expect(a.principal == nil && a.profile?.name == "New" && a.registeredAt == Self.NOW + 50)
+        let b = try await peers.adopt(try verifyPeerRecord(try peerRecord(solo, AgentProfile(name: "Old"), ts: Self.NOW + 40), clock: clock.fn)).peer
+        #expect(b.profile == nil)
+        let raw = try JSONParser.parse(try #require(try store.read(PinnedPeer.key(me.getACEId()))))
+        #expect(raw["profile"]?["principal"] == nil)
+        let reloaded = try PeerStore(store: store, clock: clock.fn)
+        let p = try #require(try await reloaded.get(me.getACEId()))
+        #expect(p.principal == nil && p.profile?.name == "New")
+        let q = try #require(try await reloaded.get(solo.getACEId()))
+        #expect(q.profile == nil)
+    }
+
+    @Test func profileTextChecksRunBeforePrincipalParse() throws {
+        // R-P45: a bad member is invalid_profile even when the principal is malformed too.
+        let long = String(repeating: "n", count: 65)
+        let v = try JSONParser.parse(Data(#"{"name":"\#(long)","principal":5}"#.utf8))
+        expectCode(.invalidProfile) { try AgentProfile.parse(v) }
+        expectCode(.invalidPrincipal) { try AgentProfile.parse(try JSONParser.parse(Data(#"{"name":"ok","principal":5}"#.utf8))) }
+    }
+
+    @Test func createRegistrationFileValidatesPrincipalAtRealNow() throws {
+        // R-P44: validated at the wall clock, not at the principal's issuedAt.
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
+        let now = systemClock()
+        func make(_ issuedAt: Int, _ expiresAt: Int) throws -> RegistrationFile {
+            try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace",
+                                       principal: try rec(owner, me, expiresAt: expiresAt, issuedAt: issuedAt))
+        }
+        expectCode(.invalidPrincipal) { try make(now - 100, now - 1) }  // expired
+        expectCode(.invalidPrincipal) { try make(now + 3600, now + 7200) }  // future-dated
+        #expect(try make(now - 10, now + 3600).principal != nil)
     }
 
     @Test func discoverQueryAccount() {
@@ -694,14 +746,6 @@ struct PrincipalPipelineTests {
         expectCode(.wrongPrincipal) { try parse(nil) }
         expectCode(.wrongPrincipal) { try parse(PrincipalContext(account: ACC)) }  // fail closed: no authority
         #expect(try parse(PrincipalContext(account: ACC, selfSigner: Self.key(w.owner))).type == .request)
-        // direct callers may plug a one-shot refresh (R-P20)
-        let bare = try verifyPeerRecord(try Self.relayRecord(w.b.id, AgentProfile(name: "b")), clock: { T0 })
-        let calls = Counter()
-        let refreshed = try parseMessage(
-            env, receiver: w.a.id, sender: bare, threads: try ThreadStateMachine(localAceId: w.a.id.getACEId()),
-            replay: try ReplayDetector(capacity: 100, horizon: T0 - 100, clock: w.clock.fn), clock: w.clock.fn,
-            principal: PrincipalContext(account: ACC, selfSigner: Self.key(w.owner), refreshSender: { _ in calls.bump(); return peerB }))
-        #expect(refreshed.type == .request && calls.value == 1)
     }
 
     // MARK: round trip, ledger, R-P25

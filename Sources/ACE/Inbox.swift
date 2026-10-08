@@ -468,14 +468,14 @@ public actor Inbox {
             return .duplicate(from: env.from, messageId: env.messageId)
         }
         // 5 (principal types): one refresh of a sender whose pinned principal fails 09 steps
-        // 2-5 (R-P20), before any store lock. Transient → retryable (cursor stays); permanent →
-        // quarantined.
+        // 2-5 (R-P20), before any store lock. It throws only transient errors → retryable (cursor
+        // stays); a permanent failure keeps the pinned binding, and the rules may then raise
+        // `wrong_principal`.
         if env.type.isPrincipal {
             do {
                 peer = try await refreshPrincipalSender(env, peer: peer, now: now)
             } catch let e as ACEError {
-                if e.isTransient { return .retryable(e) }
-                do { return try quarantine(e, env, source) } catch { return .retryable(.wrap(error)) }
+                return .retryable(e)
             } catch {
                 return .retryable(ACEError(.relayUnavailable, "peer refresh failed: \(error)"))
             }
@@ -576,8 +576,8 @@ public actor Inbox {
         return .handOver(delivery)
     }
 
-    /// Step-7 context. No `refreshSender`: `receiveOne` refreshes the sender before parsing,
-    /// outside the `requests` lock.
+    /// Step-7 context. `receiveOne` refreshes the sender before parsing, outside the
+    /// `requests` lock.
     private func principalContext() -> PrincipalContext? {
         guard let principal else { return nil }
         let store = self.store
@@ -589,9 +589,11 @@ public actor Inbox {
     /// R-P20 / R-P29 / R-P30 (09 § Same-Account Rules, SDK note): when the pinned sender
     /// principal fails steps 2-5 and the envelope verifies under the pinned key and scheme,
     /// refresh the sender from the relay once (rollback barrier) and return the binding the
-    /// rules run on. A transient error propagates (retryable); a permanent error from the relay
-    /// or adopt, no relay, or a refresh that changes the binding leaves the pinned binding to
-    /// decide. A forged envelope triggers no relay call; the pipeline rejects it later.
+    /// rules run on. Only a transient error propagates (retryable); a permanent error from the
+    /// relay or adopt, or no relay, leaves the pinned binding to decide. The refreshed binding is
+    /// adopted as is, including an encryption-key rotation; its signing key cannot differ (the
+    /// ACE ID is the hash of the signing key). A forged envelope triggers no relay call; the
+    /// pipeline rejects it later.
     private func refreshPrincipalSender(_ env: ACEMessage, peer: VerifiedPeer, now: Int) async throws -> VerifiedPeer {
         guard let principal,
               !senderPrincipalUsable(peer.principal, senderSigningPublicKey: peer.signingPublicKey, principal: principal, now: now),
@@ -606,7 +608,8 @@ public actor Inbox {
         } catch {
             throw ACEError(.relayUnavailable, "peer refresh failed: \(error)")
         }
-        guard let fresh, fresh.aceId == peer.aceId, fresh.signingPublicKey == peer.signingPublicKey else { return peer }
+        guard let fresh, fresh.aceId == peer.aceId else { return peer }
+        assert(fresh.signingPublicKey == peer.signingPublicKey, "ACE ID binds the signing key")
         return fresh
     }
 

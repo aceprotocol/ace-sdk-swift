@@ -271,21 +271,10 @@ public func parseMessage(
                          type: env.type, threadId: env.threadId, timestamp: env.timestamp, body: body)
 }
 
-/// 06 step 7 for principal types (09 § Same-Account Rules). When the pinned sender principal
-/// fails steps 2-5 and `context.refreshSender` is set, the sender's binding is refreshed once
-/// (R-P20) before the rules run; a refresh returning nil or another binding leaves the pinned
-/// binding to decide. The `Inbox` refreshes before parsing instead (outside any store lock) and
-/// leaves `refreshSender` nil.
+/// 06 step 7 for principal types (09 § Same-Account Rules), against the sender binding as given.
+/// The `Inbox` refreshes a stale sender once before parsing (R-P20, outside any store lock).
 private func checkPrincipal(_ env: ACEMessage, body: [String: JSONValue], sender: VerifiedPeer,
                             context: PrincipalContext?, now: Int) throws {
-    var sender = sender
-    if let context, let refresh = context.refreshSender,
-       !senderPrincipalUsable(sender.principal, senderSigningPublicKey: sender.signingPublicKey,
-                              principal: context.inboxPrincipal, now: now),
-       let fresh = try refresh(sender.aceId),
-       fresh.aceId == sender.aceId, fresh.signingPublicKey == sender.signingPublicKey {
-        sender = fresh
-    }
     try checkPrincipalRules(
         type: env.type, body: body, conversationId: env.conversationId, senderPrincipal: sender.principal,
         senderSigningPublicKey: sender.signingPublicKey, selfAccount: context?.account,

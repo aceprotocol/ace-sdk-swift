@@ -83,7 +83,9 @@ private func optObject(_ o: [String: JValue], _ key: String, _ code: ACEError.Co
 
 extension AgentProfile {
     /// Parse the wire shape; type errors are `invalid_profile`. Unknown top-level fields
-    /// are dropped; `pricing` may contain only `currency` and `maxAmount`.
+    /// are dropped; `pricing` may contain only `currency` and `maxAmount`. The other members'
+    /// `validateProfile` checks run before `principal` is parsed (08 order, R-P45), so a bad
+    /// member is `invalid_profile` even when the principal is malformed too.
     static func parse(_ v: JValue) throws -> AgentProfile {
         let code = ACEError.Code.invalidProfile
         guard let o = v.objectValue else { throw ACEError(code, "profile must be a JSON object") }
@@ -96,7 +98,7 @@ extension AgentProfile {
                 maxAmount: try optString(p, "maxAmount", code, "profile.pricing")
             )
         }
-        return AgentProfile(
+        var profile = AgentProfile(
             name: try optString(o, "name", code, "profile"),
             description: try optString(o, "description", code, "profile"),
             image: try optString(o, "image", code, "profile"),
@@ -104,9 +106,11 @@ extension AgentProfile {
             capabilities: try optStringList(o, "capabilities", code, "profile"),
             chains: try optStringList(o, "chains", code, "profile"),
             endpoint: try optString(o, "endpoint", code, "profile"),
-            pricing: pricing,
-            principal: try o["principal"].flatMap { $0.isNull ? nil : try PrincipalRecord.parse($0) }
+            pricing: pricing
         )
+        try validateProfile(profile)
+        profile.principal = try o["principal"].flatMap { $0.isNull ? nil : try PrincipalRecord.parse($0) }
+        return profile
     }
 
     var jvalue: JValue {
@@ -373,10 +377,15 @@ private func supersedes(_ new: PrincipalRecord, _ old: PrincipalRecord) -> Bool 
 }
 
 /// Profile a signed (relay) candidate leaves in the pin (R-P36): an older `registeredAt` keeps the
-/// cached profile; otherwise the candidate's replaces it, a principal only per `supersedes`, and a
-/// candidate without one withdraws it (an expired cached principal is dropped first, R-P35).
+/// cached profile (minus a cached principal expired at `now`, R-P35); otherwise the candidate's
+/// replaces it, a principal only per `supersedes`, and a candidate without one withdraws it (an
+/// expired cached principal is dropped first, R-P35).
 private func relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: Int) -> AgentProfile? {
-    guard candidate.registeredAt >= pin.registeredAt else { return pin.profile }
+    guard candidate.registeredAt >= pin.registeredAt else {
+        guard var kept = pin.profile, let old = kept.principal, old.expiresAt <= now else { return pin.profile }
+        kept.principal = nil
+        return kept == AgentProfile() ? nil : kept
+    }
     guard var p = candidate.profile else { return nil }
     if let new = p.principal, let old = pin.profile?.principal, old.expiresAt > now, !supersedes(new, old) {
         p.principal = old

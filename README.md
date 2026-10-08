@@ -166,13 +166,20 @@ let checked = try validatePrincipalRecord(record, subjectSigningPublicKey: agent
 - **Fail closed.** `Inbox.open(…, principal: nil)` (the default) rejects every `request`, `decision` and `report` with `wrong_principal`. Pass `principal: InboxPrincipal(account:selfSigner:trustedSigners:)` to accept them from senders whose valid record names the same account and whose signer is an authority of it (the receiver's own `selfSigner`, a host-supplied trusted signer, or for `eip155` accounts the key deriving the account address).
 - **Message types.** `request` (`action`, `summary`, optional `details`, `ttl`), `decision` (`requestId`, `outcome` approve or deny) and `report`. They are not thread-state messages, so `threadId` is optional.
 - **Request ledger.** Delivering a `request` writes `requests/<sha256(conversationId ‖ 0x00 ‖ messageId)>.json`; an accepted `decision` marks it decided. Only the request's addressee may decide it, a request expires at `timestamp + ttl`, and a second different decision is `bad_reference`. Read an entry with `loadRequestRecord(store, conversationId:messageId:)`.
-- **Refresh and retry.** If a sender's pinned principal fails the rules, the inbox looks the sender up on the relay once and re-checks. A transient relay failure makes the delivery retryable (the cursor does not advance); a permanent one keeps the pinned binding, and the message fails with `wrong_principal`.
+- **Refresh and retry.** If a sender's pinned principal fails the rules, the inbox looks the sender up on the relay once and re-checks. A transient relay failure makes the delivery retryable (the cursor does not advance); a permanent one keeps the pinned binding, and the rules may then fail the message with `wrong_principal`. A refreshed binding is adopted as is, including an encryption-key rotation.
 
 ## Persistence
 
 All pipeline state lives in the `ACEStore` under the keys of 06-security Appendix A (`replay.json`, `cursors.json`, `threads/`, `outbox/`, `deliveries/`, `quarantine/`, `peers/`, `requests/`). Records are compact JSON with sorted keys; `replay.json` is byte-identical across the TS, Python and Swift SDKs. `FileStore` writes atomically (temp file, fsync, rename) with 0600 files and 0700 directories, and uses `locks/<name>.lock` files for cross-process exclusion.
 
-Upgrading to 0.3.0: a principal `request` staged by an earlier version has no `requestTtl` in its pending send (the body `ttl` is encrypted to the recipient and cannot be recovered), so if it is delivered after the upgrade its `requests/` record gets `expiresAt: null` (the request never expires; a decision is accepted until one is recorded). Abandon and re-stage such a send to keep its `ttl`.
+## 0.3.0 breaking changes
+
+- **Registration signatures.** A registration carrying a profile signs a `replace` group of 19 profile and principal fields, so 0.2.0 and 0.3.0 registrations do not verify across relay versions: SoulPass iOS/CLI and the relay must move in lockstep (D15).
+- **Exhaustive switches.** `MessageType` gains `request`, `decision` and `report`, and `ACEError.Code` gains `invalidPrincipal` and `wrongPrincipal`; an exhaustive `switch` over either stops compiling until the new cases are handled.
+- **Requests go through the outbox.** A `request` must be staged and sent through the `Outbox` (`stage`, then `deliver`) to get its `requests/` ledger entry; a bare `createMessage` + `relay.send` writes none, so every decision to it is `bad_reference`.
+- **`selfSigner` is host-supplied.** The SDK does not derive the receiver's own authority key: pass `InboxPrincipal(selfSigner:)` explicitly, usually the signer of the host's own principal record (nil means no own-key authority).
+- **Registration files.** `createRegistrationFile(principal:)` validates the principal at the wall clock; an expired or future-dated one is `invalid_principal`.
+- **Pre-release builds of this branch.** A principal `request` staged by a pre-release build has no `requestTtl` in its pending send (the body `ttl` is encrypted to the recipient and cannot be recovered), so if it is delivered after the upgrade its `requests/` record gets `expiresAt: null` (the request never expires; a decision is accepted until one is recorded). Abandon and re-stage such a send to keep its `ttl`.
 
 ## Encryption
 

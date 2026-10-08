@@ -174,7 +174,10 @@ public func createRegistrationFile(
         chains: chains,
         principal: principal
     )
-    // Verified at the principal's own issuedAt so a fresh record never trips the future-dated rule.
-    _ = try verifyRegistrationFile(reg, pinnedAt: 0, clock: { principal?.issuedAt ?? systemClock() })
+    // R-P44: a file being published must carry a principal valid at the real now: an expired or
+    // future-dated one is `invalid_principal` (no issuedAt-relative clock, no expired-only drop).
+    let now = systemClock()
+    if let principal { try validatePrincipalRecord(principal, subjectSigningPublicKey: signingPublicKey, now: now) }
+    _ = try verifyRegistrationFile(reg, pinnedAt: 0, clock: { now })
     return reg
 }

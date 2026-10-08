@@ -270,27 +270,20 @@ public struct InboxPrincipal: Sendable, Equatable {
 /// The receiver's context for 06 step 7 (`parseMessage(principal:)`): its principal `account`,
 /// the step-4 authorities (`selfSigner`, `trustedSigners`, see `InboxPrincipal`), the open-request
 /// lookup for step 7 (`openRequestTo(conversationId, requestId, now)` → the request's `to`, or nil;
-/// bind `openRequestTo(_:conversationId:messageId:now:)` to a store) and an optional one-shot
-/// sender refresh (`refreshSender(aceId)` → a freshly adopted binding or nil, R-P20).
+/// the `Inbox` binds it to its store's `requests/` ledger). The sender binding is used as given:
+/// refreshing a stale sender is the `Inbox`'s job (R-P20, R-P43).
 public struct PrincipalContext: Sendable {
     public let account: String
     public let openRequestTo: (@Sendable (String, String, Int) throws -> String?)?
     public let selfSigner: PrincipalKey?
     public let trustedSigners: Set<PrincipalKey>
-    public let refreshSender: (@Sendable (String) throws -> VerifiedPeer?)?
 
     public init(account: String, openRequestTo: (@Sendable (String, String, Int) throws -> String?)? = nil,
-                selfSigner: PrincipalKey? = nil, trustedSigners: Set<PrincipalKey> = [],
-                refreshSender: (@Sendable (String) throws -> VerifiedPeer?)? = nil) {
+                selfSigner: PrincipalKey? = nil, trustedSigners: Set<PrincipalKey> = []) {
         self.account = account
         self.openRequestTo = openRequestTo
         self.selfSigner = selfSigner
         self.trustedSigners = trustedSigners
-        self.refreshSender = refreshSender
-    }
-
-    var inboxPrincipal: InboxPrincipal {
-        InboxPrincipal(account: account, selfSigner: selfSigner, trustedSigners: trustedSigners)
     }
 }
 
@@ -423,8 +416,8 @@ public func loadRequestRecord(_ store: any ACEStore, conversationId: String, mes
 }
 
 /// The `to` of a sent, undecided, unexpired request (expired when `timestamp + ttl < now`), else
-/// nil (09 § Same-Account Rules step 7). Bind `store` to get `checkPrincipalRules`' `openRequestTo`.
-public func openRequestTo(_ store: any ACEStore, conversationId: String, messageId: String, now: Int) throws -> String? {
+/// nil (09 § Same-Account Rules step 7). Internal (R-P46): the `Inbox` binds it to its store.
+func openRequestTo(_ store: any ACEStore, conversationId: String, messageId: String, now: Int) throws -> String? {
     guard let r = try loadRequestRecord(store, conversationId: conversationId, messageId: messageId),
           r.decision == nil else { return nil }
     if let e = r.expiresAt, now > e { return nil }
