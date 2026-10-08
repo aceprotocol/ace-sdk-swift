@@ -896,6 +896,66 @@ struct PrincipalPipelineTests {
         var wrongV = sig
         wrongV[64] ^= 0x01
         #expect(!ACESigning.verify(signData: data, signature: wrongV, scheme: .secp256k1, publicKey: id.getSigningPublicKey()))
+        // deterministic: r = 5 is in range but 5^3 + 7 is a non-residue mod p (no curve point)
+        for v: UInt8 in [0, 1] {
+            var offCurve = Data(repeating: 0, count: 65)
+            offCurve[31] = 5
+            offCurve[63] = 1
+            offCurve[64] = v
+            #expect(!ACESigning.verify(signData: data, signature: offCurve, scheme: .secp256k1, publicKey: id.getSigningPublicKey()))
+        }
+    }
+
+    @Test func failureDuringSuspendedRefreshCommitsNothingAndLeaksNoLock() async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a)
+        let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        // c: same owner and account; b's pin of c lacks the principal, so c's report refreshes c.
+        let c = Party(id: try SoftwareIdentity.generate(scheme: .ed25519), store: MemoryStore())
+        let pc = try Self.rec(w.owner, c.id)
+        try await Self.pin(c.store, w.clock, w.b.id, w.pb, name: "b")
+        let failing = FailingStore()
+        for k in try w.b.store.list(prefix: "") { try failing.inner.write(k, try #require(try w.b.store.read(k))) }
+        try await Self.pin(failing, w.clock, c.id, nil, name: "c")
+        let stub = PeerLookupStub()
+        stub.record = try Self.relayRecord(c.id, AgentProfile(principal: pc))
+        let started = LockedBox(false), gate = DispatchSemaphore(value: 0)
+        stub.onLookup = { started.mutate { $0 = true }; gate.wait() }
+        let ib = try await Self.inbox(w, w.b, store: failing, relay: try stub.client())
+        let (_, report) = try await Self.stage(w, c, w.b, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#)
+        let (_, dec) = try await Self.stage(w, w.a, w.b, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#)
+        let pending = Task { try await Self.receive(ib, report.message, 2) }
+        while !started.value { try await Task.sleep(nanoseconds: 1_000_000) }  // report suspended in its refresh
+        failing.arm(failWrite: 2)  // the decision: 1 = delivery record, 2 = requests/ fill → failed, `requests` kept
+        let d = try await Self.receive(ib, dec.message, 1)
+        guard case .retryable = d else { Issue.record("\(d)"); gate.signal(); return }
+        gate.signal()
+        let p = try await pending.value
+        guard case .retryable = p else { Issue.record("report committed after failure: \(p)"); return }
+        failing.arm(failWrite: nil)
+        #expect(try failing.read(DeliveryRecord.key(from: c.id.getACEId(), messageId: report.message.messageId)) == nil)
+        #expect(w.b.sink.count == 0 && stub.calls == 1)
+        await ib.close()
+        for name in ["threads", "requests", "receive"] { try failing.lock(name, timeout: 0).release() }
+        // a fresh Inbox recovers the decision fill
+        await (try await Self.inbox(w, w.b, store: failing)).close()
+        #expect(try Self.request(failing, req)?.decision?.messageId == dec.message.messageId)
+    }
+
+    @Test func replayedOrStaleEnvelopeMakesNoRefreshCall() async throws {
+        let w = try await Self.world(pinBPrincipal: false)
+        let stub = PeerLookupStub()
+        stub.record = try Self.relayRecord(w.b.id, AgentProfile(name: "b"))  // useless refresh
+        let ia = try await Self.inbox(w, w.a, relay: try stub.client())
+        let (_, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s"}"#)
+        #expect(code(try await Self.receive(ia, p.message, 1)) == .wrongPrincipal && stub.calls == 1)
+        // the same real envelope again: replay pre-check, no relay call
+        #expect(isDuplicate(try await Self.receive(ia, p.message, 2)) && stub.calls == 1)
+        // a real envelope outside the timestamp window: no relay call
+        w.clock.now = T0 + 1000
+        let (_, f) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s2"}"#)
+        w.clock.now = T0
+        #expect(code(try await Self.receive(ia, f.message, 3)) == .staleTimestamp && stub.calls == 1)
     }
 
     // MARK: durability

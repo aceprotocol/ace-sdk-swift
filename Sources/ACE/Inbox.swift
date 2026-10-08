@@ -127,8 +127,9 @@ public actor Inbox {
     /// `quarantine/` record count, listed once and then maintained (this instance holds
     /// the `receive` lock, so it is the only writer).
     private var quarantineCount: Int?
-    /// `threads` or `requests`, kept after a failure until `close()`.
-    private var heldLock: (any ACEStoreLock)?
+    /// `threads` / `requests` locks kept after a failure; only appended to, all released at
+    /// `close()` (never overwritten, so none leaks).
+    private var heldLocks: [any ACEStoreLock] = []
 
     /// Open the inbox: take the `receive` lock (`receiver_busy` if held), load or create
     /// `replay.json`, load cursors and run recovery from delivery records. An invalid
@@ -190,7 +191,7 @@ public actor Inbox {
     }
 
     deinit {
-        heldLock?.release()
+        for l in heldLocks { l.release() }
         if !closed { receiveLock.release() }
     }
 
@@ -198,8 +199,9 @@ public actor Inbox {
     public func close() {
         guard !closed else { return }
         closed = true
-        heldLock?.release()
-        heldLock = nil
+        let held = heldLocks
+        heldLocks = []
+        for l in held { l.release() }
         receiveLock.release()
     }
 
@@ -478,6 +480,9 @@ public actor Inbox {
                 return .retryable(ACEError(.relayUnavailable, "peer refresh failed: \(error)"))
             }
         }
+        // Actor reentrancy: another receive may have failed while this one was suspended at
+        // step 3 or the refresh. Re-check after the last await, before taking any store lock.
+        if failed { return .retryable(ACEError(.storageFailed, "inbox is in a failed state; reopen it")) }
         // 5–7: economic types under `threads`; a decision under `requests` from the
         // open-request check through the requests/ fill (R-P25)
         let lockName: String? = env.type.isEconomic ? "threads" : env.type == .decision ? "requests" : nil
@@ -489,7 +494,7 @@ public actor Inbox {
         if failed, let lock {
             // Keep the lock until close so concurrent writers cannot diverge from the
             // unrepaired history / ledger.
-            heldLock = lock
+            heldLocks.append(lock)
         } else {
             lock?.release()
         }
@@ -590,6 +595,7 @@ public actor Inbox {
     private func refreshPrincipalSender(_ env: ACEMessage, peer: VerifiedPeer, now: Int) async throws -> VerifiedPeer {
         guard let principal,
               !senderPrincipalUsable(peer.principal, senderSigningPublicKey: peer.signingPublicKey, principal: principal, now: now),
+              wouldPassPreSignatureChecks(env, now: now),
               Self.authenticated(env, by: peer) else { return peer }
         let fresh: VerifiedPeer?
         do {
@@ -602,6 +608,16 @@ public actor Inbox {
         }
         guard let fresh, fresh.aceId == peer.aceId, fresh.signingPublicKey == peer.signingPublicKey else { return peer }
         return fresh
+    }
+
+    /// R-P38: the cheap pipeline checks that precede the signature (recipient, timestamp window
+    /// and floor, replay — a pure read, nothing committed), so a misaddressed, stale or replayed
+    /// envelope never costs a relay call; the pipeline rejects it afterwards.
+    private func wouldPassPreSignatureChecks(_ env: ACEMessage, now: Int) -> Bool {
+        guard env.to == localAceId, env.timestamp >= floor, env.timestamp <= now + ACELimits.timestampWindowSeconds else {
+            return false
+        }
+        return (try? replay.accepts(env.messageId, from: env.from, timestamp: env.timestamp)) == true
     }
 
     /// The envelope signature verifies under `peer`'s pinned key and scheme (as parse steps

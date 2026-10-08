@@ -150,7 +150,9 @@ final class EnclaveIdentity: ACEIdentity {
 
 ## Persistence
 
-All pipeline state lives in the `ACEStore` under the keys of 06-security Appendix A (`replay.json`, `cursors.json`, `threads/`, `outbox/`, `deliveries/`, `quarantine/`, `peers/`). Records are compact JSON with sorted keys; `replay.json` is byte-identical across the TS, Python and Swift SDKs. `FileStore` writes atomically (temp file, fsync, rename) with 0600 files and 0700 directories, and uses `locks/<name>.lock` files for cross-process exclusion.
+All pipeline state lives in the `ACEStore` under the keys of 06-security Appendix A (`replay.json`, `cursors.json`, `threads/`, `outbox/`, `deliveries/`, `quarantine/`, `peers/`, `requests/`). Records are compact JSON with sorted keys; `replay.json` is byte-identical across the TS, Python and Swift SDKs. `FileStore` writes atomically (temp file, fsync, rename) with 0600 files and 0700 directories, and uses `locks/<name>.lock` files for cross-process exclusion.
+
+Upgrading to 0.3.0: a principal `request` staged by an earlier version has no `requestTtl` in its pending send (the body `ttl` is encrypted to the recipient and cannot be recovered), so if it is delivered after the upgrade its `requests/` record gets `expiresAt: null` (the request never expires; a decision is accepted until one is recorded). Abandon and re-stage such a send to keep its `ttl`.
 
 ## Encryption
 
