@@ -47,6 +47,7 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         case pendingSendConflict = "pending_send_conflict"
         case blockedAddress = "blocked_address"
         case directRejected = "direct_rejected"
+        case deliveryRejected = "delivery_rejected"
         // transient
         case relayUnavailable = "relay_unavailable"
         case relayProtocolError = "relay_protocol_error"
@@ -84,7 +85,8 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
     public let status: Int?
     /// The relay's `error` code, when the relay returned one.
     public let relayCode: String?
-    /// For `direct_rejected`: the receiving agent's `error` string, when it returned one.
+    /// For `direct_rejected`: the receiving agent's `error` string, when it returned one. For
+    /// `delivery_rejected`: the receiver Inbox's permanent error code from the secure receipt.
     public let remoteCode: String?
     /// Seconds from a `Retry-After` header, when present.
     public let retryAfterSeconds: Int?

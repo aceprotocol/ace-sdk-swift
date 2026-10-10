@@ -69,14 +69,12 @@ struct StoreTests {
         #expect(stat(dir.appendingPathComponent("dir").path, &st) == 0 && st.st_mode & 0o777 == 0o700)
         // Locks live under locks/ and are not listed.
         let l = try store.lock("peers", timeout: 1)
-        let content = try String(contentsOf: dir.appendingPathComponent("locks/peers.lock"), encoding: .utf8)
-        #expect(content.hasPrefix("{\"createdAt\":") && content.contains("\"pid\":\(getpid())"))
         #expect(try !store.list(prefix: "").contains { $0.hasPrefix("locks") })
         l.release()
-        #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("locks/peers.lock").path))
+        #expect(FileManager.default.fileExists(atPath: dir.appendingPathComponent("locks/peers.lock").path))
     }
 
-    @Test func fileStoreRefusesSymlinksAndBreaksStaleLocks() throws {
+    @Test func fileStoreRefusesSymlinksAndUsesKernelLocks() throws {
         let dir = tempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try FileStore(directory: dir)
@@ -84,23 +82,16 @@ struct StoreTests {
         symlink(dir.appendingPathComponent("real.json").path, dir.appendingPathComponent("link.json").path)
         expectCode(.storageFailed) { try store.read("link.json") }
 
-        // A lock left by a dead process on this host is broken.
-        var host = [CChar](repeating: 0, count: 256)
-        gethostname(&host, 256)
-        let hostname = String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
-        try FileManager.default.createDirectory(at: dir.appendingPathComponent("locks"), withIntermediateDirectories: true)
-        try Data("{\"createdAt\":1,\"host\":\"\(hostname)\",\"pid\":999999}".utf8).write(to: dir.appendingPathComponent("locks/receive.lock"))
         try store.lock("receive", timeout: 0).release()
-
-        // A live foreign lock is respected; an unparseable fresh one too.
-        try Data("{\"createdAt\":1,\"host\":\"other-host\",\"pid\":1}".utf8).write(to: dir.appendingPathComponent("locks/receive.lock"))
-        expectCode(.receiverBusy) { try store.lock("receive", timeout: 0.1) }
-        try Data("garbage".utf8).write(to: dir.appendingPathComponent("locks/threads.lock"))
-        expectCode(.lockBusy) { try store.lock("threads", timeout: 0) }
-        // ... but an unparseable one older than 60 s is broken.
-        let old = Date(timeIntervalSinceNow: -120)
-        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: dir.appendingPathComponent("locks/threads.lock").path)
-        try store.lock("threads", timeout: 0).release()
+        let path = dir.appendingPathComponent("locks/receive.lock").path
+        let fd = open(path, O_RDWR)
+        defer { close(fd) }
+        #expect(flock(fd, LOCK_EX | LOCK_NB) == 0)
+        expectCode(.receiverBusy) { try store.lock("receive", timeout: 0) }
+        #expect(flock(fd, LOCK_UN) == 0)
+        try store.lock("receive", timeout: 0).release()
+        expectCode(.invalidArgument) { try store.write("locks/receive.lock", Data()) }
+        expectCode(.invalidArgument) { try store.delete("locks/receive.lock") }
     }
 
     @Test func fileStoreSerializesInProcessAcrossInstances() throws {
@@ -133,9 +124,9 @@ struct PeerStoreTests {
                                                    encryptionSeed: ACEEncryption.generateSeed())
         let older = try verifyPeerRecord(try peerRecord(rotatedIdentity, registeredAt: 1740000000))
         await expectCodeAsync(.stalePeerBinding) { try await peers.adopt(older) }
-        // An unsigned (registration-file) candidate never rotates.
-        let file = try createRegistrationFile(for: rotatedIdentity, name: "Bob", endpoint: "https://bob.example")
-        await expectCodeAsync(.stalePeerBinding) { try await peers.pinRegistrationFile(file, pinnedAt: 1741000000) }
+        // A signed registration file also needs a strictly newer binding.
+        let file = try createRegistrationFile(for: rotatedIdentity, name: "Bob", endpoint: "https://bob.example", timestamp: 1740000000)
+        await expectCodeAsync(.stalePeerBinding) { try await peers.pinRegistrationFile(file) }
         let newer = try verifyPeerRecord(try peerRecord(rotatedIdentity, registeredAt: 1740000001))
         #expect(try await peers.adopt(newer).outcome == .rotated)
         #expect(try await peers.get(bob.getACEId())?.encryptionPublicKey == rotatedIdentity.getEncryptionPublicKey())
@@ -186,8 +177,8 @@ struct PeerStoreTests {
     @Test func noRelay() async throws {
         let peers = try PeerStore(store: MemoryStore(), clock: clock.fn)
         await expectCodeAsync(.unknownPeer) { try await peers.resolve(bob.getACEId()) }
-        let p = try await peers.pinRegistrationFile(try createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example"))
-        #expect(p.source == .registration && p.registeredAt == 1741000000 && p.registrationSignature == nil)
+        let p = try await peers.pinRegistrationFile(try createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example", timestamp: clock.now))
+        #expect(p.source == .registration && p.registeredAt == 1741000000 && !p.registrationSignature.isEmpty)
         clock.now += 10_000_000
         #expect(try await peers.resolve(bob.getACEId()) == p)
         try await peers.remove(bob.getACEId())

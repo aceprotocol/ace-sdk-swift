@@ -50,16 +50,19 @@ public actor RelayClient {
         public let cursor: String?
     }
 
+    /// A served intent (08 § Intents). `ext` is present only when non-empty, as the relay serves it.
     public struct Intent: Sendable, Equatable {
         public let intentId: String
         public let from: String
         public let need: String
         public let tags: [String]
-        public let maxPrice: String?
-        public let currency: String?
         public let ttl: Int
+        public let ext: ExtMap?
         public let createdAt: Int
         public let expiresAt: Int
+
+        /// The typed `urn:ace:commerce:1` member of `ext` (`maxPrice` / `currency`), or nil when absent.
+        public var commerce: CommerceIntentExt? { ext.flatMap(commerceIntentExt) }
     }
 
     public struct IntentPage: Sendable {
@@ -88,8 +91,8 @@ public actor RelayClient {
 
     /// The normalized base URL (08 § Client Rules, Relay URL).
     public nonisolated let baseURL: URL
-    /// `baseURL` as a string: the normalized relay key. Use it for
-    /// `ReceiveSource.relay(url:)`; `Inbox` keys cursors by it.
+    /// `baseURL` as a string: the normalized relay key. `SecureMailbox` keys its durable
+    /// cursor (`secure/cursors/<sha256(baseURLString)>.json`) by it.
     public nonisolated let baseURLString: String
     private let session: URLSession
     /// `listen`'s own session (see `init`); created on first use.
@@ -195,7 +198,6 @@ public actor RelayClient {
         var q: [(String, String)] = []
         if let v = query.q { q.append(("q", v)) }
         if let v = query.tags { q.append(("tags", try joinTags(v))) }
-        if let v = query.chain { q.append(("chain", v)) }
         if let v = query.scheme { q.append(("scheme", v)) }
         if let v = query.online { q.append(("online", v ? "true" : "false")) }
         if let v = query.account { q.append(("account", v)) }
@@ -238,13 +240,15 @@ public actor RelayClient {
         return InboxPage(entries: entries, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
 
-    /// `POST /v1/intents`. `tags` is always sent (possibly empty), mirroring the signed payload.
-    public func postIntent(_ identity: any ACEIdentity, need: String, tags: [String] = [], maxPrice: String? = nil,
-                           currency: String? = nil, ttl: Int) async throws -> PostedIntent {
-        let auth = RelayAuthRequest.intent(need: need, tags: tags, maxPrice: maxPrice, currency: currency, ttl: ttl)
+    /// `POST /v1/intents`. `tags` is always sent (possibly empty), mirroring the signed payload;
+    /// `ext` (02 § Profile Fields rules, `invalid_argument`; commerce data under `commerceExt`) is
+    /// sent only when non-empty.
+    public func postIntent(_ identity: any ACEIdentity, need: String, tags: [String] = [], ext: ExtMap? = nil,
+                           ttl: Int) async throws -> PostedIntent {
+        let auth = RelayAuthRequest.intent(need: need, tags: tags, ext: ext, ttl: ttl)
+        try auth.validate()
         var o: [String: JValue] = ["need": .string(need), "ttl": .number(String(ttl)), "tags": .array(tags.map { .string($0) })]
-        if let maxPrice { o["maxPrice"] = .string(maxPrice) }
-        if let currency { o["currency"] = .string(currency) }
+        if let ext = normalizedExt(ext), let j = JSONValue.object(ext).jvalue { o["ext"] = j }
         let v = try await call("POST", "/v1/intents", body: JSONWriter.serialize(.object(o)), auth: (identity, auth))
         guard let id = v["intentId"]?.stringValue, let expiresAt = v["expiresAt"]?.wireInt else {
             throw ACEError(.relayProtocolError, "unexpected intent response")
@@ -271,10 +275,15 @@ public actor RelayClient {
                 guard let t = $0.stringValue else { throw ACEError(.relayProtocolError, "malformed intent tags") }
                 return t
             }
-            return Intent(intentId: id, from: from, need: need, tags: tags,
-                          maxPrice: try optionalField(i, "maxPrice") { $0.stringValue },
-                          currency: try optionalField(i, "currency") { $0.stringValue },
-                          ttl: ttl, createdAt: createdAt, expiresAt: expiresAt)
+            // The served `ext` must satisfy the intent rules (02); anything else is a relay protocol error.
+            var ext: ExtMap?
+            if let raw = i["ext"] {
+                guard raw.objectValue != nil, let e = JSONValue(raw)?.objectValue, (try? validateExt(e, carrier: .intent)) != nil else {
+                    throw ACEError(.relayProtocolError, "ext is malformed")
+                }
+                ext = normalizedExt(e)
+            }
+            return Intent(intentId: id, from: from, need: need, tags: tags, ttl: ttl, ext: ext, createdAt: createdAt, expiresAt: expiresAt)
         }
         return IntentPage(intents: intents, cursor: try nullableField(v, "cursor") { $0.stringValue })
     }
@@ -715,5 +724,24 @@ struct SSEParser {
         default: break
         }
         return nil
+    }
+}
+
+extension AsyncThrowingStream.Continuation where Element: Sendable {
+    /// Yield on a `.bufferingOldest` stream, waiting while its buffer is full instead of
+    /// dropping. Throws `CancellationError` when the stream terminated or the task is
+    /// cancelled.
+    func yieldWaiting(_ value: Element) async throws {
+        var delay: UInt64 = 1_000_000
+        while true {
+            switch yield(value) {
+            case .enqueued: return
+            case .terminated: throw CancellationError()
+            case .dropped:
+                try await Task.sleep(nanoseconds: delay)
+                delay = min(delay * 2, 50_000_000)
+            @unknown default: return
+            }
+        }
     }
 }

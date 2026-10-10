@@ -115,7 +115,7 @@ struct DXTests {
                                     threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
         let sink = Sink()
         let bIn = try await p.inbox(p.bob, sink)
-        let outcome = try await bIn.receive(env.jsonData(), source: .direct)
+        let outcome = try await bIn.receive(env.jsonData())
         #expect(outcome.message?.body == body)
         let key = DeliveryRecord.key(from: env.from, messageId: env.messageId)
         let rec = try DeliveryRecord.parse(try p.bobStore.readJSON(key)!, key: key)
@@ -143,68 +143,6 @@ struct DXTests {
         #expect(peer.aceId == se.getACEId() && peer.encryptionPublicKey == se.getEncryptionPublicKey())
         let k1 = try SoftwareIdentity.generate(scheme: .secp256k1)
         #expect(try verifyRegistrationFile(createRegistrationFile(for: k1, name: "K", endpoint: "https://k.example")).scheme == .secp256k1)
-    }
-
-    // MARK: pull / follow
-
-    @Test func pullReturnsOutcomesAndPages() async throws {
-        let p = try await Pair()
-        let fake = FakeRelay()
-        let relay = try makeRelay(fake.handle, clock: p.clock.fn)
-        let aOut = try await p.outbox(p.alice)
-        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        for i in 0..<4 {
-            let s = try await aOut.stage(recipient: bobPeer, type: .text, body: ["message": .string("m\(i)")])
-            try await aOut.deliver(s.requestId) { try await relay.send($0) }
-        }
-        let sink = Sink()
-        let bIn = try await p.inbox(p.bob, sink)
-        let first = await bIn.pull(relay, limit: 3, maxPages: 1)
-        #expect(first.hasMore && first.blocked == nil && first.delivered == 3)
-        #expect(first.messages.map { $0.body["message"]?.stringValue } == ["m0", "m1", "m2"])
-        let rest = await bIn.pull(relay, limit: 3)
-        #expect(!rest.hasMore && rest.delivered == 1 && rest.duplicates == 0 && rest.quarantined == 0)
-        #expect(await bIn.cursor(for: relay) == "1741000000000-4")
-        #expect(await bIn.pull(relay, maxPages: 0).blocked == ACEError(.invalidArgument))
-        #expect(await bIn.pull(relay, limit: 101).blocked == ACEError(.invalidArgument))
-        await bIn.close()
-    }
-
-    @Test func followYieldsInitialPullThenSignalsLive() async throws {
-        let p = try await Pair()
-        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        let queued = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "queued"],
-                                       threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
-        let live = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "msg-live"],
-                                     threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
-        let liveFrame = "id: 5-2\nevent: message\ndata: \(String(decoding: live.jsonData(), as: UTF8.self))\n\n"
-        let queuedPage = Data(#"{"cursor":"5-1","messages":[{"message":"#.utf8) + queued.jsonData() + Data(#","streamId":"5-1"}]}"#.utf8)
-        let relay = try makeRelay({ req, _ in
-            switch req.url!.path {
-            case "/v1/inbox":
-                let since = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!.queryItems?.first { $0.name == "since" }
-                return since == nil ? StubResponse(status: 200, chunks: [queuedPage])
-                                    : .json(200, ["messages": [], "cursor": NSNull()])
-            case "/v1/listen":
-                return req.url!.query?.contains("since=5-2") == true ? .error(401, "invalid_signature") : .sse([liveFrame])
-            default: return .error(404, "x")
-            }
-        }, clock: p.clock.fn)
-        let bIn = try await p.inbox(p.bob, Sink())
-        let log = Locked<[String]>([])
-        do {
-            for try await o in bIn.follow(relay, onLive: { log.mutate { $0.append("LIVE") } }) {
-                log.mutate { $0.append(o.message?.body["message"]?.stringValue ?? "?") }
-            }
-            Issue.record("expected relay_rejected")
-        } catch {
-            #expect(error as? ACEError == ACEError(.relayRejected))
-        }
-        // The queued message comes from the initial pull; onLive precedes every live outcome.
-        #expect(log.value.sorted() == ["LIVE", "msg-live", "queued"])
-        #expect(log.value.firstIndex(of: "LIVE")! < log.value.firstIndex(of: "msg-live")!)
-        #expect(await bIn.cursor(for: relay) == "5-2")
-        await bIn.close()
     }
 
     // MARK: listen session and cancellation
@@ -269,21 +207,6 @@ struct DXTests {
         #expect(calls.value == 1)  // the backoff sleep was cancelled, no reconnect
     }
 
-    @Test func cancellingFollowClosesTheStream() async throws {
-        let p = try await Pair()
-        let (relay, host) = try endlessRelay(clock: p.clock.fn)
-        let bIn = try await p.inbox(p.bob, Sink())
-        let live = Locked(0)
-        let consumer = Task {
-            for try await _ in bIn.follow(relay, onLive: { live.mutate { $0 += 1 } }) {}
-        }
-        #expect(await eventually { live.value == 1 })
-        consumer.cancel()
-        #expect(await eventually(1) { EndlessSSEProtocol.info(host).stops == 1 })
-        _ = try? await consumer.value
-        await bIn.close()
-    }
-
     // MARK: per-peer open threads
 
     private func openThread(_ threads: ThreadStore, local: String, peer: String, n: Int, at ts: Int, localFirst: Bool = false) throws {
@@ -311,7 +234,7 @@ struct DXTests {
         let alicePeer = try await p.bobPeers.get(peer)!
         let rfq = try createMessage(sender: p.alice, recipient: bobPeer, type: .rfq, body: ["need": "x"],
                                     threads: try ThreadStateMachine(localAceId: peer), threadId: "new", timestamp: p.clock.now)
-        let refused = try await bIn.receive(rfq.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-1"))
+        let refused = try await bIn.receive(rfq.jsonData())
         #expect(refused.error == ACEError(.limitExceeded))
         if case .quarantined = refused {} else { Issue.record("expected quarantined: \(refused)") }
         let bOut = try await p.outbox(p.bob)
@@ -326,7 +249,7 @@ struct DXTests {
         try threads.remove(conversationId: sha256Hex(Data("c0".utf8)), threadId: "t0")
         let rfq2 = try createMessage(sender: p.alice, recipient: bobPeer, type: .rfq, body: ["need": "x"],
                                      threads: try ThreadStateMachine(localAceId: peer), threadId: "new2", timestamp: p.clock.now)
-        #expect(isDelivered(try await bIn.receive(rfq2.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(rfq2.jsonData())))
         await bIn.close()
     }
 
@@ -369,37 +292,13 @@ struct DXTests {
         for n in 0..<(Inbox.quarantineCap + 1) {
             // A fresh messageId under the old signature: invalid_signature, a new fingerprint.
             let forged = ACEMessage(messageId: "00000000-0000-4000-8000-\(String(format: "%012d", n))", from: env.from, to: env.to,
-                                    conversationId: env.conversationId, type: env.type, timestamp: env.timestamp,
+                                    conversationId: env.conversationId, timestamp: env.timestamp,
                                     encryption: env.encryption, signature: env.signature)
-            let o = try await bIn.receive(forged.jsonData(), source: .relay(url: "https://relay.example", streamId: "1-\(n)"))
+            let o = try await bIn.receive(forged.jsonData())
             #expect(o.error == ACEError(.invalidSignature))
         }
         #expect(try store.list(prefix: "quarantine/").count == Inbox.quarantineKeep)
         #expect(store.lists.value <= 3)  // the first insert, the trim, and this check
-        await bIn.close()
-    }
-
-    @Test func followAppliesBackpressure() async throws {
-        let p = try await Pair()
-        let fake = FakeRelay()
-        let relay = try makeRelay(fake.handle, clock: p.clock.fn)
-        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        let total = Inbox.followBuffer * 3
-        for i in 0..<total {
-            let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": .string("m\(i)")],
-                                        threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
-            _ = fake.enqueue(env)
-        }
-        let sink = Sink()
-        let bIn = try await p.inbox(p.bob, sink)
-        var iterator = bIn.follow(relay).makeAsyncIterator()
-        _ = try await iterator.next()
-        try await Task.sleep(nanoseconds: 300_000_000)
-        // Receiving paused with the buffer full (plus the one being yielded).
-        #expect(sink.count <= Inbox.followBuffer + 3)
-        var seen = 1
-        while seen < total, try await iterator.next() != nil { seen += 1 }
-        #expect(seen == total && sink.count == total)
         await bIn.close()
     }
 
@@ -415,32 +314,6 @@ struct DXTests {
         #expect(EndlessSSEProtocol.info(host).connects == 1)
     }
 
-    @Test func followYieldsThenThrowsAnInitialRetryable() async throws {
-        let p = try await Pair()
-        let fake = FakeRelay()
-        let relay = try makeRelay(fake.handle, clock: p.clock.fn)
-        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "x"],
-                                    threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
-        _ = fake.enqueue(env)
-        let sink = Sink()
-        sink.failing = true  // handler_failed: retryable
-        let bIn = try await p.inbox(p.bob, sink)
-        let live = Locked(0)
-        var seen: [ReceiveOutcome] = []
-        do {
-            for try await o in bIn.follow(relay, onLive: { live.mutate { $0 += 1 } }) { seen.append(o) }
-            Issue.record("expected handler_failed")
-        } catch {
-            #expect(error as? ACEError == ACEError(.handlerFailed))
-        }
-        #expect(seen.count == 1 && seen[0].error == ACEError(.handlerFailed) && live.value == 0)
-        // A failed fetch throws without yielding or going live.
-        let down = try makeRelay({ _, _ in .error(503, "x") }, clock: p.clock.fn)
-        await expectCodeAsync(.relayUnavailable) { for try await _ in bIn.follow(down, onLive: { live.mutate { $0 += 1 } }) {} }
-        #expect(live.value == 0)
-        await bIn.close()
-    }
 }
 
 @Test func jsonValueAcceptsStringInterpolation() throws {

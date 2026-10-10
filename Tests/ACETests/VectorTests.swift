@@ -51,8 +51,8 @@ struct VectorTests {
         let sd = V["signData"] as! [String: Any]
         let mp = sd["messagePayload"] as! [String: String]
         let payload = ACESigning.encodePayload([
-            .string(mp["type"]!), .string(mp["to"]!), .string(mp["conversationId"]!), .string(mp["messageId"]!),
-            .string(mp["threadId"]!), .data(Data(base64Encoded: mp["kemCiphertext"]!)!), .data(Data(base64Encoded: mp["ciphertext"]!)!),
+            .string(mp["to"]!), .string(mp["conversationId"]!), .string(mp["messageId"]!),
+            .data(Data(base64Encoded: mp["kemCiphertext"]!)!), .data(Data(base64Encoded: mp["ciphertext"]!)!),
         ])
         let data = try ACESigning.buildSignData(action: sd["action"] as! String, aceId: sd["aceId"] as! String,
                                                 timestamp: sd["timestamp"] as! Int, payload: payload)
@@ -79,7 +79,7 @@ struct VectorTests {
         let raw = try ACEEncryption.decrypt(kemCiphertext: Data(base64Encoded: enc["kemCiphertext"]!)!,
                                             payload: Data(base64Encoded: enc["payload"]!)!, seed: seed,
                                             conversationId: envObj["conversationId"] as! String)
-        #expect(try JSONValue(json: raw).objectValue == jsonBody(em["expectedBody"]!))
+        #expect(try JSONValue(json: raw)["body"]?.objectValue == jsonBody(em["expectedBody"]!))
     }
 
     // MARK: envelopes / bodies
@@ -256,8 +256,8 @@ struct VectorTests {
             default: return .webhook(.delete)
             }
         default:
-            return .intent(need: r["need"] as! String, tags: r["tags"] as! [String], maxPrice: r["maxPrice"] as? String,
-                           currency: r["currency"] as? String, ttl: r["ttl"] as! Int)
+            let ext = (r["ext"] as? [String: Any]).map { jsonBody($0) }
+            return .intent(need: r["need"] as! String, tags: r["tags"] as! [String], ext: ext, ttl: r["ttl"] as! Int)
         }
     }
 
@@ -412,7 +412,7 @@ struct VectorTests {
     @Test func registrationRoundTrip() throws {
         for name in ["alice", "bob"] {
             let ident = Fixtures.agent(name)
-            for profile: RegistrationProfile in [.keep, .remove, .replace(AgentProfile(name: "A", tags: ["x"], pricing: ProfilePricing(currency: "USDC", maxAmount: "1.5")))] {
+            for profile: RegistrationProfile in [.keep, .remove, .replace(AgentProfile(name: "A", tags: ["x"], ext: [commerceExt: ["pricing": ["currency": "USDC", "maxAmount": "1.5"]], "urn:x:1": ["n": 1]]))] {
                 let req = try createRegistrationRequest(identity: ident, profile: profile, timestamp: 1741000000)
                 let result = try verifyRegistrationRequest(req.jsonData(), clock: { 1741000000 })
                 #expect(result.request == req)
@@ -461,8 +461,7 @@ struct VectorTests {
                     if let record = step["record"] {
                         cand = try verifyPeerRecord(try PeerRecord.parse(jvalue(record)))
                     } else {
-                        cand = try verifyRegistrationFile(try RegistrationFile.parse(jvalue(step["registrationFile"]!)),
-                                                          pinnedAt: step["pinnedAt"] as? Int)
+                        cand = try verifyRegistrationFile(try RegistrationFile.parse(jvalue(step["registrationFile"]!)))
                     }
                     let (next, outcome) = try adoptDecision(pin: pin, candidate: cand, now: now)
                     pin = next
@@ -557,16 +556,20 @@ struct VectorTests {
         #expect(section["maxDirectBodyBytes"] as? Int == ACELimits.maxDirectBodyBytes)
         let all = cases("directReceive")
         #expect(all.count == 17)
-        let bob = Fixtures.agent("bob"), store = MemoryStore()
-        let inbox = try await Inbox.open(identity: bob, store: store, peers: try PeerStore(store: store), onMessage: { _ in })
+        let bob = Fixtures.agent("bob"), store = MemoryStore(), peers = try PeerStore(store: store)
+        let inbox = try await Inbox.open(identity: bob, store: store, peers: peers, onMessage: { _ in })
+        let mailbox = try SecureMailbox.open(identity: bob, store: store, peers: peers, relay: try makeRelay({ _, _ in .error(503, "x") }),
+                                             secure: SecureTransport(identity: bob, engine: UnreachableEngine(), store: store),
+                                             inbox: inbox, send: { _, _ in .relay })
         for c in all {
             let name = c["name"] as! String
             var bytes = (c["bodyHex"] as? String).map(hex) ?? Data((c["body"] as! String).utf8)
             if let padTo = c["padTo"] as? Int, bytes.count < padTo { bytes.append(Data(repeating: 0x20, count: padTo - bytes.count)) }
-            let reply = await inbox.receiveDirect(bytes)
+            let reply = await mailbox.receiveDirect(bytes)
             #expect(reply.status == c["status"] as? Int, "\(name)")
             #expect(reply.body == ["ok": false, "error": .string(c["error"] as! String)], "\(name): \(reply.body)")
         }
+        await mailbox.close()
         await inbox.close()
     }
 }

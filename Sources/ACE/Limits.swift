@@ -19,6 +19,11 @@ public enum ACELimits {
     public static let maxDirectBodyBytes = maxEnvelopeBytes + 1024
     /// Top-level object = depth 0.
     public static let maxJSONDepth = 32
+    /// `ext` objects (02 § Profile Fields): namespaces, key bytes, canonical JSON bytes, nesting (root = depth 0).
+    public static let maxExtKeys = 8
+    public static let maxExtKeyBytes = 256
+    public static let maxExtBytes = 4096
+    public static let maxExtDepth = 8
     /// Thread ID length in Unicode code points.
     public static let maxThreadIdLength = 256
     /// Future bound and relay freshness.
@@ -42,6 +47,8 @@ public enum ACELimits {
     public static let maxStoreValueBytes = 64 << 20
     /// Default `ACEStore` lock timeout.
     public static let defaultLockTimeoutSeconds: TimeInterval = 10
+    /// Lifetime of one secure handshake attempt: frame expiry and the sender's wait for each reply.
+    static let secureAttemptSeconds = 120
 }
 
 /// 2^53 − 1: the largest wire integer.

@@ -22,12 +22,14 @@ public enum WebhookMethod: Sendable, Equatable {
     }
 }
 
-/// What an authenticated relay call signs. `since` is `"-"` or `<ms>-<seq>`.
+/// What an authenticated relay call signs. `since` is `"-"` or `<ms>-<seq>`. An intent's `ext`
+/// (02 § Profile Fields rules, `invalid_argument`) is signed as its canonical JSON; nil or empty
+/// signs the empty string and is not sent.
 public enum RelayAuthRequest: Sendable, Equatable {
     case listen(since: String)
     case inbox(since: String, limit: Int)
     case unregister
-    case intent(need: String, tags: [String], maxPrice: String?, currency: String?, ttl: Int)
+    case intent(need: String, tags: [String], ext: ExtMap? = nil, ttl: Int)
     case webhook(WebhookMethod)
 
     public var action: String {
@@ -52,9 +54,10 @@ public enum RelayAuthRequest: Sendable, Equatable {
             }
         case .unregister:
             break
-        case .intent(_, let tags, _, _, let ttl):
+        case .intent(_, let tags, let ext, let ttl):
             guard !tags.contains(where: { $0.contains(",") }) else { throw ACEError.invalidArgument("tags must be strings without ','") }
             guard isWireInt(ttl) else { throw ACEError.invalidArgument("ttl must be an integer in [0, 2^53-1]") }
+            if let ext = normalizedExt(ext) { try validateExt(ext, carrier: .intent) }
         case .webhook(.put(let url, let secret)):
             guard isHTTPSURL(url) else { throw ACEError.invalidArgument("url must match the ACE HTTPS URL grammar") }
             guard isWebhookSecret(secret) else {
@@ -73,8 +76,9 @@ public enum RelayAuthRequest: Sendable, Equatable {
             return ACESigning.encodePayload(since, String(limit))
         case .unregister:
             return Data()
-        case .intent(let need, let tags, let maxPrice, let currency, let ttl):
-            return ACESigning.encodePayload(need, tags.joined(separator: ","), maxPrice ?? "", currency ?? "", String(ttl))
+        case .intent(let need, let tags, let ext, let ttl):
+            // A non-finite number never passes `validate()`, which runs before signing.
+            return ACESigning.encodePayload(need, tags.joined(separator: ","), (try? extCanonicalOrEmpty(ext)) ?? "", String(ttl))
         case .webhook(let method):
             guard case .put(let url, let secret) = method else { return ACESigning.encodePayload(method.verb, "", "") }
             return ACESigning.encodePayload(method.verb, url, secret)

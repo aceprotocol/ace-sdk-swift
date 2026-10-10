@@ -2,13 +2,13 @@
 //  Direct.swift
 //  ACE SDK
 //
-//  Direct delivery, sender side (08-relay § Direct Delivery). The receiver side is
-//  `Inbox.receiveDirect`.
+//  Direct delivery, sender side (08-relay § Direct Delivery): the transport for secure
+//  delivery frames. The receiver side is `SecureMailbox.receiveDirect`.
 //
 
 import Foundation
 
-/// The path that delivered an envelope (`deliverDirectOrRelay`).
+/// The path that delivered a secure delivery frame (`deliverDirectOrRelay`).
 public enum DeliveryPath: String, Sendable {
     case direct, relay
 }
@@ -17,6 +17,8 @@ public enum DeliveryPath: String, Sendable {
 private let maxDirectReplyBytes = 64 << 10
 
 /// POST `{"message": envelope}` to a peer's direct endpoint (08 § Direct Delivery, Sender).
+/// `envelope` is a secure delivery frame (`SecureTransport`); the receiver's
+/// `SecureMailbox.receiveDirect` refuses static application envelopes.
 ///
 /// - `endpoint` must be an ACE HTTPS URL; its host is resolved and refused when any
 ///   address is blocked (`isBlockedAddress`). Either failure is `invalid_argument`.
@@ -100,16 +102,18 @@ func postDirect(endpoint: String, envelope: ACEMessage, timeout: TimeInterval, s
     }
 }
 
-/// A transport for `Outbox.deliver` that tries the peer's direct endpoint first and falls
-/// back to `relay.send` (08 § Direct Delivery, Sender):
+/// A transport for `SecureRelayReplies` / secure delivery frames (the `send` of
+/// `SecureMailbox.open` and `SecureRelayReplies`): the peer's direct endpoint first, relay
+/// fallback (08 § Direct Delivery, Sender):
 ///
 /// - no `endpoint` → relay;
 /// - `postDirect` succeeds → `.direct`;
 /// - `direct_unavailable` or `invalid_argument` (unsafe or malformed endpoint) → relay;
-/// - `direct_rejected` is thrown: the recipient rejected this envelope, so it is not sent
+/// - `direct_rejected` is thrown: the recipient rejected this frame, so it is not sent
 ///   again through the relay.
 ///
-/// Returns the path that delivered: `let path = try await outbox.deliver(id, transport: deliverDirectOrRelay(relay: relay, endpoint: ep))`.
+/// Returns the path that delivered the frame, e.g.
+/// `SecureMailbox.open(…, send: { packet, peer in try await deliverDirectOrRelay(relay: relay, endpoint: peer.profile?.endpoint)(packet) })`.
 public func deliverDirectOrRelay(relay: RelayClient, endpoint: String?,
                                  timeout: TimeInterval = 5) -> @Sendable (ACEMessage) async throws -> DeliveryPath {
     deliverDirectOrRelay(send: { try await relay.send($0) }, endpoint: endpoint) {

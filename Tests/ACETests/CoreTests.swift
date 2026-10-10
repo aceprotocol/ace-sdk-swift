@@ -9,9 +9,9 @@ struct CoreTests {
     let now = 1741000000
 
     @Test func errorCategories() {
-        #expect(ACEError.Code.allCases.count == 39)
+        #expect(ACEError.Code.allCases.count == 40)
         #expect(ACEError(.lockBusy).category == .local && ACEError(.directRejected).category == .permanent
-                && ACEError(.directUnavailable).category == .transient)
+                && ACEError(.deliveryRejected).category == .permanent && ACEError(.directUnavailable).category == .transient)
         #expect(ACEError(.relayUnavailable).category == .transient)
         #expect(ACEError(.storageFailed).category == .local && ACEError(.storageFailed).isTransient)
         #expect(ACEError(.decryptionFailed).category == .permanent && !ACEError(.decryptionFailed).isTransient)
@@ -42,7 +42,7 @@ struct CoreTests {
         var obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         #expect(obj["threadId"] == nil)
         obj["threadId"] = NSNull()
-        #expect(throws: DecodingError.self) { try JSONDecoder().decode(ACEMessage.self, from: json(obj)) }
+        expectCode(.invalidEnvelope) { try JSONDecoder().decode(ACEMessage.self, from: json(obj)) }
         expectCode(.invalidEnvelope) { try decodeEnvelope(json(obj)) }
     }
 
@@ -81,8 +81,8 @@ struct CoreTests {
         expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x", "n": .number(.infinity)], threads: threads) }
         expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": 1], threads: threads) }
         var deep: JSONValue = ["a": 1]
-        for _ in 0..<31 { deep = ["a": deep] }
-        // Depth 32 (body object = 0) is accepted, 33 is not.
+        for _ in 0..<30 { deep = ["a": deep] }
+        // Depth 32 (private content object = 0) is accepted, 33 is not.
         _ = try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x", "d": deep], threads: threads)
         deep = ["a": deep]
         expectCode(.invalidBody) { try createMessage(sender: alice, recipient: peer, type: .text, body: ["message": "x", "d": deep], threads: threads) }
@@ -122,14 +122,14 @@ struct CoreTests {
         expectCode(.replay) { try parse(env, replay: replay) }
         // Wrong signature → invalid_signature, and the replay store is untouched.
         let other = try ACE.resign(env, sender: Fixtures.agent("bob"), timestamp: now)
-        let forged = ACEMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
+        let forged = ACEMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
                                 timestamp: now, encryption: env.encryption, signature: SignatureEnvelope(scheme: .ed25519, value: ACEBase64.encode(Data(repeating: 7, count: 64))))
         _ = other
         let fresh = try ReplayDetector(horizon: now - 300)
         expectCode(.invalidSignature) { try parse(forged, replay: fresh) }
         #expect(try fresh.accepts(env.messageId, from: env.from, timestamp: now))
         // Scheme mismatch.
-        let secp = ACEMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
+        let secp = ACEMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
                               timestamp: now, encryption: env.encryption, signature: SignatureEnvelope(scheme: .secp256k1, value: "0x" + String(repeating: "1", count: 130)))
         expectCode(.schemeMismatch) { try parse(secp) }
     }
@@ -172,6 +172,23 @@ struct CoreTests {
         expectCode(.invalidKey) { try ACEEncryption.publicKey(fromSeed: Data(count: 33)) }
     }
 
+    @Test func registrationBindsEncryptionKeyAndTimestamp() throws {
+        let victim = try SoftwareIdentity.generate(scheme: .ed25519)
+        let attacker = try SoftwareIdentity.generate(scheme: .ed25519)
+        let reg = try createRegistrationFile(for: victim, name: "Victim", endpoint: "https://victim.example")
+        #expect(try verifyRegistrationFile(reg).aceId == victim.getACEId())
+        var substituted = reg
+        substituted.signing = SigningConfig(scheme: reg.signing.scheme, address: reg.signing.address,
+                                            signingPublicKey: reg.signing.signingPublicKey,
+                                            encryptionPublicKey: ACEBase64.encode(attacker.getEncryptionPublicKey()))
+        expectCode(.invalidRegistration) { try verifyRegistrationFile(substituted) }
+        var wire = try JSONSerialization.jsonObject(with: JSONEncoder().encode(reg)) as! [String: Any]
+        wire["registeredAt"] = reg.registeredAt + 1
+        expectCode(.invalidRegistration) { try verifyRegistrationFile(RegistrationFile(json: JSONSerialization.data(withJSONObject: wire))) }
+        wire.removeValue(forKey: "registrationSignature")
+        expectCode(.invalidRegistration) { try RegistrationFile(json: JSONSerialization.data(withJSONObject: wire)) }
+    }
+
     @Test func identityExportAndRegistration() throws {
         for scheme in SigningScheme.allCases {
             let id = try SoftwareIdentity.generate(scheme: scheme)
@@ -179,8 +196,8 @@ struct CoreTests {
             #expect(back.getACEId() == id.getACEId() && back.getEncryptionPublicKey() == id.getEncryptionPublicKey())
             let reg = try createRegistrationFile(for: id, name: "X", endpoint: "https://x.example/ace", tier: .chainRegistered)
             #expect(reg.tier == .chainRegistered)
-            let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)), pinnedAt: 5)
-            #expect(peer.registeredAt == 5 && peer.address == id.getAddress())
+            let peer = try verifyRegistrationFile(try RegistrationFile(json: try JSONEncoder().encode(reg)))
+            #expect(peer.registeredAt == reg.registeredAt && peer.address == id.getAddress())
             expectCode(.invalidRegistration) { try createRegistrationFile(for: id, name: "X", endpoint: "http://x.example") }
         }
         expectCode(.invalidKey) { try SoftwareIdentity(export: SoftwareIdentityExport(scheme: .ed25519, signingPrivateKey: "QR==", encryptionPrivateKey: "")) }
@@ -199,7 +216,7 @@ struct CoreTests {
         expectCode(.invalidArgument) { try parseAuthHeaders(["X-ACE-Id": alice.getACEId(), "X-ACE-Timestamp": "01", "X-ACE-Signature": "x"]) }
         expectCode(.invalidArgument) { try parseAuthHeaders(["X-ACE-Id": alice.getACEId(), "X-ACE-Timestamp": "1", "X-ACE-Signature": String(repeating: "a", count: 513)]) }
         expectCode(.invalidArgument) { try createAuthHeaders(identity: alice, request: .inbox(since: "x", limit: 1), timestamp: now) }
-        expectCode(.invalidArgument) { try createAuthHeaders(identity: alice, request: .intent(need: "n", tags: ["a,b"], maxPrice: nil, currency: nil, ttl: 1), timestamp: now) }
+        expectCode(.invalidArgument) { try createAuthHeaders(identity: alice, request: .intent(need: "n", tags: ["a,b"], ttl: 1), timestamp: now) }
     }
 
     @Test func blockedAddresses() {
@@ -230,14 +247,67 @@ struct CoreTests {
     }
 
     @Test func profileValidation() throws {
-        let profile = AgentProfile(name: "A", tags: ["a-1"], chains: ["eip155:1"], endpoint: "https://a.example",
-                                   pricing: ProfilePricing(currency: "USDC", maxAmount: "10.5"))
+        let commerce = CommerceProfileExt(chains: ["eip155:1"], pricing: CommercePricing(currency: "USDC", maxAmount: "10.5"),
+                                          settlement: ["crypto/instant"], accounts: [CommerceAccount(network: "eip155:8453", address: "0xabc")])
+        let profile = AgentProfile(name: "A", tags: ["a-1"], endpoint: "https://a.example", ext: [commerceExt: commerce.jsonValue])
         #expect(try validateProfile(profile) == profile)
+        #expect(profile.commerce == commerce)
         expectCode(.invalidProfile) { try validateProfile(AgentProfile(name: "")) }
         expectCode(.invalidProfile) { try validateProfile(AgentProfile(tags: ["A"])) }
-        expectCode(.invalidProfile) { try validateProfile(AgentProfile(pricing: ProfilePricing(currency: "USDC", maxAmount: "1e3"))) }
-        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["pricing": ["currency": "USDC", "model": "x"]])) }
-        #expect(try AgentProfile.parse(jvalue(["name": "A", "unknown": 1, "image": NSNull()])) == AgentProfile(name: "A"))
+        expectCode(.invalidProfile) { try validateProfile(AgentProfile(ext: [commerceExt: ["pricing": ["currency": "USDC", "maxAmount": "1e3"]]])) }
+        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["ext": [commerceExt: ["pricing": ["currency": "USDC", "model": "x"]]]])) }
+        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["ext": [commerceExt: ["pricing": ["currency": "USDC", "maxAmount": NSNull()]]]])) }
+        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["ext": [commerceExt: ["accounts": [["network": "eip155:1", "address": "a", "x": 1]]]]])) }
+        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["ext": [commerceExt: ["chains": ["EIP155:1"]]]])) }
+        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["ext": [commerceExt: ["pricing": ["currency": "US\u{01}D"]]]])) }
+        expectCode(.invalidProfile) { try AgentProfile.parse(jvalue(["ext": "x"])) }
+        // Old top-level commerce fields are unknown members: dropped, never an error. An empty `ext` is absent.
+        #expect(try AgentProfile.parse(jvalue(["name": "A", "unknown": 1, "image": NSNull(), "chains": ["eip155:1"],
+                                               "pricing": ["currency": "USDC"], "ext": [:]])) == AgentProfile(name: "A"))
+        let parsed = try AgentProfile.parse(jvalue(["ext": ["urn:x:1": ["n": 1.0, "s": "é"], commerceExt: ["chains": ["eip155:1"]]]]))
+        #expect(parsed.ext?["urn:x:1"] == ["n": 1, "s": "é"] && parsed.commerce?.chains == ["eip155:1"])
+        #expect(String(decoding: try extCanonical(parsed.ext!), as: UTF8.self) == #"{"urn:ace:commerce:1":{"chains":["eip155:1"]},"urn:x:1":{"n":1,"s":"é"}}"#)
+    }
+
+    @Test func extRules() throws {
+        for carrier in [ExtCarrier.profile, .intent] {
+            let code = carrier.code
+            #expect(code == (carrier == .profile ? .invalidProfile : .invalidArgument))
+            try validateExt([:], carrier: carrier)
+            try validateExt(["urn:x:1": [:], "a:b": ["k": [1, [2, [3]]]]], carrier: carrier)
+            expectCode(code) { try validateExt(["urn:x:1": "s"], carrier: carrier) }
+            expectCode(code) { try validateExt(["urn:x:1": [:], "Bad": [:]], carrier: carrier) }
+            expectCode(code) { try validateExt(["x": [:]], carrier: carrier) }
+            expectCode(code) { try validateExt(["a:" + String(repeating: "b", count: 255): [:]], carrier: carrier) }
+            try validateExt(["a:" + String(repeating: "b", count: 254): [:]], carrier: carrier)
+            expectCode(code) { try validateExt(["a:é": [:]], carrier: carrier) }
+            expectCode(code) { try validateExt(Dictionary(uniqueKeysWithValues: (0..<9).map { ("urn:x:\($0)", JSONValue.object([:])) }), carrier: carrier) }
+            try validateExt(Dictionary(uniqueKeysWithValues: (0..<8).map { ("urn:x:\($0)", JSONValue.object([:])) }), carrier: carrier)
+            // Depth: the ext root is depth 0; a container at depth 9 is rejected.
+            var deep: JSONValue = [:]
+            for _ in 0..<7 { deep = ["k": deep] }  // value at depth 1 holding containers down to depth 8
+            try validateExt(["urn:x:1": deep], carrier: carrier)
+            expectCode(code) { try validateExt(["urn:x:1": ["k": deep]], carrier: carrier) }
+            expectCode(code) { try validateExt(["urn:x:1": ["s": .string(String(repeating: "a", count: 4096))]], carrier: carrier) }
+            expectCode(code) { try validateExt(["urn:x:1": ["s": .string(String(repeating: "a", count: 4096 - 19))]], carrier: carrier) }
+            try validateExt(["urn:x:1": ["s": .string(String(repeating: "a", count: 4096 - 20))]], carrier: carrier)  // {"urn:x:1":{"s":""}} is 20 bytes
+            expectCode(code) { try validateExt(["urn:x:1": ["n": .number(.infinity)]], carrier: carrier) }
+        }
+        try validateExt([commerceExt: ["maxPrice": "5", "currency": "US\u{01}"]], carrier: .intent)  // code points only
+        try validateExt([commerceExt: [:]], carrier: .intent)
+        expectCode(.invalidArgument) { try validateExt([commerceExt: ["maxPrice": "5"]], carrier: .intent) }
+        expectCode(.invalidArgument) { try validateExt([commerceExt: ["maxPrice": "5", "currency": .string(String(repeating: "c", count: 17))]], carrier: .intent) }
+        expectCode(.invalidArgument) { try validateExt([commerceExt: ["maxPrice": "5", "currency": .null]], carrier: .intent) }
+        expectCode(.invalidArgument) { try validateExt([commerceExt: ["maxPrice": "", "currency": "USDC"]], carrier: .intent) }
+        expectCode(.invalidArgument) { try validateExt([commerceExt: ["maxPrice": "5", "currency": "USDC", "chains": []]], carrier: .intent) }
+        expectCode(.invalidArgument) { try validateExt([commerceExt: ["chains": ["eip155:1"]]], carrier: .intent) }
+        expectCode(.invalidProfile) { try validateExt([commerceExt: ["maxPrice": "5", "currency": "USDC"]], carrier: .profile) }
+        expectCode(.invalidProfile) { try validateExt([commerceExt: ["chains": .array(Array(repeating: "eip155:1", count: 11))]], carrier: .profile) }
+        expectCode(.invalidProfile) { try validateExt([commerceExt: ["settlement": [1]]], carrier: .profile) }
+        expectCode(.invalidProfile) { try validateExt([commerceExt: ["accounts": [["network": "eip155:1"]]]], carrier: .profile) }
+        expectCode(.invalidProfile) { try validateExt([commerceExt: ["pricing": ["maxAmount": "1"]]], carrier: .profile) }
+        #expect(commerceIntentExt([commerceExt: ["maxPrice": "5", "currency": "USDC"]]) == CommerceIntentExt(maxPrice: "5", currency: "USDC"))
+        #expect(commerceIntentExt(["urn:x:1": [:]]) == nil)
     }
 
     @Test func streamIdOrdering() throws {

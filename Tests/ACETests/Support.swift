@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import ACE
 
-/// The shared cross-language vectors (`ace-spec/test-vectors.json`, version 3).
+/// The shared cross-language vectors (`ace-spec/test-vectors.json`, version 4).
 enum Fixtures {
     nonisolated(unsafe) static let root: [String: Any] = {
         let url = Bundle.module.url(forResource: "test-vectors", withExtension: "json", subdirectory: "Fixtures")!
@@ -41,7 +41,7 @@ func hex(_ s: String) -> Data { hexDecode(s)! }
 
 /// A registration-file peer for a local identity.
 func peerOf(_ identity: SoftwareIdentity, pinnedAt: Int = 0) throws -> VerifiedPeer {
-    try verifyRegistrationFile(try createRegistrationFile(for: identity, name: "Peer", endpoint: "https://peer.example/ace"), pinnedAt: pinnedAt)
+    try verifyRegistrationFile(try createRegistrationFile(for: identity, name: "Peer", endpoint: "https://peer.example/ace", timestamp: pinnedAt))
 }
 
 /// Expect an `ACEError` with `code`.

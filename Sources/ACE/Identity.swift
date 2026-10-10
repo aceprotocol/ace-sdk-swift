@@ -149,14 +149,19 @@ public func createRegistrationFile(
     tier: IdentityTier = .keyOnly,
     hardwareBacking: HardwareBacking? = nil,
     capabilities: [Capability]? = nil,
-    settlement: [String]? = nil,
-    chains: [ChainInfo]? = nil,
-    principal: PrincipalRecord? = nil
+    ext: ExtMap? = nil,
+    principal: PrincipalRecord? = nil,
+    timestamp: Int? = nil
 ) throws -> RegistrationFile {
     let scheme = identity.getSigningScheme()
     let signingPublicKey = identity.getSigningPublicKey()
+    let registeredAt = timestamp ?? systemClock()
+    guard isWireInt(registeredAt) else { throw ACEError(.invalidArgument, "timestamp must be a wire integer") }
+    let enc = ACEBase64.encode(identity.getEncryptionPublicKey())
+    let signature = try encodeSignature(identity.sign(bindingSignData(aceId: identity.getACEId(), timestamp: registeredAt, encryptionPublicKey: enc, signingPublicKey: ACEBase64.encode(signingPublicKey))), scheme: scheme)
     let reg = RegistrationFile(
         ace: "1.0",
+        registeredAt: registeredAt, registrationSignature: signature,
         id: identity.getACEId(),
         name: name,
         description: description,
@@ -170,14 +175,13 @@ public func createRegistrationFile(
             encryptionPublicKey: ACEBase64.encode(identity.getEncryptionPublicKey())
         ),
         capabilities: capabilities,
-        settlement: settlement,
-        chains: chains,
+        ext: ext,
         principal: principal
     )
     // R-P44: a file being published must carry a principal valid at the real now: an expired or
     // future-dated one is `invalid_principal` (no issuedAt-relative clock, no expired-only drop).
     let now = systemClock()
     if let principal { try validatePrincipalRecord(principal, subjectSigningPublicKey: signingPublicKey, now: now) }
-    _ = try verifyRegistrationFile(reg, pinnedAt: 0, clock: { now })
+    _ = try verifyRegistrationFile(reg, clock: { now })
     return reg
 }

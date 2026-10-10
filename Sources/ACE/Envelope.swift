@@ -9,7 +9,7 @@ import Foundation
 
 /// Decode an envelope from its JSON bytes, applying the 04 decoding rules exactly.
 ///
-/// Errors: `unsupported_version` for an `ace` string other than `"1.0"`, otherwise
+/// Errors: `unsupported_version` for an `ace` string other than `"2.0"`, otherwise
 /// `invalid_envelope`. Unknown fields at any level are ignored.
 public func decodeEnvelope(_ json: Data) throws -> ACEMessage {
     let v: JValue
@@ -32,7 +32,7 @@ func decodePayload(_ text: String) throws -> Data {
 func decodeEnvelope(value v: JValue) throws -> ACEMessage {
     guard let o = v.objectValue else { throw bad("envelope must be a JSON object") }
     guard let ace = o["ace"]?.stringValue else { throw bad("ace must be a string") }
-    guard ace == "1.0" else {
+    guard ace == "2.0" else {
         throw ACEError(.unsupportedVersion, "unsupported ACE version '\(String(ace.prefix(16)))'")
     }
     guard let messageId = o["messageId"]?.stringValue, isMessageId(messageId) else {
@@ -44,17 +44,9 @@ func decodeEnvelope(value v: JValue) throws -> ACEMessage {
     guard let conversationId = o["conversationId"]?.stringValue, isConversationId(conversationId) else {
         throw bad("conversationId must be 64 lowercase hex characters")
     }
-    guard let typeText = o["type"]?.stringValue, let type = MessageType(rawValue: typeText) else {
-        throw bad("unknown message type")
+    guard !["type", "threadId", "body", "schemaDigest"].contains(where: { o[$0] != nil }) else {
+        throw bad("application metadata belongs inside encrypted content")
     }
-    var threadId: String?
-    if let t = o["threadId"] {
-        guard let s = t.stringValue, isThreadId(s) else {
-            throw bad("threadId must be 1..256 code points without control characters")
-        }
-        threadId = s
-    }
-    if threadId == nil && type.isEconomic { throw bad("economic messages require threadId") }
     guard let timestamp = o["timestamp"]?.wireInt else { throw bad("timestamp must be an integer in [0, 2^53-1]") }
     guard let enc = o["encryption"]?.objectValue else { throw bad("encryption must be an object") }
     guard let kem = enc["kemCiphertext"]?.stringValue else { throw bad("encryption.kemCiphertext must be a Base64 string") }
@@ -68,8 +60,7 @@ func decodeEnvelope(value v: JValue) throws -> ACEMessage {
     guard let value = sig["value"]?.stringValue else { throw bad("signature.value must be a string") }
     _ = try decodeSignature(value, scheme: scheme, code: .invalidEnvelope)
     return ACEMessage(
-        ace: ace, messageId: messageId, from: from, to: to, conversationId: conversationId, type: type,
-        threadId: threadId, timestamp: timestamp,
+        ace: ace, messageId: messageId, from: from, to: to, conversationId: conversationId, timestamp: timestamp,
         encryption: EncryptionEnvelope(kemCiphertext: kem, payload: payload),
         signature: SignatureEnvelope(scheme: scheme, value: value)
     )
@@ -82,12 +73,11 @@ func revalidate(_ env: ACEMessage) throws -> ACEMessage {
 
 func messageSignData(_ env: ACEMessage) throws -> Data {
     let payload = ACESigning.encodePayload([
-        .string(env.type.rawValue), .string(env.to), .string(env.conversationId), .string(env.messageId),
-        .string(env.threadId ?? ""),
+        .string(env.to), .string(env.conversationId), .string(env.messageId),
         .data(try ACEEncryption.decodeKemCiphertext(env.encryption.kemCiphertext)),
         .data(try decodePayload(env.encryption.payload)),
     ])
-    return try ACESigning.buildSignData(action: "message", aceId: env.from, timestamp: env.timestamp, payload: payload)
+    return try ACESigning.buildSignData(action: "packet", aceId: env.from, timestamp: env.timestamp, payload: payload)
 }
 
 /// Signature-only check against a known signer.

@@ -76,8 +76,6 @@ final class KeychainIdentity: ACEIdentity, @unchecked Sendable {
 
 }
 
-private let relayURL = "https://relay.example"
-private let relayClient = try! RelayClient(baseURL: URL(string: relayURL)!)
 
 /// Two parties with pinned registration-file peers over a shared clock.
 struct Pair {
@@ -94,18 +92,18 @@ struct Pair {
         self.bobStore = bobStore
         alicePeers = try PeerStore(store: aliceStore, clock: clock.fn)
         bobPeers = try PeerStore(store: bobStore, clock: clock.fn)
-        try await alicePeers.pinRegistrationFile(try createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example"), pinnedAt: 1)
-        try await bobPeers.pinRegistrationFile(try createRegistrationFile(for: alice, name: "Alice", endpoint: "https://alice.example"), pinnedAt: 1)
+        try await alicePeers.pinRegistrationFile(try createRegistrationFile(for: bob, name: "Bob", endpoint: "https://bob.example", timestamp: 1))
+        try await bobPeers.pinRegistrationFile(try createRegistrationFile(for: alice, name: "Alice", endpoint: "https://alice.example", timestamp: 1))
     }
 
     func outbox(_ who: SoftwareIdentity) async throws -> Outbox {
-        try await Outbox.open(identity: who, store: who.getACEId() == alice.getACEId() ? aliceStore : bobStore, clock: clock.fn)
+        try await Outbox.open(identity: who, store: who.getACEId() == alice.getACEId() ? aliceStore : bobStore, clock: clock.fn, commerce: true)
     }
 
     func inbox(_ who: SoftwareIdentity, _ sink: Sink) async throws -> Inbox {
         let isAlice = who.getACEId() == alice.getACEId()
         return try await Inbox.open(identity: who, store: isAlice ? aliceStore : bobStore, peers: isAlice ? alicePeers : bobPeers,
-                                    onMessage: sink.handler, clock: clock.fn)
+                                    onMessage: sink.handler, clock: clock.fn, commerce: true)
     }
 }
 
@@ -131,23 +129,23 @@ struct PipelineTests {
 
         let rfq = try await aOut.stage(recipient: bobPeer, type: .rfq, body: ["need": "translate"], threadId: "t1", requestId: "r1")
         // Idempotent stage; a second pending send on the thread conflicts.
-        #expect(try await aOut.stage(recipient: bobPeer, type: .rfq, body: ["need": "other"], threadId: "t1", requestId: "r1") == rfq)
+        await expectCodeAsync(.pendingSendConflict) { try await aOut.stage(recipient: bobPeer, type: .rfq, body: ["need": "other"], threadId: "t1", requestId: "r1") }
+        #expect(try await aOut.stage(recipient: bobPeer, type: .rfq, body: ["need": "translate"], threadId: "t1", requestId: "r1") == rfq)
         await expectCodeAsync(.pendingSendConflict) {
             try await aOut.stage(recipient: bobPeer, type: .offer, body: ["price": "1", "currency": "USDC"], threadId: "t1", requestId: "r2")
         }
         let wire = Locked<[ACEMessage]>([])
         try await aOut.deliver("r1") { env in wire.mutate { $0.append(env) } }
         #expect(try await aOut.pending().isEmpty)
-        #expect(isDelivered(try await bIn.receive(wire.value[0].jsonData(), source: .relay(url: relayURL, streamId: "1-1"))))
+        #expect(isDelivered(try await bIn.receive(wire.value[0].jsonData())))
         #expect(bSink.has(rfq.message))
-        #expect(isDuplicate(try await bIn.receive(wire.value[0].jsonData(), source: .relay(url: relayURL + "/", streamId: "1-1"))))
-        #expect(await bIn.cursor(for: try RelayClient(baseURL: URL(string: "HTTPS://RELAY.example/")!)) == "1-1")
+        #expect(isDuplicate(try await bIn.receive(wire.value[0].jsonData())))
 
         let offer = try await bOut.stage(recipient: alicePeer, type: .offer, body: ["price": "5", "currency": "USDC"], threadId: "t1")
         // Offer stays pending (no ack): alice's accept later proves delivery.
-        #expect(isDelivered(try await aIn.receive(offer.message.jsonData(), source: .direct)))
+        #expect(isDelivered(try await aIn.receive(offer.message.jsonData())))
         let accept = try await aOut.stage(recipient: bobPeer, type: .accept, body: ["offerId": .string(offer.message.messageId)], threadId: "t1")
-        #expect(isDelivered(try await bIn.receive(accept.message.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(accept.message.jsonData())))
         #expect(try await bOut.pending().map(\.requestId) == [])  // proven by alice's accept
         #expect(try await aOut.pending().map(\.requestId) == [accept.requestId])
 
@@ -168,7 +166,7 @@ struct PipelineTests {
         let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
         let rfq = try await (try await p.outbox(p.alice)).stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "gone")
         let bIn = try await p.inbox(p.bob, Sink())
-        #expect(isDelivered(try await bIn.receive(rfq.message.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(rfq.message.jsonData())))
         await bIn.close()
         let threads = try ThreadStore(store: p.bobStore, localAceId: p.bob.getACEId(), clock: p.clock.fn)
         let cid = rfq.message.conversationId
@@ -206,7 +204,7 @@ struct PipelineTests {
         #expect(try threads.get(conversationId: staged.message.conversationId, threadId: "t9")?.history.last?.timestamp == 1741001000)
         // The receiver accepts the re-signed envelope.
         let bIn = try await p.inbox(p.bob, Sink())
-        #expect(isDelivered(try await bIn.receive(resigned.message.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(resigned.message.jsonData())))
         try await aOut.abandon("q")
         try await aOut.abandon("unknown")
         #expect(try threads.get(conversationId: staged.message.conversationId, threadId: "t9") == nil)
@@ -226,7 +224,7 @@ struct PipelineTests {
         let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
         // Staged by `first` (which remembers its thread), found by `second` only by scanning.
         let staged = try await first.stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "t1")
-        #expect(try await second.stage(recipient: bobPeer, type: .rfq, body: ["need": "y"], threadId: "t2",
+        #expect(try await second.stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "t1",
                                        requestId: staged.requestId) == staged)
         // `second` clears it; `first`'s remembered thread no longer holds it.
         try await second.deliver(staged.requestId) { _ in }
@@ -235,45 +233,39 @@ struct PipelineTests {
         #expect(try await first.pending().isEmpty)
     }
 
-    @Test func quarantineAndDirectRules() async throws {
+    @Test func quarantineRules() async throws {
         let p = try await Pair()
         let sink = Sink()
         let bIn = try await p.inbox(p.bob, sink)
         let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        // Undecodable: quarantined without fingerprint, cursor still advances.
-        let o1 = try await bIn.receive(Data("{}".utf8), source: .relay(url: relayURL, streamId: "1-1"))
+        // Undecodable: quarantined without fingerprint, nothing persisted.
+        let o1 = try await bIn.receive(Data("{}".utf8))
         if case .quarantined(let e, let fp) = o1 { #expect(e.code == .invalidEnvelope && fp == nil) } else { Issue.record("\(o1)") }
-        #expect(await bIn.cursor(for: relayClient) == "1-1")
-        // Tampered signature from relay: quarantine record written.
+        #expect(try p.bobStore.list(prefix: "quarantine/").isEmpty)
+        // Tampered signature: quarantine record written.
         let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "x"],
                                     threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
         let resignedByBob = try ACE.resign(env, sender: p.bob, timestamp: env.timestamp)
         let forged = ACEMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
-                                type: env.type, timestamp: env.timestamp, encryption: env.encryption,
+                                timestamp: env.timestamp, encryption: env.encryption,
                                 signature: SignatureEnvelope(scheme: .ed25519, value: ACEBase64.encode(Data(repeating: 1, count: 64))))
         _ = resignedByBob
-        let o2 = try await bIn.receive(forged.jsonData(), source: .relay(url: relayURL, streamId: "1-2"))
+        let o2 = try await bIn.receive(forged.jsonData())
         #expect(code(o2) == .invalidSignature)
         #expect(try p.bobStore.list(prefix: "quarantine/") == ["quarantine/\(envelopeFingerprint(forged)).json"])
         // The authentic one still delivers (quarantine is keyed by fingerprint).
-        #expect(isDelivered(try await bIn.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "1-3"))))
-        // Direct: stale is quarantined, nothing persisted.
+        #expect(isDelivered(try await bIn.receive(env.jsonData())))
+        // No ±300 s freshness check on the inner envelope (that is the MLS handshake's job):
+        // inside the offline window it is simply a duplicate.
         p.clock.now += 1000
-        let late = try await bIn.receive(env.jsonData(), source: .direct)
-        #expect(code(late) == .staleTimestamp)
+        #expect(isDuplicate(try await bIn.receive(env.jsonData())))
         #expect(try p.bobStore.list(prefix: "quarantine/").count == 1)
-        // Extreme clocks read as 0 / 2^53 − 1, so the message is stale.
-        let saved = p.clock.now
-        for extreme in [Int.min, Int.max] {
-            p.clock.now = extreme
-            #expect(code(try await bIn.receive(env.jsonData(), source: .direct)) == .staleTimestamp)
-        }
-        p.clock.now = saved
-        // Unknown sender (no relay, no pin) is permanent → quarantined.
+        // Unknown sender (no relay, no pin) is permanent → quarantined and persisted.
         let stranger = try SoftwareIdentity.generate(scheme: .ed25519)
         let s = try createMessage(sender: stranger, recipient: bobPeer, type: .text, body: ["message": "?"],
                                   threads: try ThreadStateMachine(localAceId: stranger.getACEId()), timestamp: p.clock.now)
-        #expect(code(try await bIn.receive(s.jsonData(), source: .direct)) == .unknownPeer)
+        #expect(code(try await bIn.receive(s.jsonData())) == .unknownPeer)
+        #expect(try p.bobStore.list(prefix: "quarantine/").count == 2)
         #expect(sink.count == 1)
         await bIn.close()
     }
@@ -289,7 +281,7 @@ struct PipelineTests {
             // Opening on a fresh store with the extreme clock seeds the replay horizon from the clamped clock.
             p.clock.now = extreme
             let bIn = try await p.inbox(p.bob, sink)
-            let o = try await bIn.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "1-1"))
+            let o = try await bIn.receive(env.jsonData())
             #expect(code(o) == .staleTimestamp, "clock \(extreme): \(o)")
             #expect(sink.count == 0)
             await bIn.close()
@@ -308,7 +300,7 @@ struct PipelineTests {
                                     body: ["need": "x"], threads: try ThreadStateMachine(localAceId: p.alice.getACEId()),
                                     threadId: "z", timestamp: p.clock.now)
         let b2 = try await p.inbox(p.bob, Sink())
-        #expect(isDelivered(try await b2.receive(env.jsonData(), source: .direct)))
+        #expect(isDelivered(try await b2.receive(env.jsonData())))
         await b2.close()
         try p.bobStore.delete("replay.json")
         await expectCodeAsync(.storageFailed) { try await p.inbox(p.bob, Sink()) }
@@ -320,26 +312,24 @@ struct PipelineTests {
         let alice = Fixtures.agent("alice")
         let store = FailingStore()  // host-provided ACEStore
         let peers = try PeerStore(store: store, clock: clock.fn)
-        try await peers.pinRegistrationFile(try createRegistrationFile(for: alice, name: "A", endpoint: "https://a.example"), pinnedAt: 1)
+        try await peers.pinRegistrationFile(try createRegistrationFile(for: alice, name: "A", endpoint: "https://a.example", timestamp: 1))
         let sink = Sink()
-        let inbox = try await Inbox.open(identity: se, store: store, peers: peers, onMessage: sink.handler, clock: clock.fn)
-        let sePeer = try verifyRegistrationFile(try createRegistrationFile(for: se, name: "SE", endpoint: "https://se.example"), pinnedAt: 1)
+        let inbox = try await Inbox.open(identity: se, store: store, peers: peers, onMessage: sink.handler, clock: clock.fn, commerce: true)
+        let sePeer = try verifyRegistrationFile(try createRegistrationFile(for: se, name: "SE", endpoint: "https://se.example"))
         let env = try createMessage(sender: alice, recipient: sePeer, type: .rfq, body: ["need": "x"],
                                     threads: try ThreadStateMachine(localAceId: alice.getACEId()), threadId: "k", timestamp: clock.now)
         se.keychainAvailable = false
-        let o = try await inbox.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "2-1"))
+        let o = try await inbox.receive(env.jsonData())
         #expect(code(o) == .identityUnavailable)
         #expect(o.error?.isTransient == true)
-        #expect(await inbox.cursor(for: relayClient) == nil)
         #expect(try store.read("replay.json").map { String(decoding: $0, as: UTF8.self).contains(env.messageId) } == false)
         se.keychainAvailable = true
-        #expect(isDelivered(try await inbox.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "2-1"))))
-        let cursorNow = await inbox.cursor(for: relayClient)
-        #expect(sink.count == 1 && cursorNow == "2-1")
+        #expect(isDelivered(try await inbox.receive(env.jsonData())))
+        #expect(sink.count == 1)
 
         // The SE identity can also send and stage through the Outbox.
         let out = try await Outbox.open(identity: se, store: store, clock: clock.fn)
-        let alicePeer = try verifyRegistrationFile(try createRegistrationFile(for: alice, name: "A", endpoint: "https://a.example"), pinnedAt: 1)
+        let alicePeer = try verifyRegistrationFile(try createRegistrationFile(for: alice, name: "A", endpoint: "https://a.example", timestamp: 1))
         let offer = try await out.stage(recipient: alicePeer, type: .offer, body: ["price": "1", "currency": "USDC"], threadId: "k")
         try verifyEnvelopeSignature(offer.message, scheme: .ed25519, signingPublicKey: se.getSigningPublicKey())
         await inbox.close()
@@ -353,45 +343,22 @@ struct PipelineTests {
         let env = try createMessage(sender: p.alice, recipient: try await p.alicePeers.get(p.bob.getACEId())!, type: .text,
                                     body: ["message": "x"], threads: try ThreadStateMachine(localAceId: p.alice.getACEId()),
                                     timestamp: p.clock.now)
-        #expect(code(try await bIn.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "1-1"))) == .handlerFailed)
-        #expect(await bIn.cursor(for: relayClient) == nil)
+        #expect(code(try await bIn.receive(env.jsonData())) == .handlerFailed)
         await bIn.close()
         // Recovery during open surfaces handler_failed; the record stays pending.
         await expectCodeAsync(.handlerFailed) { try await p.inbox(p.bob, sink) }
         sink.failing = false
         let reopened = try await p.inbox(p.bob, sink)
         #expect(sink.has(env))
-        #expect(isDuplicate(try await reopened.receive(env.jsonData(), source: .relay(url: relayURL, streamId: "1-1"))))
-        #expect(await reopened.cursor(for: relayClient) == "1-1")
+        #expect(isDuplicate(try await reopened.receive(env.jsonData())))
         await reopened.close()
-    }
-
-    @Test func pullAndFollowThroughRelay() async throws {
-        let p = try await Pair()
-        let fake = FakeRelay()
-        let relay = try makeRelay(fake.handle, clock: p.clock.fn)
-        let aOut = try await p.outbox(p.alice)
-        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        for i in 0..<5 {
-            let s = try await aOut.stage(recipient: bobPeer, type: .text, body: ["message": .string("m\(i)")])
-            try await aOut.deliver(s.requestId) { try await relay.send($0) }
-        }
-        let sink = Sink()
-        let bIn = try await p.inbox(p.bob, sink)
-        let r = await bIn.pull(relay, limit: 2)
-        #expect(r.delivered == 5 && r.blocked == nil)
-        #expect(await bIn.cursor(for: relay) == "1741000000000-5")
-        let again = await bIn.pull(relay)
-        #expect(again.delivered == 0 && again.duplicates == 0)
-        #expect(sink.count == 5)
-        await bIn.close()
     }
 
     // MARK: crash injection
 
-    /// Fail the Nth store write of one non-economic receive (1 delivery, 2 replay, 3 ack,
-    /// 4 cursor), reopen, re-receive: no lost message and no duplicate effect.
-    @Test(arguments: 1...5) func crashInjection(_ failAt: Int) async throws {
+    /// Fail the Nth store write of one non-economic receive (1 delivery, 2 replay, 3 ack),
+    /// reopen, re-receive: no lost message and no duplicate effect.
+    @Test(arguments: 1...4) func crashInjection(_ failAt: Int) async throws {
         let store = FailingStore()
         let p = try await Pair(bobStore: store)
         let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
@@ -400,22 +367,54 @@ struct PipelineTests {
         let sink = Sink()
         var inbox = try await p.inbox(p.bob, sink)
         store.arm(failWrite: failAt)
-        let first = try await inbox.receive(message.jsonData(), source: .relay(url: relayURL, streamId: "1-2"))
+        let first = try await inbox.receive(message.jsonData())
         store.arm(failWrite: nil)
-        if failAt <= 4 { #expect(code(first) == .storageFailed, "failAt \(failAt): \(first)") } else { #expect(isDelivered(first)) }
-        if failAt >= 2 && failAt <= 4 {
+        // Writes: 1 delivery record (commit point), 2 ack, 3 replay.json at close (journaled by the record).
+        if failAt <= 2 { #expect(code(first) == .storageFailed, "failAt \(failAt): \(first)") } else { #expect(isDelivered(first)) }
+        if failAt == 2 {
             // Failed state until reopened.
-            #expect(code(try await inbox.receive(message.jsonData(), source: .direct)) == .storageFailed)
+            #expect(code(try await inbox.receive(message.jsonData())) == .storageFailed)
         }
         await inbox.close()
         inbox = try await p.inbox(p.bob, sink)
-        let retry = try await inbox.receive(message.jsonData(), source: .relay(url: relayURL, streamId: "1-2"))
+        let retry = try await inbox.receive(message.jsonData())
         #expect(isDelivered(retry) || isDuplicate(retry), "failAt \(failAt): retry \(retry)")
         #expect(sink.has(message) && sink.count == 1)
         #expect(sink.calls <= 2)
-        #expect(await inbox.cursor(for: relayClient) == "1-2")
-        #expect(!(try await isAcceptedByReplay(store, message)))
         await inbox.close()
+        #expect(!(try await isAcceptedByReplay(store, message)))
+    }
+
+    /// The delivery records journal the seen store between writes of replay.json: a crash
+    /// (no close) loses no commit, and a record a horizon covers in memory only is kept until a
+    /// written replay.json covers it.
+    @Test func deliveryRecordsJournalTheSeenStore() async throws {
+        let p = try await Pair()
+        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
+        func text(_ s: String, at t: Int) throws -> ACEMessage {
+            try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": .string(s)], timestamp: t)
+        }
+        let first = try text("one", at: p.clock.now - 1), second = try text("two", at: p.clock.now)
+        let sink = Sink()
+        func open() async throws -> Inbox {
+            // Quota 1: the second message evicts the first and raises H[alice] over it, in memory.
+            try await Inbox.open(identity: p.bob, store: p.bobStore, peers: p.bobPeers, onMessage: sink.handler, capacity: 16, clock: p.clock.fn)
+        }
+        var inbox: Inbox? = try await open()
+        #expect(isDelivered(try await inbox!.receive(first.jsonData())))
+        #expect(isDelivered(try await inbox!.receive(second.jsonData())))
+        #expect(try p.bobStore.list(prefix: "deliveries/").count == 2)
+        inbox = nil  // crash: replay.json was never rewritten
+        #expect(try await isAcceptedByReplay(p.bobStore, first))
+        inbox = try await open()
+        #expect(isDuplicate(try await inbox!.receive(first.jsonData())))
+        #expect(isDuplicate(try await inbox!.receive(second.jsonData())))
+        #expect(sink.count == 2 && sink.calls == 2)
+        await inbox!.close()
+        // Written at close: the covered record of the first message is pruned, the second kept.
+        #expect(!(try await isAcceptedByReplay(p.bobStore, first)))
+        #expect(!(try await isAcceptedByReplay(p.bobStore, second)))
+        #expect(try p.bobStore.list(prefix: "deliveries/").count == 1)
     }
 
     /// The same, for an economic message that is valid (seller offer → buyer).
@@ -429,15 +428,15 @@ struct PipelineTests {
         var aIn = try await p.inbox(p.alice, sink)
         let bIn = try await p.inbox(p.bob, Sink())
         let rfq = try await aOut.stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "e")
-        #expect(isDelivered(try await bIn.receive(rfq.message.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(rfq.message.jsonData())))
         let offer = try await bOut.stage(recipient: alicePeer, type: .offer, body: ["price": "2", "currency": "USDC"], threadId: "e")
 
         aliceStore.arm(failWrite: failAt)
-        let first = try await aIn.receive(offer.message.jsonData(), source: .relay(url: relayURL, streamId: "9-1"))
+        let first = try await aIn.receive(offer.message.jsonData())
         aliceStore.arm(failWrite: nil)
         await aIn.close()
         aIn = try await p.inbox(p.alice, sink)
-        let retry = try await aIn.receive(offer.message.jsonData(), source: .relay(url: relayURL, streamId: "9-1"))
+        let retry = try await aIn.receive(offer.message.jsonData())
         #expect(isDelivered(retry) || isDuplicate(retry), "failAt \(failAt): first \(first), retry \(retry)")
         #expect(sink.has(offer.message) && sink.count == 1)
         #expect(sink.calls <= 2)
@@ -446,7 +445,6 @@ struct PipelineTests {
         #expect(snap.state == .offered && snap.history.map(\.messageId) == [rfq.message.messageId, offer.message.messageId])
         // The rfq's pending send was proven delivered by the offer.
         #expect(try await aOut.pending().isEmpty)
-        #expect(await aIn.cursor(for: relayClient) == "9-1")
         await aIn.close(); await bIn.close()
     }
 
@@ -461,10 +459,10 @@ struct PipelineTests {
             let r = try await bOut.stage(recipient: alicePeer, type: .offer, body: ["price": "1", "currency": "USDC"],
                                          threadId: m.threadId, requestId: "reply-\(m.messageId)")
             replies.mutate { $0.append(r) }
-        }, clock: p.clock.fn)
+        }, clock: p.clock.fn, commerce: true)
         let aOut = try await p.outbox(p.alice)
         let rfq = try await aOut.stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "h")
-        #expect(isDelivered(try await bIn.receive(rfq.message.jsonData(), source: .direct)))
+        #expect(isDelivered(try await bIn.receive(rfq.message.jsonData())))
         #expect(replies.value.count == 1)
         await bIn.close()
     }
@@ -476,7 +474,7 @@ struct PipelineTests {
         let rfq = try await (try await p.outbox(p.alice)).stage(recipient: bobPeer, type: .rfq, body: ["need": "x"], threadId: "f")
         let bIn = try await p.inbox(p.bob, Sink())
         store.arm(failWrite: 2)  // thread record write, after the commit point
-        #expect(code(try await bIn.receive(rfq.message.jsonData(), source: .direct)) == .storageFailed)
+        #expect(code(try await bIn.receive(rfq.message.jsonData())) == .storageFailed)
         store.arm(failWrite: nil)
         expectCode(.lockBusy) { try store.lock("threads", timeout: 0.1) }
         await bIn.close()
@@ -488,30 +486,4 @@ struct PipelineTests {
         _ = bOut
     }
 
-    @Test func followYieldsLiveOutcomes() async throws {
-        let p = try await Pair()
-        let bobPeer = try await p.alicePeers.get(p.bob.getACEId())!
-        let env = try createMessage(sender: p.alice, recipient: bobPeer, type: .text, body: ["message": "live"],
-                                    threads: try ThreadStateMachine(localAceId: p.alice.getACEId()), timestamp: p.clock.now)
-        let frame = "id: 5-1\nevent: message\ndata: \(String(decoding: env.jsonData(), as: UTF8.self))\n\n"
-        let relay = try makeRelay({ req, _ in
-            switch req.url!.path {
-            case "/v1/inbox": return .json(200, ["messages": [], "cursor": NSNull()])
-            case "/v1/listen":
-                return req.url!.query?.contains("since=5-1") == true ? .error(401, "invalid_signature") : .sse([frame])
-            default: return .error(404, "x")
-            }
-        }, clock: p.clock.fn)
-        let sink = Sink()
-        let bIn = try await p.inbox(p.bob, sink)
-        var outcomes: [ReceiveOutcome] = []
-        do {
-            for try await o in bIn.follow(relay) { outcomes.append(o) }
-        } catch let e as ACEError {
-            #expect(e.code == .relayRejected)
-        }
-        #expect(outcomes.count == 1 && isDelivered(outcomes[0]) && sink.has(env))
-        #expect(await bIn.cursor(for: relay) == "5-1")
-        await bIn.close()
-    }
 }

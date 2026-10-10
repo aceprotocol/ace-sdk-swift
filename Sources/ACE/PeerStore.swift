@@ -19,6 +19,10 @@ public actor PeerStore {
     private let relay: RelayClient?
     private let ttlSeconds: Int
     private let clock: @Sendable () -> Int
+    /// Horizon rows already validated: their exact bytes and record, by key. The key binds the
+    /// ACE ID (so the signing key), account and signer, so equal bytes validate identically.
+    private var horizons: [String: (raw: Data, record: PrincipalRecord)] = [:]
+    private static let horizonsCap = 1024
 
     public init(store: any ACEStore, relay: RelayClient? = nil, ttlSeconds: Int = 86400,
                 clock: @escaping @Sendable () -> Int = systemClock) throws {
@@ -29,10 +33,15 @@ public actor PeerStore {
         self.clock = wireClock(clock)
     }
 
-    private func load(_ aceId: String) throws -> PinnedPeer? {
+    private func load(_ aceId: String, enforceHorizon: Bool = true) throws -> PinnedPeer? {
         let key = PinnedPeer.key(aceId)
         guard let v = try store.readJSON(key) else { return nil }
-        return try PinnedPeer.parse(v, key: key, aceId: aceId)
+        let result = try PinnedPeer.parse(v, key: key, aceId: aceId)
+        if enforceHorizon {
+            do { try checkPrincipalHorizon(result.peer, persist: false) }
+            catch { throw storageError(key, "principal conflicts with durable horizon") }
+        }
+        return result
     }
 
     /// The pin regardless of TTL, or nil.
@@ -83,18 +92,53 @@ public actor PeerStore {
     public func adopt(_ peer: VerifiedPeer) throws -> AdoptResult {
         try store.withLock("peers") {
             let now = clock()
-            let pin = try load(peer.aceId)
+            let pin = try load(peer.aceId, enforceHorizon: false)
             let (next, outcome) = try adoptDecision(pin: pin?.peer, candidate: peer, now: now)
-            // A kept candidate (even an unsigned file) replaces the cached profile and fetchedAt (02).
+            try checkPrincipalHorizon(next)
+            // A kept candidate replaces the cached profile and fetchedAt (02).
             try store.checkedWrite(PinnedPeer.key(peer.aceId), PinnedPeer(peer: next, fetchedAt: now).data())
             return AdoptResult(peer: next, outcome: outcome)
         }
     }
 
-    /// Verify a registration file (`registeredAt = pinnedAt ?? now`) and adopt it.
+    /// Keep the authority barrier independently of the evictable key/profile cache.
+    private func checkPrincipalHorizon(_ peer: VerifiedPeer, persist: Bool = true) throws {
+        guard let next = peer.principal else { return }
+        let domain = [peer.aceId, next.account, next.signer.scheme, next.signer.publicKey].joined(separator: "\0")
+        let key = "principal-horizons/\(sha256Hex(Data(domain.utf8))).json"
+        var high: PrincipalRecord?
+        if let raw = try store.checkedRead(key) {
+            if let cached = horizons[key], cached.raw == raw {
+                high = cached.record
+            } else {
+                let value: JValue
+                do { value = try JSONParser.parse(raw) } catch { throw ACEError(.storageFailed, "\(key) is not valid JSON") }
+                do {
+                    guard let o = value.objectValue, o["aceId"]?.stringValue == peer.aceId,
+                          let p = o["principal"] else { throw storageError(key, "wrong record") }
+                    try checkVersion(o, key)
+                    let record = try PrincipalRecord.parse(p)
+                    guard record.account == next.account, record.signer == next.signer else { throw storageError(key, "wrong authority") }
+                    high = try validatePrincipalRecord(record, subjectSigningPublicKey: peer.signingPublicKey, now: record.issuedAt)
+                } catch { throw storageError(key, "invalid principal horizon") }
+                if horizons.count >= Self.horizonsCap { horizons.removeAll() }
+                horizons[key] = (raw, high!)
+            }
+        }
+        if let high, next.issuedAt < high.issuedAt || (next.issuedAt == high.issuedAt && !next.sameClaims(as: high)) {
+            throw ACEError(.invalidPrincipal, "principal rolls back or conflicts with the durable horizon")
+        }
+        if persist && (high == nil || next.issuedAt > high!.issuedAt) {
+            try store.checkedWrite(key, JSONWriter.serialize(.object([
+                "aceId": .string(peer.aceId), "principal": next.jvalue, "version": num(1)
+            ])))
+        }
+    }
+
+    /// Verify a registration file (signed binding time) and adopt it.
     @discardableResult
-    public func pinRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil) throws -> VerifiedPeer {
-        let candidate = try verifyRegistrationFile(reg, pinnedAt: pinnedAt ?? clock(), clock: clock)
+    public func pinRegistrationFile(_ reg: RegistrationFile) throws -> VerifiedPeer {
+        let candidate = try verifyRegistrationFile(reg, clock: clock)
         return try adopt(candidate).peer
     }
 

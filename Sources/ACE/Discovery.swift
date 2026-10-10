@@ -13,7 +13,7 @@ import Foundation
 public enum PeerSource: String, Codable, Sendable {
     /// A relay `PeerRecord` with a verified `registrationSignature`.
     case relay
-    /// A registration file (no signed timestamp; `registeredAt` is the pin time).
+    /// A registration file with a verified signed key binding and timestamp.
     case registration
 }
 
@@ -25,8 +25,8 @@ public struct VerifiedPeer: Sendable, Equatable {
     public let signingPublicKey: Data
     public let encryptionPublicKey: Data
     public let registeredAt: Int
-    /// The relay binding signature; `nil` for a registration-file peer.
-    public let registrationSignature: String?
+    /// Verified key-binding signature, for every discovery source.
+    public let registrationSignature: String
     public let source: PeerSource
     /// Discovery profile as served by the relay. **Unverified** metadata: it is
     /// self-asserted and not covered by the binding signature. Never use it for trust decisions.
@@ -36,7 +36,7 @@ public struct VerifiedPeer: Sendable, Equatable {
     public var principal: PrincipalRecord? { profile?.principal }
 
     init(aceId: String, scheme: SigningScheme, signingPublicKey: Data, encryptionPublicKey: Data, registeredAt: Int,
-         registrationSignature: String?, source: PeerSource, profile: AgentProfile?) {
+         registrationSignature: String, source: PeerSource, profile: AgentProfile?) {
         self.aceId = aceId
         self.scheme = scheme
         self.signingPublicKey = signingPublicKey
@@ -81,32 +81,32 @@ private func optObject(_ o: [String: JValue], _ key: String, _ code: ACEError.Co
     return d
 }
 
+/// The `ext` member as an `ExtMap` (`null` = absent). Only the object shape is checked here;
+/// the rules are `validateExt`. Failures are `invalid_profile` (profiles and registration files).
+private func optExt(_ o: [String: JValue], _ what: String) throws -> ExtMap? {
+    let code = ACEError.Code.invalidProfile
+    guard let v = o["ext"], !v.isNull else { return nil }
+    guard v.objectValue != nil else { throw ACEError(code, "\(what).ext must be a JSON object") }
+    guard let ext = JSONValue(v)?.objectValue else { throw ACEError(code, "\(what).ext contains a non-finite number") }
+    return normalizedExt(ext)  // `{}` is absent
+}
+
 extension AgentProfile {
     /// Parse the wire shape; type errors are `invalid_profile`. Unknown top-level fields
-    /// are dropped; `pricing` may contain only `currency` and `maxAmount`. The other members'
+    /// are dropped; `ext` is kept as a plain object. The other members'
     /// `validateProfile` checks run before `principal` is parsed (08 order, R-P45), so a bad
     /// member is `invalid_profile` even when the principal is malformed too.
     static func parse(_ v: JValue) throws -> AgentProfile {
         let code = ACEError.Code.invalidProfile
         guard let o = v.objectValue else { throw ACEError(code, "profile must be a JSON object") }
-        var pricing: ProfilePricing?
-        if let p = try optObject(o, "pricing", code, "profile") {
-            let extra = Set(p.keys).subtracting(["currency", "maxAmount"])
-            guard extra.isEmpty else { throw ACEError(code, "profile.pricing has unknown fields: \(extra.sorted().prefix(3))") }
-            pricing = ProfilePricing(
-                currency: try reqString(p, "currency", code, "profile.pricing"),
-                maxAmount: try optString(p, "maxAmount", code, "profile.pricing")
-            )
-        }
         var profile = AgentProfile(
             name: try optString(o, "name", code, "profile"),
             description: try optString(o, "description", code, "profile"),
             image: try optString(o, "image", code, "profile"),
             tags: try optStringList(o, "tags", code, "profile"),
             capabilities: try optStringList(o, "capabilities", code, "profile"),
-            chains: try optStringList(o, "chains", code, "profile"),
             endpoint: try optString(o, "endpoint", code, "profile"),
-            pricing: pricing
+            ext: try optExt(o, "profile")
         )
         try validateProfile(profile)
         profile.principal = try o["principal"].flatMap { $0.isNull ? nil : try PrincipalRecord.parse($0) }
@@ -120,13 +120,9 @@ extension AgentProfile {
         if let image { o["image"] = .string(image) }
         if let tags { o["tags"] = .array(tags.map { .string($0) }) }
         if let capabilities { o["capabilities"] = .array(capabilities.map { .string($0) }) }
-        if let chains { o["chains"] = .array(chains.map { .string($0) }) }
         if let endpoint { o["endpoint"] = .string(endpoint) }
-        if let pricing {
-            var p: [String: JValue] = ["currency": .string(pricing.currency)]
-            if let m = pricing.maxAmount { p["maxAmount"] = .string(m) }
-            o["pricing"] = .object(p)
-        }
+        // A non-finite number cannot pass `validateProfile`; it is written as null rather than dropped silently.
+        if let ext = normalizedExt(ext) { o["ext"] = JSONValue.object(ext).jvalue ?? .null }
         if let principal { o["principal"] = principal.jvalue }
         return .object(o)
     }
@@ -148,29 +144,12 @@ extension RegistrationFile {
             guard let caps = v.arrayValue else { throw ACEError(code, "registration.capabilities must be an array") }
             capabilities = try caps.map { c in
                 guard let c = c.objectValue else { throw ACEError(code, "registration.capabilities entries must be objects") }
-                var pricing: PricingInfo?
-                if let p = try optObject(c, "pricing", code, "capability") {
-                    pricing = PricingInfo(
-                        model: try reqString(p, "model", code, "capability.pricing"),
-                        amount: try reqString(p, "amount", code, "capability.pricing"),
-                        currency: try reqString(p, "currency", code, "capability.pricing")
-                    )
-                }
                 return Capability(
                     id: try reqString(c, "id", code, "capability"),
                     description: try reqString(c, "description", code, "capability"),
                     input: try optString(c, "input", code, "capability"),
-                    output: try optString(c, "output", code, "capability"),
-                    pricing: pricing
+                    output: try optString(c, "output", code, "capability")
                 )
-            }
-        }
-        var chains: [ChainInfo]?
-        if let v = d["chains"], !v.isNull {
-            guard let list = v.arrayValue else { throw ACEError(code, "registration.chains must be an array") }
-            chains = try list.map { c in
-                guard let c = c.objectValue else { throw ACEError(code, "registration.chains entries must be objects") }
-                return ChainInfo(network: try reqString(c, "network", code, "chain"), address: try reqString(c, "address", code, "chain"))
             }
         }
         var hardwareBacking: HardwareBacking?
@@ -180,8 +159,11 @@ extension RegistrationFile {
         }
         let schemeText = try reqString(signing, "scheme", code, "signing")
         guard let scheme = SigningScheme(rawValue: schemeText) else { throw ACEError(code, "unsupported signing.scheme") }
+        guard let registeredAt = d["registeredAt"]?.wireInt else { throw ACEError(code, "registeredAt must be a wire integer") }
         return RegistrationFile(
             ace: try reqString(d, "ace", code, "registration"),
+            registeredAt: registeredAt,
+            registrationSignature: try reqString(d, "registrationSignature", code, "registration"),
             id: try reqString(d, "id", code, "registration"),
             name: try reqString(d, "name", code, "registration"),
             description: try optString(d, "description", code, "registration"),
@@ -195,8 +177,7 @@ extension RegistrationFile {
                 encryptionPublicKey: try reqString(signing, "encryptionPublicKey", code, "signing")
             ),
             capabilities: capabilities,
-            settlement: try optStringList(d, "settlement", code, "registration"),
-            chains: chains,
+            ext: try optExt(d, "registration"),
             principal: try d["principal"].flatMap { $0.isNull ? nil : try PrincipalRecord.parse($0) }
         )
     }
@@ -226,14 +207,6 @@ extension PeerRecord {
 // MARK: - Profile
 
 private let tagRegex = try! NSRegularExpression(pattern: "^[a-z0-9][a-z0-9-]*$")
-private let caip2Regex = try! NSRegularExpression(pattern: "^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$")
-private let amountRegex = try! NSRegularExpression(pattern: "^[0-9]+(\\.[0-9]+)?$")
-
-private func regexFull(_ re: NSRegularExpression, _ s: String) -> Bool {
-    guard !s.contains("\n") else { return false }
-    let r = NSRange(location: 0, length: (s as NSString).length)
-    return re.firstMatch(in: s, range: r)?.range == r
-}
 
 /// Validate a discovery profile and return it; failures are `invalid_profile`.
 @discardableResult
@@ -249,7 +222,7 @@ public func validateProfile(_ p: AgentProfile) throws -> AgentProfile {
     func tagList(_ items: [String]?, _ name: String, _ maxCount: Int) throws {
         guard let items else { return }
         guard items.count <= maxCount else { throw ACEError(code, "profile.\(name) has more than \(maxCount) items") }
-        for item in items where item.unicodeScalars.count > 32 || !regexFull(tagRegex, item) {
+        for item in items where item.unicodeScalars.count > 32 || !regexFullMatch(tagRegex, item) {
             throw ACEError(code, "profile.\(name) items must be 1-32 of [a-z0-9-]")
         }
     }
@@ -260,18 +233,10 @@ public func validateProfile(_ p: AgentProfile) throws -> AgentProfile {
     }
     try tagList(p.tags, "tags", 10)
     try tagList(p.capabilities, "capabilities", 20)
-    if let chains = p.chains, chains.count > 10 || !chains.allSatisfy({ regexFull(caip2Regex, $0) }) {
-        throw ACEError(code, "profile.chains must be at most 10 CAIP-2 identifiers")
-    }
     if let endpoint = p.endpoint, !isHTTPSURL(endpoint) {
         throw ACEError(code, "profile.endpoint must be an HTTPS URL")
     }
-    if let pricing = p.pricing {
-        try text(pricing.currency, "pricing.currency", 1, 16)
-        if let m = pricing.maxAmount, m.unicodeScalars.count > 32 || !regexFull(amountRegex, m) {
-            throw ACEError(code, "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)")
-        }
-    }
+    if let ext = normalizedExt(p.ext) { try validateExt(ext, carrier: .profile) }
     return p
 }
 
@@ -323,12 +288,9 @@ public func verifyPeerRecord(_ record: PeerRecord, clock: @Sendable () -> Int = 
 /// Run all 01 rules (including the ID hash); failures are `invalid_registration`, except a
 /// `principal` that fails 09 validation (`invalid_principal`; subject = the file's own signing key).
 ///
-/// The peer's `registeredAt` is `pinnedAt` or now (a file has no signed timestamp).
-public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil, clock: @Sendable () -> Int = systemClock) throws -> VerifiedPeer {
+/// The peer's `registeredAt` is the signed binding timestamp.
+public func verifyRegistrationFile(_ reg: RegistrationFile, clock: @Sendable () -> Int = systemClock) throws -> VerifiedPeer {
     let code = ACEError.Code.invalidRegistration
-    if let pinnedAt, !isWireInt(pinnedAt) {
-        throw ACEError(.invalidArgument, "pinnedAt must be an integer in [0, 2^53-1]")
-    }
     guard reg.ace == "1.0" else { throw ACEError(code, "ace must be '1.0'") }
     guard isACEId(reg.id) else { throw ACEError(code, "id is not an ACE ID") }
     guard !reg.name.isEmpty, !hasControlCharacter(reg.name) else {
@@ -357,10 +319,20 @@ public func verifyRegistrationFile(_ reg: RegistrationFile, pinnedAt: Int? = nil
     }
     guard computeACEId(signingKey) == reg.id else { throw ACEError(code, "id does not match the signing key") }
     let encKey = try ACEEncryption.decodeKemPublicKey(s.encryptionPublicKey, code: code)
+    guard isWireInt(reg.registeredAt) else { throw ACEError(code, "registeredAt must be a wire integer") }
+    let signature = try decodeSignature(reg.registrationSignature, scheme: s.scheme, code: code)
+    let digest = try bindingSignData(aceId: reg.id, timestamp: reg.registeredAt, encryptionPublicKey: s.encryptionPublicKey, signingPublicKey: ACEBase64.encode(signingKey))
+    guard ACESigning.verify(signData: digest, signature: signature, scheme: s.scheme, publicKey: signingKey) else {
+        throw ACEError(code, "registrationSignature does not verify")
+    }
+    let ext = normalizedExt(reg.ext)
+    if let ext { try validateExt(ext, carrier: .profile) }  // 01 § Field Reference: profile `ext` rules (`invalid_profile`)
     let now = wireNow(clock)
-    let profile = try dropExpiredPrincipal(reg.principal.map { AgentProfile(principal: $0) }, subjectSigningPublicKey: signingKey, now: now)
+    // The file supplies `ext` and `principal` to the peer profile (02 § Rollback Barrier, 1:1 member mapping).
+    let supplied = ext == nil && reg.principal == nil ? nil : AgentProfile(ext: ext, principal: reg.principal)
+    let profile = try dropExpiredPrincipal(supplied, subjectSigningPublicKey: signingKey, now: now)
     return VerifiedPeer(aceId: reg.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
-                        registeredAt: pinnedAt ?? now, registrationSignature: nil, source: .registration, profile: profile)
+                        registeredAt: reg.registeredAt, registrationSignature: reg.registrationSignature, source: .registration, profile: profile)
 }
 
 // MARK: - Rollback barrier (02)
@@ -371,9 +343,10 @@ public enum AdoptOutcome: String, Sendable {
 }
 
 /// R-P36: a principal replaces the cached one only with a strictly newer `issuedAt`, or the
-/// byte-identical record at the same `issuedAt`.
+/// same signed claims at the same `issuedAt` (signature bytes may differ).
 private func supersedes(_ new: PrincipalRecord, _ old: PrincipalRecord) -> Bool {
-    new.issuedAt > old.issuedAt || (new.issuedAt == old.issuedAt && new.jsonData() == old.jsonData())
+    new.account != old.account || new.signer != old.signer ||
+        new.issuedAt > old.issuedAt || (new.issuedAt == old.issuedAt && new.sameClaims(as: old))
 }
 
 /// Profile a signed (relay) candidate leaves in the pin (R-P36): an older `registeredAt` keeps the
@@ -413,9 +386,8 @@ private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: I
         if let v = c.image { m.image = v }
         if let v = c.tags { m.tags = v }
         if let v = c.capabilities { m.capabilities = v }
-        if let v = c.chains { m.chains = v }
         if let v = c.endpoint { m.endpoint = v }
-        if let v = c.pricing { m.pricing = v }
+        if let v = normalizedExt(c.ext) { m.ext = v }
     }
     m.principal = keep
     return m == AgentProfile() ? nil : m
@@ -423,9 +395,7 @@ private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: I
 
 /// Pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
 ///
-/// Rotation to a different encryption key requires a signed (relay) binding with a
-/// strictly newer `registeredAt`; an unsigned registration-file candidate is adopted only
-/// without a pin, or as `unchanged` when its key equals the pin (pin kept as is).
+/// Rotation to a different encryption key requires a strictly newer signed binding.
 func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws -> (VerifiedPeer, AdoptOutcome) {
     if candidate.registeredAt > now + ACELimits.timestampWindowSeconds {
         throw ACEError(.invalidPeer, "registeredAt is in the future")
@@ -434,24 +404,15 @@ func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws
     guard pin.signingPublicKey == candidate.signingPublicKey, pin.scheme == candidate.scheme else {
         throw ACEError(.invalidPeer, "signing key or scheme differs from the pinned binding")
     }
-    let unsigned = candidate.registrationSignature == nil
     if pin.encryptionPublicKey == candidate.encryptionPublicKey {
-        if unsigned {
-            // An unsigned source never changes the binding, but a kept candidate refreshes the
-            // cached profile; it can never remove or downgrade the cached principal (R-P26/R-P27).
-            return (withProfile(pin, fileProfile(cached: pin.profile, candidate: candidate.profile, now: now)), .unchanged)
-        }
         let newer = candidate.registeredAt > pin.registeredAt ? candidate : pin
         let merged = VerifiedPeer(
             aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
             encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
             registrationSignature: newer.registrationSignature, source: newer.source,
-            profile: relayProfile(pin: pin, candidate: candidate, now: now)
+            profile: candidate.source == .registration ? fileProfile(cached: pin.profile, candidate: candidate.profile, now: now) : relayProfile(pin: pin, candidate: candidate, now: now)
         )
         return (merged, .unchanged)
-    }
-    if unsigned {
-        throw ACEError(.stalePeerBinding, "an unsigned source cannot rotate a pinned encryption key")
     }
     if candidate.registeredAt > pin.registeredAt { return (candidate, .rotated) }
     throw ACEError(.stalePeerBinding, "a different encryption key requires a newer registeredAt")
@@ -587,7 +548,7 @@ public func fetchRegistrationFile(
     maxBytes: Int = ACELimits.maxRegistrationFileBytes,
     allowPrivateAddresses: Bool = false
 ) async throws -> RegistrationFile {
-    guard regexFull(domainRegex, domain) else { throw ACEError(.invalidArgument, "invalid domain") }
+    guard regexFullMatch(domainRegex, domain) else { throw ACEError(.invalidArgument, "invalid domain") }
     guard timeout > 0, timeout.isFinite else { throw ACEError(.invalidArgument, "timeout must be positive") }
     guard maxBytes >= 1 else { throw ACEError(.invalidArgument, "maxBytes must be a positive integer") }
     try resolveAndCheck(domain, allowPrivate: allowPrivateAddresses)

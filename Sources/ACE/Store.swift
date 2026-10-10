@@ -23,19 +23,47 @@ public protocol ACEStoreLock: Sendable {
 ///   and `peers`. A timeout is `receiver_busy` for `receive` and `lock_busy` otherwise
 ///   (06 § SDK Error Codes); every I/O error is `storage_failed`. `lock(_:)` uses the
 ///   default timeout `ACELimits.defaultLockTimeoutSeconds` (10 s).
-public protocol ACEStore: Sendable {
+public protocol ACEStoreData: Sendable {
     func read(_ key: String) throws -> Data?
     func write(_ key: String, _ value: Data) throws
     func delete(_ key: String) throws
     func list(prefix: String) throws -> [String]
+}
+
+/// Scope every authority-state access to a live lock. Never retain the handle or detach work.
+public protocol ACECoordinatedStore: Sendable {
+    func coordinate<T>(_ name: String, _ body: (any ACEStoreData) throws -> T) throws -> T
+}
+
+public protocol ACEStore: ACEStoreData, ACECoordinatedStore {
     func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock
 }
 
 extension ACEStore {
+    public func coordinate<T>(_ name: String, _ body: (any ACEStoreData) throws -> T) throws -> T {
+        let held = try lock(name)
+        defer { held.release() }
+        return try body(self)
+    }
     /// `lock(name, timeout: ACELimits.defaultLockTimeoutSeconds)`.
     public func lock(_ name: String) throws -> any ACEStoreLock {
         try lock(name, timeout: ACELimits.defaultLockTimeoutSeconds)
     }
+}
+
+/// The store key contract (06 Appendix A grammar, ≤ 200 bytes): `key`, or `invalid_argument`
+/// ("invalid store key …"). Public so a custom `ACEStore` can enforce what it is handed.
+@discardableResult
+public func checkKey(_ key: String) throws -> String {
+    try validateStoreKey(key)
+    return key
+}
+
+/// The lock-name contract (`^[a-z0-9][a-z0-9_-]{0,63}$`): `name`, or `invalid_argument` ("invalid lock name …").
+@discardableResult
+public func checkLockName(_ name: String) throws -> String {
+    try validateLockName(name)
+    return name
 }
 
 /// Lock-name grammar `^[a-z0-9][a-z0-9_-]{0,63}$` (`invalid_argument`).
@@ -177,9 +205,9 @@ public final class MemoryStore: ACEStore, @unchecked Sendable {
 
 // MARK: - Helpers used by the pipeline
 
-extension ACEStore {
+extension ACEStoreData {
     /// Run a store call, surfacing any failure as `storage_failed` (codes in `keep` pass through).
-    private func storageCall<T>(_ op: String, _ key: String, keep: Set<ACEError.Code> = [.storageFailed],
+    fileprivate func storageCall<T>(_ op: String, _ key: String, keep: Set<ACEError.Code> = [.storageFailed],
                                 _ body: () throws -> T) throws -> T {
         do { return try body() } catch let e as ACEError where keep.contains(e.code) {
             throw e
@@ -212,6 +240,9 @@ extension ACEStore {
         try storageCall("list", prefix) { try list(prefix: prefix) }
     }
 
+}
+
+extension ACEStore {
     func checkedLock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
         try storageCall("lock", name, keep: [.storageFailed, .receiverBusy, .lockBusy]) { try lock(name, timeout: timeout) }
     }

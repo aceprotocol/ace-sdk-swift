@@ -9,7 +9,7 @@ import Foundation
 
 // MARK: - Body schema
 
-private enum FieldKind { case str, optStr, obj, optObj, optTTL }
+private enum FieldKind: String { case str, optStr, obj, optObj; case optTTL = "optTtl" }
 
 private let bodySchemas: [MessageType: [(String, FieldKind)]] = [
     .rfq: [("need", .str), ("maxPrice", .optStr), ("currency", .optStr), ("ttl", .optTTL)],
@@ -27,10 +27,92 @@ private let bodySchemas: [MessageType: [(String, FieldKind)]] = [
     .report: [("action", .str), ("summary", .str), ("outcome", .str), ("ref", .optObj), ("requestId", .optStr), ("proof", .optObj)],
 ]
 
+/// Digest of the immutable bundled profile descriptor. Custom schemas are pinned by callers.
+public func knownSchemaDigest(_ type: MessageType) -> String? {
+    guard let fields = bodySchemas[type] else { return nil }
+    let outcomes = type == .decision ? ["approve", "deny"] : type == .report ? ["ok", "failed", "skipped"] : []
+    let v: JValue = .object(["type": .string(type.rawValue), "version": .number("1"),
+        "fields": .array(fields.map { .array([.string($0.0), .string($0.1.rawValue)]) }),
+        "outcomes": .array(outcomes.map(JValue.string))])
+    return sha256Hex(JSONWriter.serialize(v))
+}
+
+// MARK: - Installed schemas
+
+/// What an installed validator sees: the decoded private content of one message.
+public struct SchemaMessage: Sendable {
+    public let type: MessageType
+    public let schemaDigest: String
+    public let threadId: String?
+    public let body: [String: JSONValue]
+    public init(type: MessageType, schemaDigest: String, threadId: String?, body: [String: JSONValue]) {
+        self.type = type; self.schemaDigest = schemaDigest; self.threadId = threadId; self.body = body
+    }
+}
+
+/// Deterministic validator installed per `schemaDigest` (`Inbox.open(schemas:)`,
+/// `Outbox.open(schemas:)`). Throw an `ACEError` with a permanent code to reject with that
+/// code; any other thrown value is `invalid_body`.
+public typealias SchemaValidator = @Sendable (SchemaMessage) throws -> Void
+
+/// `invalid_argument` unless every key is a 64-hex schema digest.
+func checkSchemas(_ schemas: [String: SchemaValidator]) throws {
+    for key in schemas.keys where !isSha256Hex(key) {
+        throw ACEError(.invalidArgument, "schemas keys must be 64 lowercase hex schema digests")
+    }
+}
+
+/// Run the installed validator for `message.schemaDigest`, if any, with the error mapping above.
+func validateInstalledSchema(_ schemas: [String: SchemaValidator], _ message: SchemaMessage) throws {
+    guard let validator = schemas[message.schemaDigest] else { return }
+    do { try validator(message) }
+    catch let e as ACEError where e.category == .permanent { throw e }
+    catch { throw ACEError(.invalidBody, "schema validator rejected the body: \(error)") }
+}
+
+/// The schema digest a message of `type` carries: `schemaDigest`, else the bundled one. A custom
+/// type must pin one, and a bundled type only its own (`invalid_body`).
+func resolveSchemaDigest(_ type: MessageType, _ schemaDigest: String?) throws -> String {
+    let known = knownSchemaDigest(type)
+    guard let digest = schemaDigest ?? known, isSha256Hex(digest), known == nil || known == digest else {
+        throw ACEError(.invalidBody, "schemaDigest must pin the message schema")
+    }
+    return digest
+}
+
+func privateContent(_ type: MessageType, body: [String: JSONValue], threadId: String?, schemaDigest: String?) throws -> [String: JSONValue] {
+    let digest = try resolveSchemaDigest(type, schemaDigest)
+    var content: [String: JSONValue] = ["type": .string(type.rawValue), "body": .object(body), "schemaDigest": .string(digest)]
+    if let threadId { content["threadId"] = .string(threadId) }
+    try checkJSONValue(.object(content))
+    return content
+}
+
+func decodePrivateContent(_ raw: Data) throws -> (MessageType, [String: JSONValue], String?, String) {
+    let v: JValue
+    do { v = try JSONParser.parse(raw, maxDepth: ACELimits.maxJSONDepth) } catch {
+        throw ACEError(.invalidBody, "content is not valid JSON")
+    }
+    guard let content = JSONValue(v)?.objectValue,
+          Set(content.keys).isSubset(of: ["type", "body", "schemaDigest", "threadId"]),
+          let t = content["type"]?.stringValue, let type = MessageType(rawValue: t),
+          let body = content["body"]?.objectValue, let digest = content["schemaDigest"]?.stringValue else {
+        throw ACEError(.invalidBody, "invalid private content")
+    }
+    var threadId: String?
+    if let rawThread = content["threadId"] {
+        guard let t = rawThread.stringValue, isThreadId(t) else { throw ACEError(.invalidBody, "invalid threadId") }
+        threadId = t
+    }
+    _ = try privateContent(type, body: body, threadId: threadId, schemaDigest: digest)
+    try validateBody(type, body)
+    return (type, body, threadId, digest)
+}
+
 /// Validate a body against its type's schema; failures are `invalid_body`.
 /// Optional fields set to `null` are absent; unknown fields are ignored.
 public func validateBody(_ type: MessageType, _ body: [String: JSONValue]) throws {
-    for (name, kind) in bodySchemas[type]! {
+    for (name, kind) in bodySchemas[type] ?? [] {
         guard let v = body[name], !v.isNull else {
             if kind == .str || kind == .obj { throw ACEError(.invalidBody, "\(type.rawValue).\(name) is required") }
             continue
@@ -82,19 +164,20 @@ func decodeBody(_ type: MessageType, _ raw: Data) throws -> [String: JSONValue] 
     return body
 }
 
-/// Sender-side JSON-value rules: finite numbers, depth ≤ 32 (the body object is depth 0).
-private func checkJSONValue(_ value: JSONValue, depth: Int) throws {
+/// Sender-side JSON-value rules: finite numbers, depth ≤ `maxDepth` (the top-level object is
+/// depth 0). Bodies use 32 / `invalid_body`; `ext` objects use 8 and their carrier's code.
+func checkJSONValue(_ value: JSONValue, depth: Int = 0, maxDepth: Int = ACELimits.maxJSONDepth, code: ACEError.Code = .invalidBody) throws {
     switch value {
     case .null, .bool, .string:
         return
     case .number(let d):
-        guard d.isFinite else { throw ACEError(.invalidBody, "non-finite number") }
+        guard d.isFinite else { throw ACEError(code, "non-finite number") }
     case .object(let o):
-        guard depth <= ACELimits.maxJSONDepth else { throw ACEError(.invalidBody, "JSON nesting exceeds depth \(ACELimits.maxJSONDepth)") }
-        for v in o.values { try checkJSONValue(v, depth: depth + 1) }
+        guard depth <= maxDepth else { throw ACEError(code, "JSON nesting exceeds depth \(maxDepth)") }
+        for v in o.values { try checkJSONValue(v, depth: depth + 1, maxDepth: maxDepth, code: code) }
     case .array(let a):
-        guard depth <= ACELimits.maxJSONDepth else { throw ACEError(.invalidBody, "JSON nesting exceeds depth \(ACELimits.maxJSONDepth)") }
-        for v in a { try checkJSONValue(v, depth: depth + 1) }
+        guard depth <= maxDepth else { throw ACEError(code, "JSON nesting exceeds depth \(maxDepth)") }
+        for v in a { try checkJSONValue(v, depth: depth + 1, maxDepth: maxDepth, code: code) }
     }
 }
 
@@ -104,7 +187,7 @@ func serializeBody(_ body: [String: JSONValue]) throws -> Data {
     return JSONWriter.serialize(v)
 }
 
-private func event(_ env: ACEMessage) -> ThreadEvent {
+func event(_ env: ParsedMessage) -> ThreadEvent {
     ThreadEvent(conversationId: env.conversationId, threadId: env.threadId, type: env.type, messageId: env.messageId,
                 timestamp: env.timestamp, from: env.from, to: env.to)
 }
@@ -120,25 +203,26 @@ public func createMessage(
     recipient: VerifiedPeer,
     type: MessageType,
     body: [String: JSONValue],
-    threads: ThreadStateMachine,
+    threads: ThreadStateMachine? = nil,
     threadId: String? = nil,
-    timestamp: Int? = nil
+    timestamp: Int? = nil,
+    schemaDigest: String? = nil
 ) throws -> ACEMessage {
     try createMessage(sender: sender, recipient: recipient, type: type, body: body, threads: threads,
-                      threadId: threadId, timestamp: timestamp, messageId: UUID().uuidString.lowercased())
+                      threadId: threadId, timestamp: timestamp, schemaDigest: schemaDigest, messageId: UUID().uuidString.lowercased())
 }
 
 func createMessage(
-    sender: any ACEIdentity, recipient: VerifiedPeer, type: MessageType, body: [String: JSONValue], threads: ThreadStateMachine,
-    threadId: String?, timestamp: Int?, messageId: String
+    sender: any ACEIdentity, recipient: VerifiedPeer, type: MessageType, body: [String: JSONValue], threads: ThreadStateMachine? = nil,
+    threadId: String?, timestamp: Int?, schemaDigest: String? = nil, messageId: String
 ) throws -> ACEMessage {
     // 1. type, threadId, local identity
     if let threadId, !isThreadId(threadId) {
         throw ACEError(.invalidArgument, "threadId must be 1..256 code points without control characters")
     }
-    if threadId == nil && type.isEconomic { throw ACEError(.invalidArgument, "economic messages require threadId") }
+    if threads != nil && threadId == nil && type.isEconomic { throw ACEError(.invalidArgument, "economic messages require threadId") }
     let from = sender.getACEId()
-    guard threads.localAceId == from else { throw ACEError(.invalidArgument, "threads.localAceId must be the sender") }
+    guard threads == nil || threads?.localAceId == from else { throw ACEError(.invalidArgument, "threads.localAceId must be the sender") }
     let ts = timestamp ?? systemClock()
     guard isWireInt(ts) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
     // 2. JSON values, then schema
@@ -149,9 +233,9 @@ func createMessage(
     let e = ThreadEvent(conversationId: conversationId, threadId: threadId, type: type, messageId: messageId,
                         timestamp: ts, from: from, to: recipient.aceId)
     // 4. state machine pre-check
-    try threads.check(e, body: body)
+    try threads?.check(e, body: body)
     // 5. serialize
-    let plaintext = try serializeBody(body)
+    let plaintext = try serializeBody(privateContent(type, body: body, threadId: threadId, schemaDigest: schemaDigest))
     guard plaintext.count <= ACELimits.maxPlaintextBytes else {
         throw ACEError(.limitExceeded, "body exceeds \(ACELimits.maxPlaintextBytes) bytes")
     }
@@ -160,14 +244,13 @@ func createMessage(
     // 7. sign
     let scheme = sender.getSigningScheme()
     let unsigned = ACEMessage(
-        messageId: messageId, from: from, to: recipient.aceId, conversationId: conversationId, type: type,
-        threadId: threadId, timestamp: ts,
+        messageId: messageId, from: from, to: recipient.aceId, conversationId: conversationId, timestamp: ts,
         encryption: EncryptionEnvelope(kemCiphertext: ACEBase64.encode(kem), payload: ACEBase64.encode(payload)),
         signature: SignatureEnvelope(scheme: scheme, value: "")
     )
     let env = try resign(unsigned, sender: sender, timestamp: ts)
     // 8. commit
-    try threads.apply(e, body: body)
+    try threads?.apply(e, body: body)
     return env
 }
 
@@ -175,14 +258,12 @@ func createMessage(
 func resign(_ env: ACEMessage, sender: any ACEIdentity, timestamp: Int) throws -> ACEMessage {
     let scheme = sender.getSigningScheme()
     let draft = ACEMessage(
-        messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
-        threadId: env.threadId, timestamp: timestamp, encryption: env.encryption,
+        messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, timestamp: timestamp, encryption: env.encryption,
         signature: SignatureEnvelope(scheme: scheme, value: "")
     )
     let sig = try sender.sign(try messageSignData(draft))
     return ACEMessage(
-        messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
-        threadId: env.threadId, timestamp: timestamp, encryption: env.encryption,
+        messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, timestamp: timestamp, encryption: env.encryption,
         signature: SignatureEnvelope(scheme: scheme, value: encodeSignature(sig, scheme: scheme))
     )
 }
@@ -199,21 +280,34 @@ func resign(_ env: ACEMessage, sender: any ACEIdentity, timestamp: Int) throws -
 /// `floor` defaults to `max(0, now − 300)` and must lie in `[0, now]` (`invalid_argument`).
 /// A non-`ACEError` thrown by `receiver.decrypt` is `identity_unavailable`.
 ///
-/// Principal types (`request`, `decision`, `report`) need `principal` (the receiver's
-/// `PrincipalContext`, 09 § Same-Account Rules); without it they are `wrong_principal`. They
-/// never enter the thread state machine.
+/// `principal` explicitly installs the account coordination policy. Its absence permits
+/// data reception only; it grants no execution rights. Commerce is also opt-in.
 public func parseMessage(
     _ env: ACEMessage,
     receiver: any ACEIdentity,
     sender: VerifiedPeer,
-    threads: ThreadStateMachine,
+    threads: ThreadStateMachine? = nil,
     replay: ReplayDetector,
     floor: Int? = nil,
     clock: @Sendable () -> Int = systemClock,
     principal: PrincipalContext? = nil
 ) throws -> ParsedMessage {
+    try parseMessage(env, receiver: receiver, sender: sender, threads: threads, gate: replay, floor: floor, clock: clock, principal: principal)
+}
+
+/// The seen store as the pipeline reads it (step 7) and records into it (step 9).
+protocol ReplayGate {
+    func accepts(_ messageId: String, from sender: String, timestamp: Int) throws -> Bool
+    func commit(_ messageId: String, from sender: String, timestamp: Int, floor: Int?) throws -> Bool
+}
+extension ReplayDetector: ReplayGate {}
+
+func parseMessage(
+    _ env: ACEMessage, receiver: any ACEIdentity, sender: VerifiedPeer, threads: ThreadStateMachine? = nil,
+    gate replay: any ReplayGate, floor: Int?, clock: @Sendable () -> Int, principal: PrincipalContext? = nil
+) throws -> ParsedMessage {
     let receiverId = receiver.getACEId()
-    guard threads.localAceId == receiverId else { throw ACEError(.invalidArgument, "threads.localAceId must be the receiver") }
+    guard threads == nil || threads?.localAceId == receiverId else { throw ACEError(.invalidArgument, "threads.localAceId must be the receiver") }
     // 1
     let env = try revalidate(env)
     // 2-5
@@ -259,21 +353,24 @@ public func parseMessage(
     } catch {
         throw ACEError(.identityUnavailable, "identity decrypt failed: \(Swift.type(of: error))")
     }
-    // 11-12
-    let body = try decodeBody(env.type, plaintext)
-    // 13
-    if env.type.isEconomic {
-        try threads.apply(event(env), body: body)
-    } else if env.type.isPrincipal {
-        try checkPrincipal(env, body: body, sender: sender, context: principal, now: now)
-    }
-    return ParsedMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
-                         type: env.type, threadId: env.threadId, timestamp: env.timestamp, body: body)
+    let (type, body, threadId, digest) = try decodePrivateContent(plaintext)
+    let parsed = ParsedMessage(messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
+                               type: type, threadId: threadId, timestamp: env.timestamp, body: body, schemaDigest: digest)
+    try applyMessageRules(parsed, threads: threads, principal: principal, sender: sender, now: now)
+    return parsed
+}
+
+/// 06 step 13 on a decoded message: the state machine for economic types, the account rules for
+/// principal types. A nil `threads` / `principal` skips that rule.
+func applyMessageRules(_ parsed: ParsedMessage, threads: ThreadStateMachine?, principal: PrincipalContext?,
+                       sender: VerifiedPeer, now: Int) throws {
+    if parsed.type.isEconomic { try threads?.apply(event(parsed), body: parsed.body) }
+    if parsed.type.isPrincipal, let principal { try checkPrincipal(parsed, body: parsed.body, sender: sender, context: principal, now: now) }
 }
 
 /// 06 step 7 for principal types (09 § Same-Account Rules), against the sender binding as given.
 /// The `Inbox` refreshes a stale sender once before parsing (R-P20, outside any store lock).
-private func checkPrincipal(_ env: ACEMessage, body: [String: JSONValue], sender: VerifiedPeer,
+private func checkPrincipal(_ env: ParsedMessage, body: [String: JSONValue], sender: VerifiedPeer,
                             context: PrincipalContext?, now: Int) throws {
     try checkPrincipalRules(
         type: env.type, body: body, conversationId: env.conversationId, senderPrincipal: sender.principal,

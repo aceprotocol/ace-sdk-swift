@@ -28,61 +28,17 @@ struct DirectTests {
                                  timestamp: p.clock.now)
     }
 
-    private func request(_ env: ACEMessage) -> Data {
-        JSONWriter.serialize(.object(["message": env.jvalue, "extra": .bool(true)]))
-    }
-
     // MARK: receiver
-
-    @Test func receiveDirectDeliversAndAcknowledgesDuplicates() async throws {
-        let p = try await Pair()
-        let sink = Sink()
-        let bIn = try await p.inbox(p.bob, sink)
-        let env = try await rfq(p)
-        let first = await bIn.receiveDirect(request(env))
-        #expect(first.status == 200 && first.body == ["ok": true, "messageId": .string(env.messageId)])
-        #expect(first.outcome.map(isDelivered) == true && sink.has(env))
-        #expect(try JSONValue(json: first.bodyData) == .object(first.body))
-        let again = await bIn.receiveDirect(request(env))
-        #expect(again.status == 200 && again.body["messageId"] == .string(env.messageId))
-        #expect(again.outcome.map(isDuplicate) == true)
-
-        // Pipeline rejection → 400 with its code; nothing persisted for a direct source.
-        p.clock.now += 1000
-        let fresh = await bIn.receiveDirect(request(try await rfq(p, threadId: "d2")))
-        #expect(fresh.status == 200)
-        let old = try await rfq(p, threadId: "d3")
-        p.clock.now += 400
-        let late = await bIn.receiveDirect(request(old))
-        #expect(late.status == 400 && late.body["error"] == "stale_timestamp")
-        #expect(try p.bobStore.list(prefix: "quarantine/").isEmpty)
-
-        // Retryable → 503 with its code.
-        sink.failing = true
-        let busy = await bIn.receiveDirect(request(try await rfq(p, threadId: "d4")))
-        #expect(busy.status == 503 && busy.body["error"] == "handler_failed")
-        sink.failing = false
-
-        // A closed inbox is not accepting: 503 internal_error (the sender falls back to the relay).
-        await bIn.close()
-        let closed = await bIn.receiveDirect(request(try await rfq(p, threadId: "d5")))
-        #expect(closed.status == 503 && closed.body["error"] == "internal_error" && closed.outcome == nil)
-        let closedBig = await bIn.receiveDirect(Data(count: ACELimits.maxDirectBodyBytes + 1))
-        #expect(closedBig.status == 503)
-    }
 
     @Test func receiveThrowsOnMisuse() async throws {
         let p = try await Pair()
         let bIn = try await p.inbox(p.bob, Sink())
         let env = try await rfq(p)
-        await expectCodeAsync(.invalidArgument) { try await bIn.receive(env.jsonData(), source: .relay(url: "ftp://x.example", streamId: "1-1")) }
-        await expectCodeAsync(.invalidArgument) { try await bIn.receive(env.jsonData(), source: .relay(url: "https://x.example?a", streamId: nil)) }
-        await expectCodeAsync(.invalidArgument) { try await bIn.receive(env.jsonData(), source: .relay(url: "https://x.example", streamId: "x")) }
         // Bytes that are not an envelope are an outcome, not a throw.
-        let junk = try await bIn.receive(Data("not json".utf8), source: .direct)
+        let junk = try await bIn.receive(Data("not json".utf8))
         #expect(code(junk) == .invalidEnvelope)
         await bIn.close()
-        await expectCodeAsync(.invalidArgument) { try await bIn.receive(env.jsonData(), source: .direct) }
+        await expectCodeAsync(.invalidArgument) { try await bIn.receive(env.jsonData()) }
     }
 
     // MARK: sender

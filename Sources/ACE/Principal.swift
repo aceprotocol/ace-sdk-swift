@@ -35,6 +35,14 @@ public struct PrincipalRecord: Codable, Sendable, Equatable {
     public var scope: String?
     public var signature: String
 
+    /// A new valid signature of the same statement is not a conflicting grant.
+    func sameClaims(as other: PrincipalRecord) -> Bool {
+        var a = self, b = other
+        a.signature = ""
+        b.signature = ""
+        return a == b
+    }
+
     public init(account: String, roles: [String], signer: PrincipalKey, issuedAt: Int, expiresAt: Int,
                 scope: String? = nil, signature: String) {
         self.account = account
@@ -119,22 +127,17 @@ public struct PrincipalSigner: Sendable {
     }
 }
 
-/// The roles in canonical order.
-public let principalRoles: [String] = ["controller", "agent"]
-private let allowedRoles: Set<[String]> = [["controller"], ["agent"], ["controller", "agent"]]
+/// The roles in canonical order: `controller` approves, `delegate` acts.
+public let principalRoles: [String] = ["controller", "delegate"]
+private let allowedRoles: Set<[String]> = [["controller"], ["delegate"], ["controller", "delegate"]]
 private let caip10Regex = try! NSRegularExpression(pattern: #"\A[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}\z"#)
 private let eip155AddressRegex = try! NSRegularExpression(pattern: #"\A0x[0-9a-fA-F]{40}\z"#)
 private let wrongDecider = "decision from a different controller than the request was sent to"
 
-private func fullMatch(_ re: NSRegularExpression, _ s: String) -> Bool {
-    let r = NSRange(location: 0, length: (s as NSString).length)
-    return re.firstMatch(in: s, range: r)?.range == r
-}
-
 private func principalError(_ m: String) -> ACEError { ACEError(.invalidPrincipal, m) }
 
 /// A CAIP-10 account ID (`^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}$`).
-public func isCAIP10(_ value: String) -> Bool { fullMatch(caip10Regex, value) }
+public func isCAIP10(_ value: String) -> Bool { regexFullMatch(caip10Regex, value) }
 
 // MARK: - Signing context
 
@@ -159,7 +162,7 @@ private func checkFields(_ r: PrincipalRecord, now: Int) throws -> (SigningSchem
     guard isWireInt(r.expiresAt) else { throw principalError("principal.expiresAt must be a wire integer") }
     guard isCAIP10(r.account) else { throw principalError("principal.account must be a CAIP-10 account") }  // 2
     guard allowedRoles.contains(r.roles) else {  // 3
-        throw principalError(#"principal.roles must be ["controller"], ["agent"] or ["controller","agent"]"#)
+        throw principalError(#"principal.roles must be ["controller"], ["delegate"] or ["controller","delegate"]"#)
     }
     guard let scheme = SigningScheme(rawValue: r.signer.scheme) else {  // 4
         throw principalError("principal.signer.scheme is unsupported")
@@ -224,7 +227,7 @@ public func createPrincipalRecord(
     expiresAt: Int, scope: String? = nil, issuedAt: Int? = nil
 ) throws -> PrincipalRecord {
     guard roles.allSatisfy(principalRoles.contains) else {
-        throw ACEError(.invalidArgument, "roles must contain only 'controller' and 'agent'")
+        throw ACEError(.invalidArgument, "roles must contain only 'controller' and 'delegate'")
     }
     let ts = issuedAt ?? systemClock()
     var r = PrincipalRecord(account: account, roles: principalRoles.filter(roles.contains),
@@ -295,7 +298,7 @@ func isAccountAuthority(_ p: PrincipalRecord, selfSigner: PrincipalKey?, trusted
     let parts = p.account.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
     guard parts.count == 3, parts[0] == "eip155", p.signer.scheme == SigningScheme.secp256k1.rawValue else { return false }
     let address = String(parts[2])
-    guard fullMatch(eip155AddressRegex, address),
+    guard regexFullMatch(eip155AddressRegex, address),
           let key = try? decodeB64(p.signer.publicKey, code: .invalidPrincipal, what: "principal.signer.publicKey", maxBytes: 64),
           let derived = try? secp256k1Address(key) else { return false }
     return derived.lowercased() == address.lowercased()
@@ -324,6 +327,7 @@ public func checkPrincipalRules(
         throw ACEError(.wrongPrincipal, "signer is not an authority of the account")
     }
     guard p.account == selfAccount else { throw ACEError(.wrongPrincipal, "the sender belongs to another account") }  // 5
+    guard p.scope == nil else { throw ACEError(.wrongPrincipal, "unsupported principal scope") }
     if type == .decision {
         guard p.roles.contains("controller") else {  // 6
             throw ACEError(.wrongPrincipal, "only a controller may send a decision")
@@ -349,7 +353,7 @@ func senderPrincipalUsable(_ senderPrincipal: PrincipalRecord?, senderSigningPub
           let p = try? validatePrincipalRecord(senderPrincipal, subjectSigningPublicKey: senderSigningPublicKey, now: now) else {
         return false
     }
-    return isAccountAuthority(p, selfSigner: principal.selfSigner, trustedSigners: principal.trustedSigners)
+    return p.scope == nil && isAccountAuthority(p, selfSigner: principal.selfSigner, trustedSigners: principal.trustedSigners)
         && p.account == principal.account
 }
 

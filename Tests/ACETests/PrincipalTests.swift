@@ -11,7 +11,7 @@ struct PrincipalTests {
         #expect(messageTypes.count == 13 && Array(messageTypes.suffix(3)) == [.request, .decision, .report])
         #expect(economicTypes.count == 8 && principalTypes == [.request, .decision, .report])
         #expect(principalTypes.allSatisfy { $0.isPrincipal && !$0.isEconomic })
-        #expect(!MessageType.text.isPrincipal && !isPrincipalType(.info))
+        #expect(!MessageType.text.isPrincipal && !MessageType.info.isPrincipal)
         #expect(ACEError.Code.invalidPrincipal.category == .permanent && ACEError.Code.wrongPrincipal.category == .permanent)
     }
 
@@ -48,7 +48,7 @@ struct PrincipalTests {
     static let NOW = 1_800_000_000
     static let TO = "ace:sha256:" + String(repeating: "cd", count: 32)
 
-    func rec(_ owner: SoftwareIdentity, _ subject: SoftwareIdentity, roles: [String] = ["agent", "controller", "agent"],
+    func rec(_ owner: SoftwareIdentity, _ subject: SoftwareIdentity, roles: [String] = ["delegate", "controller", "delegate"],
              scope: String? = nil, expiresAt: Int = NOW + 3600, issuedAt: Int = NOW - 10,
              account: String = PrincipalTests.ACC) throws -> PrincipalRecord {
         try createPrincipalRecord(signer: PrincipalSigner(identity: owner), subjectSigningPublicKey: subject.getSigningPublicKey(),
@@ -70,19 +70,19 @@ struct PrincipalTests {
     @Test(arguments: [SigningScheme.ed25519, .secp256k1]) func createAndValidate(_ scheme: SigningScheme) throws {
         let owner = try SoftwareIdentity.generate(scheme: scheme), subject = try SoftwareIdentity.generate(scheme: .ed25519)
         let r = try rec(owner, subject, scope: "copy:solana,hl")
-        #expect(r.roles == ["controller", "agent"])
+        #expect(r.roles == ["controller", "delegate"])
         #expect(r.signer == key(owner))
         let spk = subject.getSigningPublicKey()
         #expect(try validatePrincipalRecord(r, subjectSigningPublicKey: spk, now: Self.NOW) == r)
         #expect(principalPayload(r, subjectSigningPublicKey: spk) == ACESigning.encodePayload(
-            Self.ACC, "controller,agent", scheme.rawValue, r.signer.publicKey, ACEBase64.encode(spk), "copy:solana,hl",
+            Self.ACC, "controller,delegate", scheme.rawValue, r.signer.publicKey, ACEBase64.encode(spk), "copy:solana,hl",
             String(Self.NOW + 3600)))
         #expect(try principalSignData(r, subjectSigningPublicKey: spk) == ACESigning.buildSignData(
             action: "principal", aceId: subject.getACEId(), timestamp: Self.NOW - 10,
             payload: principalPayload(r, subjectSigningPublicKey: spk)))
         // JSON round trip; no scope → member absent, payload uses "".
         #expect(try PrincipalRecord(json: r.jsonData()) == r)
-        let bare = try rec(owner, subject, roles: ["agent"])
+        let bare = try rec(owner, subject, roles: ["delegate"])
         #expect(bare.scope == nil && !String(decoding: bare.jsonData(), as: UTF8.self).contains("scope"))
         #expect(String(decoding: bare.jsonData(), as: UTF8.self).contains(#""expiresAt":\#(Self.NOW + 3600)"#))
         // Codable round trip.
@@ -92,7 +92,7 @@ struct PrincipalTests {
     @Test func createRolesAndArguments() throws {
         let owner = try SoftwareIdentity.generate(scheme: .ed25519), subject = try SoftwareIdentity.generate(scheme: .ed25519)
         #expect(try rec(owner, subject, roles: ["controller", "controller"]).roles == ["controller"])
-        #expect(try rec(owner, subject, roles: ["agent"]).roles == ["agent"])
+        #expect(try rec(owner, subject, roles: ["delegate"]).roles == ["delegate"])
         expectCode(.invalidArgument) { try rec(owner, subject, roles: ["owner"]) }
         expectCode(.invalidPrincipal) { try rec(owner, subject, roles: []) }
         expectCode(.invalidPrincipal) { try rec(owner, subject, account: "solana:abc") }
@@ -105,7 +105,7 @@ struct PrincipalTests {
         let signer = PrincipalSigner(scheme: .ed25519, publicKey: owner.getSigningPublicKey()) { calls.bump(); return try owner.sign($0) }
         expectCode(.invalidPrincipal) {
             try createPrincipalRecord(signer: signer, subjectSigningPublicKey: subject.getSigningPublicKey(), account: "x",
-                                      roles: ["agent"], expiresAt: Self.NOW + 10, issuedAt: Self.NOW)
+                                      roles: ["delegate"], expiresAt: Self.NOW + 10, issuedAt: Self.NOW)
         }
         #expect(calls.value == 0)
     }
@@ -117,7 +117,7 @@ struct PrincipalTests {
         let spk = subject.getSigningPublicKey()
         let mutations: [(inout PrincipalRecord) -> Void] = [
             { $0.account = "solana:abc" }, { $0.account = "Solana:x:y" }, { $0.account = Self.ACC + "\n" },
-            { $0.roles = [] }, { $0.roles = ["agent", "controller"] }, { $0.roles = ["controller", "controller"] },
+            { $0.roles = [] }, { $0.roles = ["delegate", "controller"] }, { $0.roles = ["controller", "controller"] },
             { $0.roles = ["owner"] }, { $0.roles = ["Controller"] }, { $0.roles = ["controller"] },
             { $0.signer = .init(scheme: "p256", publicKey: $0.signer.publicKey) },
             { $0.signer = .init(scheme: "ed25519", publicKey: "QQ==") },
@@ -170,7 +170,7 @@ struct PrincipalTests {
         #expect(isCAIP10(Self.ACC) && isCAIP10("eip155:1:0xabc"))
         #expect(!isCAIP10("eip155:1") && !isCAIP10("EIP155:1:x") && !isCAIP10("eip155:1:x\n") && !isCAIP10("ab:1:x"))
         #expect(!isCAIP10("eip155:1:" + String(repeating: "a", count: 129)) && !isCAIP10("eip155:1:a b"))
-        #expect(principalRoles == ["controller", "agent"])
+        #expect(principalRoles == ["controller", "delegate"])
     }
 
     @Test func rules() throws {
@@ -178,7 +178,7 @@ struct PrincipalTests {
         let ctrl = try SoftwareIdentity.generate(scheme: .ed25519), ctrl2 = try SoftwareIdentity.generate(scheme: .ed25519)
         let agent = try SoftwareIdentity.generate(scheme: .secp256k1)
         let pCtrl = try rec(owner, ctrl, roles: ["controller"]), pCtrl2 = try rec(owner, ctrl2, roles: ["controller"])
-        let pAgent = try rec(owner, agent, roles: ["agent"])
+        let pAgent = try rec(owner, agent, roles: ["delegate"])
         let ownerKey = key(owner)
         func chk(_ t: MessageType, _ body: String, _ p: PrincipalRecord?, _ sender: SoftwareIdentity,
                  _ account: String? = PrincipalTests.ACC, selfSigner: PrincipalKey? = nil, trusted: Set<PrincipalKey> = [],
@@ -213,7 +213,7 @@ struct PrincipalTests {
 
         // R-P21: the signer must be an authority of the account.
         let forger = try SoftwareIdentity.generate(scheme: .ed25519)
-        let forged = try rec(forger, agent, roles: ["agent"])
+        let forged = try rec(forger, agent, roles: ["delegate"])
         expectCode(.wrongPrincipal) { try chk(.request, req, forged, agent) }
         try chk(.request, req, forged, agent, trusted: [key(forger)])
         expectCode(.wrongPrincipal) {
@@ -225,16 +225,16 @@ struct PrincipalTests {
         let eoa = try SoftwareIdentity.generate(scheme: .secp256k1), stranger = try SoftwareIdentity.generate(scheme: .secp256k1)
         let addr = eoa.getAddress()
         for account in ["eip155:8453:" + addr, "eip155:8453:" + addr.lowercased(), "eip155:8453:0x" + addr.dropFirst(2).uppercased()] {
-            let p = try rec(eoa, agent, roles: ["agent"], account: account)
+            let p = try rec(eoa, agent, roles: ["delegate"], account: account)
             try chk(.request, req, p, agent, account, selfSigner: ownerKey)
         }
-        let wrongAddr = try rec(stranger, agent, roles: ["agent"], account: "eip155:8453:" + addr)
+        let wrongAddr = try rec(stranger, agent, roles: ["delegate"], account: "eip155:8453:" + addr)
         expectCode(.wrongPrincipal) { try chk(.request, req, wrongAddr, agent, "eip155:8453:" + addr) }
-        let edOnEip = try rec(owner, agent, roles: ["agent"], account: "eip155:8453:" + addr)
+        let edOnEip = try rec(owner, agent, roles: ["delegate"], account: "eip155:8453:" + addr)
         try chk(.request, req, edOnEip, agent, "eip155:8453:" + addr)  // via selfSigner (owner)
         expectCode(.wrongPrincipal) { try chk(.request, req, edOnEip, agent, "eip155:8453:" + addr, selfSigner: key(forger)) }
         // A solana account gets no address derivation.
-        let solEoa = try rec(eoa, agent, roles: ["agent"])
+        let solEoa = try rec(eoa, agent, roles: ["delegate"])
         expectCode(.wrongPrincipal) { try chk(.request, req, solEoa, agent) }
     }
 
@@ -249,14 +249,14 @@ struct PrincipalTests {
 
     func msg(conv: String = CONV, mid: String = MID, ts: Int = NOW) -> ACEMessage {
         ACEMessage(messageId: mid, from: "ace:sha256:" + String(repeating: "ef", count: 32), to: Self.TO, conversationId: conv,
-                   type: .request, timestamp: ts, encryption: .init(kemCiphertext: "", payload: ""),
+                   timestamp: ts, encryption: .init(kemCiphertext: "", payload: ""),
                    signature: .init(scheme: .ed25519, value: ""))
     }
 
     func decision(mid: String = MID, outcome: String = "approve", ts: Int = NOW + 5,
                   own: String = "00000000-0000-4000-8000-0000000000aa", from: String = PrincipalTests.TO) -> ParsedMessage {
         ParsedMessage(messageId: own, from: from, to: "ace:sha256:" + String(repeating: "ef", count: 32), conversationId: CONV,
-                      type: .decision, threadId: nil, timestamp: ts, body: ["requestId": .string(mid), "outcome": .string(outcome)])
+                      type: .decision, threadId: nil, timestamp: ts, body: ["requestId": .string(mid), "outcome": .string(outcome)], schemaDigest: knownSchemaDigest(.decision)!)
     }
 
     @Test func requestKeyShape() {
@@ -345,7 +345,7 @@ struct PrincipalTests {
         let good = try rec(owner, me, scope: "s", expiresAt: Self.NOW + 99)
         let p = registrationPayload(encryptionPublicKey: "E", signingPublicKey: "S", scheme: .ed25519,
                                     profile: .replace(AgentProfile(name: "A", principal: good)))
-        let tail = ACESigning.encodePayload("present", Self.ACC, "controller,agent", "ed25519", good.signer.publicKey,
+        let tail = ACESigning.encodePayload("present", Self.ACC, "controller,delegate", "ed25519", good.signer.publicKey,
                                             String(Self.NOW - 10), String(Self.NOW + 99), "s", good.signature)
         #expect(p.suffix(tail.count) == tail)
         let absent = registrationPayload(encryptionPublicKey: "E", signingPublicKey: "S", scheme: .ed25519, profile: .replace(AgentProfile(name: "A")))
@@ -362,7 +362,7 @@ struct PrincipalTests {
         let owner = try SoftwareIdentity.generate(scheme: .ed25519)
         let me = try SoftwareIdentity.generate(scheme: .ed25519), other = try SoftwareIdentity.generate(scheme: .ed25519)
         let r = try peerRecord(me, AgentProfile(name: "A", principal: try rec(owner, me, expiresAt: Self.NOW + 50)))
-        #expect(try verifyPeerRecord(r, clock: { Self.NOW }).principal?.roles == ["controller", "agent"])
+        #expect(try verifyPeerRecord(r, clock: { Self.NOW }).principal?.roles == ["controller", "delegate"])
         // R-P40: expired-only principal is dropped, other members kept; forged + expired still fails.
         let dropped = try verifyPeerRecord(r, clock: { Self.NOW + 50 })
         #expect(dropped.profile?.principal == nil && dropped.profile?.name == "A")
@@ -374,10 +374,10 @@ struct PrincipalTests {
                                 registeredAt: fbase.registeredAt, profile: AgentProfile(name: "A", principal: try rec(owner, other, expiresAt: Self.NOW + 50)))
         expectCode(.invalidPrincipal) { try verifyPeerRecord(forged, clock: { Self.NOW + 50 }) }
         let ereg = try regFile(me, try rec(owner, me, expiresAt: Self.NOW + 50))
-        #expect(try verifyRegistrationFile(ereg, pinnedAt: Self.NOW, clock: { Self.NOW + 50 }).profile == nil)
+        #expect(try verifyRegistrationFile(ereg, clock: { Self.NOW + 50 }).profile == nil)
         var wrong = ereg
         wrong.principal = try rec(owner, other, expiresAt: Self.NOW + 50)
-        expectCode(.invalidPrincipal) { try verifyRegistrationFile(wrong, pinnedAt: Self.NOW, clock: { Self.NOW + 50 }) }
+        expectCode(.invalidPrincipal) { try verifyRegistrationFile(wrong, clock: { Self.NOW + 50 }) }
         // A registration request still rejects an expired principal.
         let ereq = try createRegistrationRequest(identity: me, profile: .replace(AgentProfile(principal: try rec(owner, me, expiresAt: Self.NOW + 50))), timestamp: Self.NOW)
         expectCode(.invalidPrincipal) { try verifyRegistrationRequest(ereq.jsonData(), clock: { Self.NOW + 50 }) }
@@ -388,12 +388,59 @@ struct PrincipalTests {
                                  registeredAt: base.registeredAt, profile: AgentProfile(name: "A", principal: try rec(owner, other)))
         expectCode(.invalidPrincipal) { try verifyPeerRecord(swapped, clock: { Self.NOW }) }
         let reg = try regFile(me, try rec(owner, me))
-        let peer = try verifyRegistrationFile(reg, pinnedAt: Self.NOW, clock: { Self.NOW })
+        let peer = try verifyRegistrationFile(reg, clock: { Self.NOW })
         #expect(peer.profile == AgentProfile(principal: reg.principal))
         let wire = try JSONValue(json: try JSONEncoder().encode(reg))
         #expect(wire.objectValue?["principal"] != nil)
         let back = try RegistrationFile(json: try JSONEncoder().encode(reg))
         #expect(back.principal == reg.principal)
+    }
+
+    @Test(arguments: ["strip", "expire", "remove", "rotate"])
+    func durablePrincipalHorizon(_ event: String) async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), subject = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore(), clock = TestClock(Self.NOW)
+        let peers = try PeerStore(store: store, clock: clock.fn)
+        let latest = try rec(owner, subject, roles: ["delegate"], expiresAt: Self.NOW + 10, issuedAt: Self.NOW - 5)
+        let older = try rec(owner, subject, roles: ["controller"], issuedAt: Self.NOW - 10)
+        try await peers.adopt(try verifyPeerRecord(try peerRecord(subject, AgentProfile(principal: latest)), clock: clock.fn))
+        clock.now += 20
+        var identity = subject
+        if event == "remove" { try await peers.remove(subject.getACEId()) }
+        else {
+            if event == "rotate" {
+                let exported = subject.exportPrivateKey()
+                identity = try SoftwareIdentity(scheme: .ed25519, signingPrivateKey: ACEBase64.decode(exported.signingPrivateKey), encryptionSeed: Data(repeating: 42, count: 32))
+            }
+            try await peers.adopt(try verifyPeerRecord(try peerRecord(identity, AgentProfile(), ts: clock.now), clock: clock.fn))
+        }
+        let reopened = try PeerStore(store: store, clock: clock.fn)
+        let rollback = try verifyPeerRecord(try peerRecord(identity, AgentProfile(principal: older), ts: clock.now), clock: clock.fn)
+        await expectCodeAsync(.invalidPrincipal) { try await reopened.adopt(rollback) }
+        #expect(try await reopened.get(subject.getACEId())?.principal == nil)
+    }
+
+    @Test func unrelatedIssuerCannotPoisonHorizon() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), attacker = try SoftwareIdentity.generate(scheme: .ed25519)
+        let subject = try SoftwareIdentity.generate(scheme: .ed25519), store = MemoryStore()
+        let peers = try PeerStore(store: store, clock: { Self.NOW })
+        let valid = try rec(owner, subject, roles: ["delegate"])
+        let poison = try rec(attacker, subject, roles: ["controller"], issuedAt: Self.NOW + 100)
+        for principal in [valid, poison, valid] {
+            try await peers.adopt(try verifyPeerRecord(try peerRecord(subject, AgentProfile(principal: principal)), clock: { Self.NOW }))
+        }
+        #expect(try await peers.get(subject.getACEId())?.principal == valid)
+    }
+
+    @Test func opaqueScopeFailsClosed() throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), subject = try SoftwareIdentity.generate(scheme: .ed25519)
+        let scoped = try rec(owner, subject, scope: "read-only")
+        expectCode(.wrongPrincipal) {
+            try checkPrincipalRules(type: .request, body: ["action": .string("pay"), "summary": .string("s")],
+                conversationId: String(repeating: "ab", count: 32), senderPrincipal: scoped,
+                senderSigningPublicKey: subject.getSigningPublicKey(), selfAccount: Self.ACC,
+                openRequestTo: nil, now: Self.NOW, selfSigner: key(owner))
+        }
     }
 
     @Test func expiredPinStillLoads() async throws {
@@ -409,7 +456,7 @@ struct PrincipalTests {
         let owner = try SoftwareIdentity.generate(scheme: .ed25519), me = try SoftwareIdentity.generate(scheme: .ed25519)
         let store = MemoryStore(), clock = TestClock(Self.NOW)
         let peers = try PeerStore(store: store, clock: clock.fn)
-        try await peers.pinRegistrationFile(try regFile(me, try rec(owner, me, expiresAt: Self.NOW + 5)), pinnedAt: 1)
+        try await peers.pinRegistrationFile(try regFile(me, try rec(owner, me, expiresAt: Self.NOW + 5)))
         let key = PinnedPeer.key(me.getACEId())
         var o = try JSONValue(json: try #require(try store.read(key))).objectValue!
         o["fetchedAt"] = .number(Double(Self.NOW + 100))
@@ -442,17 +489,17 @@ struct PrincipalTests {
         clock.now = Self.NOW + 100
         // file without principal: keeps it, other members carry over
         let bare = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace")
-        var kept = try await peers.pinRegistrationFile(bare, pinnedAt: Self.NOW)
+        var kept = try await peers.pinRegistrationFile(bare)
         #expect(kept.principal == cached && kept.profile?.name == "Rel" && kept.profile?.tags == ["x"])
         // older issuedAt: keeps the cached one
         let older = try regFile(me, try rec(owner, me, issuedAt: Self.NOW - 20))
-        kept = try await peers.pinRegistrationFile(older, pinnedAt: Self.NOW)
+        kept = try await peers.pinRegistrationFile(older)
         #expect(kept.principal == cached)
         // newer issuedAt: replaces
         let newer = try rec(owner, me, issuedAt: Self.NOW + 50)
         let reg = try regFile(me, newer)
         clock.now = Self.NOW + 60
-        kept = try await peers.pinRegistrationFile(reg, pinnedAt: Self.NOW)
+        kept = try await peers.pinRegistrationFile(reg)
         #expect(kept.principal == newer && kept.profile?.name == "Rel")
         // relay record without principal clears it
         let relay = try peerRecord(me, AgentProfile(name: "Rel2"), ts: Self.NOW + 70)
@@ -468,7 +515,7 @@ struct PrincipalTests {
         try await peers.adopt(try verifyPeerRecord(try peerRecord(me, AgentProfile(name: "Rel", principal: try rec(owner, me, expiresAt: Self.NOW + 5))), clock: { Self.NOW }))
         let bare = try createRegistrationFile(for: me, name: "M", endpoint: "https://m.example/ace")
         clock.now = Self.NOW + 100
-        let kept = try await peers.pinRegistrationFile(bare, pinnedAt: Self.NOW)
+        let kept = try await peers.pinRegistrationFile(bare)
         #expect(kept.principal == nil && kept.profile?.name == "Rel")
         #expect(try await PeerStore(store: store, clock: clock.fn).get(me.getACEId())?.principal == nil)
         // unexpired cached principal is still carried
@@ -476,7 +523,7 @@ struct PrincipalTests {
         clock.now = Self.NOW
         try await peers.adopt(try verifyPeerRecord(try peerRecord(me2, AgentProfile(principal: try rec(owner, me2, expiresAt: Self.NOW + 500))), clock: { Self.NOW }))
         clock.now = Self.NOW + 100
-        let k2 = try await peers.pinRegistrationFile(try createRegistrationFile(for: me2, name: "M", endpoint: "https://m.example/ace"), pinnedAt: Self.NOW)
+        let k2 = try await peers.pinRegistrationFile(try createRegistrationFile(for: me2, name: "M", endpoint: "https://m.example/ace"))
         #expect(k2.principal != nil)
         #expect(try await PeerStore(store: store, clock: clock.fn).get(me2.getACEId())?.principal != nil)
     }
@@ -563,7 +610,6 @@ struct PrincipalTests {
 
 /// Relay lookups verify principals at the wall clock, so these tests run at it.
 private let T0 = systemClock()
-private let RELAY_URL = "https://relay.example"
 private let ACC = PrincipalTests.ACC
 
 /// Fake `/v1/peer` endpoint: serves `record`, or fails with `status` / a network error.
@@ -656,7 +702,7 @@ struct PrincipalPipelineTests {
         let pb: PrincipalRecord
     }
 
-    static func rec(_ owner: SoftwareIdentity, _ subject: SoftwareIdentity, roles: [String] = ["controller", "agent"],
+    static func rec(_ owner: SoftwareIdentity, _ subject: SoftwareIdentity, roles: [String] = ["controller", "delegate"],
                     account: String = ACC) throws -> PrincipalRecord {
         try createPrincipalRecord(signer: PrincipalSigner(identity: owner), subjectSigningPublicKey: subject.getSigningPublicKey(),
                                   account: account, roles: roles, expiresAt: T0 + 3600, issuedAt: T0 - 10)
@@ -678,7 +724,7 @@ struct PrincipalPipelineTests {
     }
 
     /// a (ed25519) and b (secp256k1) under one owner; each pins the other via a relay record.
-    static func world(rolesA: [String] = ["controller", "agent"], rolesB: [String] = ["agent"], accB: String = ACC,
+    static func world(rolesA: [String] = ["controller", "delegate"], rolesB: [String] = ["delegate"], accB: String = ACC,
                       pinBPrincipal: Bool = true, pinAPrincipal: Bool = true, ownerScheme: SigningScheme = .ed25519,
                       account: String? = nil, aStore: (any ACEStore)? = nil) async throws -> World {
         let clock = TestClock(T0)
@@ -712,17 +758,13 @@ struct PrincipalPipelineTests {
                      _ n: Int) async throws -> (ReceiveOutcome, PendingSend) {
         let (outbox, p) = try await stage(w, from, to, type, body)
         let out = try await outbox.deliver(p.requestId) { env in
-            try await rx.receive(env.jsonData(), source: .relay(url: RELAY_URL, streamId: "\(n)-0"))
+            try await rx.receive(env.jsonData())
         }
         return (out, p)
     }
 
     static func receive(_ rx: Inbox, _ env: ACEMessage, _ n: Int) async throws -> ReceiveOutcome {
-        try await rx.receive(env.jsonData(), source: .relay(url: RELAY_URL, streamId: "\(n)-0"))
-    }
-
-    static func cursor(_ rx: Inbox) async throws -> String? {
-        await rx.cursor(for: try RelayClient(baseURL: URL(string: RELAY_URL)!))
+        try await rx.receive(env.jsonData())
     }
 
     static func request(_ store: any ACEStore, _ p: PendingSend) throws -> RequestRecord? {
@@ -731,19 +773,19 @@ struct PrincipalPipelineTests {
 
     // MARK: parse
 
-    @Test func parseMessageWithoutContextIsWrongPrincipal() async throws {
+    @Test func parseMessageWithoutPolicyDeliversData() async throws {
         let w = try await Self.world()
         let peerA = try #require(try await PeerStore(store: w.b.store).get(w.a.id.getACEId()))
         let env = try createMessage(sender: w.b.id, recipient: peerA, type: .request, body: jsonBody(["action": "pay", "summary": "s"]),
                                     threads: try ThreadStateMachine(localAceId: w.b.id.getACEId()), timestamp: T0)
-        #expect(env.threadId == nil)
+        #expect(!String(decoding: env.jsonData(), as: UTF8.self).contains("threadId"))
         let peerB = try #require(try await PeerStore(store: w.a.store).get(w.b.id.getACEId()))
         func parse(_ ctx: PrincipalContext?) throws -> ParsedMessage {
             try parseMessage(env, receiver: w.a.id, sender: peerB, threads: try ThreadStateMachine(localAceId: w.a.id.getACEId()),
                              replay: try ReplayDetector(capacity: 100, horizon: T0 - 100, clock: w.clock.fn), clock: w.clock.fn,
                              principal: ctx)
         }
-        expectCode(.wrongPrincipal) { try parse(nil) }
+        #expect(try parse(nil).type == .request)
         expectCode(.wrongPrincipal) { try parse(PrincipalContext(account: ACC)) }  // fail closed: no authority
         #expect(try parse(PrincipalContext(account: ACC, selfSigner: Self.key(w.owner))).type == .request)
     }
@@ -803,7 +845,7 @@ struct PrincipalPipelineTests {
     // MARK: wrong principal, Inbox option
 
     @Test func wrongPrincipalCases() async throws {
-        let w = try await Self.world(rolesA: ["agent"])
+        let w = try await Self.world(rolesA: ["delegate"])
         let ia = try await Self.inbox(w, w.a), ib = try await Self.inbox(w, w.b)
         let (_, req) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
         let (d, _) = try await Self.send(w, w.a, w.b, ib, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#, 1)
@@ -817,7 +859,7 @@ struct PrincipalPipelineTests {
         let y = try await Self.world()
         let none = try await Self.inbox(y, y.a, principal: .some(nil))
         let (r2, _) = try await Self.send(y, y.b, y.a, none, .report, #"{"action":"pay","summary":"s","outcome":"ok"}"#, 1)
-        #expect(code(r2) == .wrongPrincipal)
+        #expect(isDelivered(r2))
         await none.close()
     }
 
@@ -887,16 +929,14 @@ struct PrincipalPipelineTests {
         let r = try await Self.receive(ia, p.message, 1)
         guard case .retryable(let e) = r else { Issue.record("\(r)"); return }
         #expect(e.code == .relayUnavailable && stub.calls == 1)
-        #expect(try await Self.cursor(ia) == nil && w.a.sink.count == 0)
+        #expect(w.a.sink.count == 0)
         stub.status = -1  // network failure
         let r2 = try await Self.receive(ia, p.message, 1)
         guard case .retryable = r2 else { Issue.record("\(r2)"); return }
-        #expect(try await Self.cursor(ia) == nil)
         stub.status = 200
         stub.record = try Self.relayRecord(w.b.id, AgentProfile(principal: w.pb))
         let r3 = try await Self.receive(ia, p.message, 1)
         #expect(isDelivered(r3) && stub.calls == 3)
-        #expect(try await Self.cursor(ia) == "1-0")
     }
 
     @Test func wrongPrincipalAfterPermanentOrUselessRefresh() async throws {
@@ -906,7 +946,6 @@ struct PrincipalPipelineTests {
         let ia = try await Self.inbox(w, w.a, relay: try stub.client())
         let (r, _) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s"}"#, 1)
         #expect(code(r) == .wrongPrincipal && stub.calls == 1)
-        #expect(try await Self.cursor(ia) == "1-0")
         stub.status = 200
         stub.record = try Self.relayRecord(w.b.id, AgentProfile(name: "b"))  // useless: still no principal
         let (r2, _) = try await Self.send(w, w.b, w.a, ia, .request, #"{"action":"pay","summary":"s2"}"#, 2)
@@ -932,7 +971,7 @@ struct PrincipalPipelineTests {
         sig[5] ^= 0x01
         sigObj["value"] = .string(ACEBase64.encode(sig))
         o["signature"] = .object(sigObj)
-        let r = try await ia.receive(JSONValue.object(o).jsonData(), source: .relay(url: RELAY_URL, streamId: "1-0"))
+        let r = try await ia.receive(JSONValue.object(o).jsonData())
         #expect(code(r) == .invalidSignature && stub.calls == 0)
         let r2 = try await Self.receive(ia, p.message, 2)
         #expect(isDelivered(r2) && stub.calls == 1)
@@ -1059,6 +1098,26 @@ struct PrincipalPipelineTests {
         #expect(try Self.request(failing, req)?.decision == dec)
     }
 
+    @Test(arguments: [false, true]) func decisionBeforeTransportAck(_ loseAck: Bool) async throws {
+        let w = try await Self.world()
+        let ia = try await Self.inbox(w, w.a), ib = try await Self.inbox(w, w.b)
+        let (outbox, pending) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s","ttl":30}"#)
+        do {
+            try await outbox.deliver(pending.requestId) { message in
+                #expect(isDelivered(try await Self.receive(ia, message, 1)))
+                let (decision, _) = try await Self.send(w, w.a, w.b, ib, .decision,
+                    #"{"requestId":"\#(message.messageId)","outcome":"approve"}"#, 1)
+                #expect(isDelivered(decision))
+                if loseAck { throw ACEError(.relayUnavailable, "ack lost") }
+            }
+            #expect(!loseAck)
+        } catch let error as ACEError {
+            #expect(loseAck && error.code == .relayUnavailable)
+        }
+        #expect(try Self.request(w.b.store, pending)?.decision?.outcome == "approve")
+        await ia.close(); await ib.close()
+    }
+
     @Test func requestRecordWrittenBeforeAck() async throws {
         let w = try await Self.world()
         let ia = try await Self.inbox(w, w.a)
@@ -1066,7 +1125,7 @@ struct PrincipalPipelineTests {
         store.failWritePrefix = "requests/"
         let (outbox, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s","ttl":30}"#, store: store)
         let transport: @Sendable (ACEMessage) async throws -> ReceiveOutcome = { env in try await Self.receive(ia, env, 1) }
-        // transport succeeds, the requests/ write fails: the send stays pending, no record
+        // A failed correlation write prevents transport; the send stays pending.
         await expectCodeAsync(.storageFailed) { try await outbox.deliver(p.requestId, transport: transport) }
         #expect(try Self.request(w.b.store, p) == nil)
         #expect(try await outbox.pending().map(\.requestId) == [p.requestId])
@@ -1074,7 +1133,7 @@ struct PrincipalPipelineTests {
         let outbox2 = try await Outbox.open(identity: w.b.id, store: store, clock: w.clock.fn)
         #expect(try await outbox2.pending().first?.requestTtl == 30)
         let res = try await outbox2.deliver(p.requestId, transport: transport)
-        #expect(isDuplicate(res))
+        #expect(isDelivered(res))
         let r = try #require(try Self.request(w.b.store, p))
         #expect(r.to == w.a.id.getACEId() && r.expiresAt == p.message.timestamp + 30 && r.sentAt == T0)
         let log = store.log
@@ -1084,18 +1143,15 @@ struct PrincipalPipelineTests {
         #expect(try await outbox2.pending().isEmpty)
     }
 
-    @Test func requestTtlSurvivesResign() async throws {
+    @Test func transportRetryCannotRenewRequestDeadline() async throws {
         let w = try await Self.world()
         let (outbox, p) = try await Self.stage(w, w.b, w.a, .request, #"{"action":"pay","summary":"s","ttl":30}"#)
         await expectCodeAsync(.envelopeExpired) {
             try await outbox.deliver(p.requestId) { _ -> Int in throw ACEError(.envelopeExpired, "x") }
         }
-        #expect(try await outbox.pending().first?.requestTtl == 30)
         w.clock.now = T0 + 50
-        let q = try await outbox.resign(p.requestId)
-        #expect(q.requestTtl == 30 && q.jvalue(version: true).objectValue?["requestTtl"] == .number("30"))
-        try await outbox.deliver(p.requestId) { _ in 0 }
-        #expect(try Self.request(w.b.store, p)?.expiresAt == T0 + 50 + 30)
+        await expectCodeAsync(.invalidArgument) { try await outbox.resign(p.requestId) }
+        #expect(try Self.request(w.b.store, p)?.expiresAt == T0 + 30)
     }
 
     @Test func pendingRequestTtlNormalizedAndTyped() async throws {

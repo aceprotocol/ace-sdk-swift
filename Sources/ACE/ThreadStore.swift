@@ -124,6 +124,9 @@ public final class ThreadStore: Sendable {
         fields["pending"] = record.pending?.jvalue(version: false) ?? .null
         fields["version"] = num(1)
         let key = Self.key(conversationId: record.snapshot.conversationId, threadId: record.snapshot.threadId)
+        if record.pending == nil, let previous = try load(conversationId: record.snapshot.conversationId, threadId: record.snapshot.threadId)?.pending {
+            try store.checkedWrite("sent/\(sha256Hex(Data(previous.requestId.utf8))).json", JSONWriter.serialize(previous.jvalue(version: true)))
+        }
         let open = !record.snapshot.state.isTerminal
         // Crash-safe order: index an open thread before its record exists; unindex a
         // terminal one only after its record says so. A stale entry is reconciled at the bound.

@@ -38,11 +38,14 @@ public func isMessageId(_ value: String) -> Bool {
     return true
 }
 
-/// 64 lowercase hex characters.
-public func isConversationId(_ value: String) -> Bool {
+/// 64 lowercase hex characters: a SHA-256 digest (schema, intent and claims digests, nonces).
+func isSha256Hex(_ value: String) -> Bool {
     let u = Array(value.utf8)
     return u.count == 64 && u.allSatisfy(isLowerHex)
 }
+
+/// 64 lowercase hex characters.
+public func isConversationId(_ value: String) -> Bool { isSha256Hex(value) }
 
 /// 1..256 Unicode code points with no U+0000–U+001F or U+007F.
 public func isThreadId(_ value: String) -> Bool {
@@ -122,7 +125,23 @@ func decodeB64(_ text: String, code: ACEError.Code, what: String, maxBytes: Int?
     return raw
 }
 
+/// True when `re` matches all of `s` (no partial or trailing-newline matches).
+func regexFullMatch(_ re: NSRegularExpression, _ s: String) -> Bool {
+    guard !s.contains("\n") else { return false }
+    let r = NSRange(location: 0, length: (s as NSString).length)
+    return re.firstMatch(in: s, range: r)?.range == r
+}
+
 // MARK: - Hex
+
+/// `count` bytes from the system CSPRNG.
+func randomBytes(_ count: Int) -> [UInt8] {
+    var rng = SystemRandomNumberGenerator()
+    return (0..<count).map { _ in UInt8.random(in: .min ... .max, using: &rng) }
+}
+
+/// `bytes` random bytes as lowercase hex.
+func randomHex(_ bytes: Int) -> String { hexEncode(randomBytes(bytes)) }
 
 func hexEncode(_ data: some Sequence<UInt8>) -> String {
     let digits = Array("0123456789abcdef".utf8)

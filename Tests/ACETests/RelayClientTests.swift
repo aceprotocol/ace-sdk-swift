@@ -146,22 +146,24 @@ struct RelayClientTests {
         }
         _ = try await relay.postIntent(alice, need: "x", ttl: 60)
         #expect(posted.value?["tags"] as? [String] == [])
-        #expect(try await relay.listIntents(tags: ["a", "b"]).intents[0].maxPrice == nil)
+        #expect(try await relay.listIntents(tags: ["a", "b"]).intents[0].ext == nil)
         #expect(listed.value == "a,b")
         await expectCodeAsync(.invalidArgument) { try await relay.listIntents(tags: ["a,b"]) }
         await expectCodeAsync(.invalidArgument) { try await relay.discover(DiscoverQuery(tags: ["a,b"])) }
         var withPrice = intent
-        withPrice["maxPrice"] = "5"
-        withPrice["currency"] = "USDC"
+        withPrice["ext"] = [commerceExt: ["maxPrice": "5", "currency": "USDC"], "urn:x:1": ["k": 1]]
         response.mutate { $0 = withPrice }
         let priced = try await relay.listIntents().intents[0]
-        #expect(priced.maxPrice == "5" && priced.currency == "USDC")
+        #expect(priced.commerce == CommerceIntentExt(maxPrice: "5", currency: "USDC") && priced.ext?["urn:x:1"] == ["k": 1])
         let breakages: [([String: Any]) -> [String: Any]] = [
             { var v = $0; v.removeValue(forKey: "tags"); return v },
             { $0.merging(["tags": "a"]) { $1 } },
             { $0.merging(["tags": [1]]) { $1 } },
-            { $0.merging(["maxPrice": 5]) { $1 } },
-            { $0.merging(["currency": NSNull()]) { $1 } },
+            { $0.merging(["ext": "x"]) { $1 } },
+            { $0.merging(["ext": NSNull()]) { $1 } },
+            { $0.merging(["ext": ["x": [:]]]) { $1 } },  // key not namespaced
+            { $0.merging(["ext": [commerceExt: ["maxPrice": "5"]]]) { $1 } },  // currency missing
+            { $0.merging(["ext": [commerceExt: ["maxPrice": 5, "currency": "USDC"]]]) { $1 } },
         ]
         for brk in breakages {
             response.mutate { $0 = brk(intent) }
@@ -243,7 +245,9 @@ struct RelayClientTests {
             case "/v1/intents" where req.httpMethod == "POST":
                 let auth = try! parseAuthHeaders(req.allHTTPHeaderFields!)
                 let a = Fixtures.agent("alice")
-                try! verifyAuthHeaders(auth, request: .intent(need: "x", tags: ["a", "b"], maxPrice: "5", currency: nil, ttl: 60),
+                let posted = try! JSONSerialization.jsonObject(with: body) as! [String: Any]
+                #expect((posted["ext"] as? [String: Any])?.keys.sorted() == [commerceExt])
+                try! verifyAuthHeaders(auth, request: .intent(need: "x", tags: ["a", "b"], ext: [commerceExt: ["maxPrice": "5", "currency": "USDC"]], ttl: 60),
                                        aceId: a.getACEId(), scheme: .ed25519, signingPublicKey: a.getSigningPublicKey())
                 return .json(201, ["intentId": "i1", "expiresAt": 99])
             case "/v1/intents":
@@ -257,7 +261,8 @@ struct RelayClientTests {
             }
         }
         #expect(try await relay.register(alice, profile: .replace(AgentProfile(name: "Alice"))) == .registered)
-        #expect(try await relay.postIntent(alice, need: "x", tags: ["a", "b"], maxPrice: "5", ttl: 60) == .init(intentId: "i1", expiresAt: 99))
+        #expect(try await relay.postIntent(alice, need: "x", tags: ["a", "b"], ext: [commerceExt: CommerceIntentExt(maxPrice: "5", currency: "USDC").jsonValue], ttl: 60) == .init(intentId: "i1", expiresAt: 99))
+        await expectCodeAsync(.invalidArgument) { try await relay.postIntent(alice, need: "x", ext: [commerceExt: ["maxPrice": "5"]], ttl: 60) }
         let page = try await relay.listIntents(q: "x")
         #expect(page.intents.count == 1 && page.intents[0].tags == ["a"])
         try await relay.unregister(alice)

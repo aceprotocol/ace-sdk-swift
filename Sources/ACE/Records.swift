@@ -29,28 +29,39 @@ public struct PendingSend: Sendable, Equatable {
     public let stagedAt: Int
     public let message: ACEMessage
     /// The body `ttl` of a principal `request` (the body is encrypted to the recipient, so the
-    /// Outbox keeps it to write the `requests/` record after delivery). Persisted as
+    /// Outbox keeps it to write the `requests/` record before transport). Persisted as
     /// `requestTtl` only when present (06 Appendix A).
+    public let intentDigest: String
+    public let type: MessageType
+    public let schemaDigest: String
+    public let threadId: String?
     public let requestTtl: Int?
 
-    public init(requestId: String, status: PendingStatus, stagedAt: Int, message: ACEMessage, requestTtl: Int? = nil) {
+    public init(requestId: String, status: PendingStatus, stagedAt: Int, message: ACEMessage, intentDigest: String, type: MessageType, schemaDigest: String, threadId: String? = nil, requestTtl: Int? = nil) {
         self.requestId = requestId
         self.status = status
         self.stagedAt = stagedAt
         self.message = message
+        self.intentDigest = intentDigest
+        self.type = type
+        self.schemaDigest = schemaDigest
+        self.threadId = threadId
         self.requestTtl = requestTtl
     }
 
     /// The same send with another status / message (keeps `requestId`, `stagedAt`, `requestTtl`).
     func with(status: PendingStatus, message: ACEMessage? = nil) -> PendingSend {
-        PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message ?? self.message, requestTtl: requestTtl)
+        PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message ?? self.message, intentDigest: intentDigest, type: type, schemaDigest: schemaDigest, threadId: threadId, requestTtl: requestTtl)
     }
 
     func jvalue(version: Bool) -> JValue {
         var o: [String: JValue] = [
             "message": message.jvalue, "requestId": .string(requestId),
-            "stagedAt": num(stagedAt), "status": .string(status.rawValue),
+            "stagedAt": num(stagedAt), "status": .string(status.rawValue), "intentDigest": .string(intentDigest),
         ]
+        o["type"] = .string(type.rawValue)
+        o["schemaDigest"] = .string(schemaDigest)
+        if let threadId { o["threadId"] = .string(threadId) }
         if let requestTtl { o["requestTtl"] = num(requestTtl) }
         if version { o["version"] = num(1) }
         return .object(o)
@@ -61,18 +72,23 @@ public struct PendingSend: Sendable, Equatable {
         if versioned { try checkVersion(o, key) }
         guard let requestId = o["requestId"]?.stringValue, let statusText = o["status"]?.stringValue,
               let status = PendingStatus(rawValue: statusText), let stagedAt = o["stagedAt"]?.wireInt,
+              let intentDigest = o["intentDigest"]?.stringValue, isSha256Hex(intentDigest),
+              let typeText = o["type"]?.stringValue, let type = MessageType(rawValue: typeText),
+              let schemaDigest = o["schemaDigest"]?.stringValue, isSha256Hex(schemaDigest),
               let m = o["message"] else {
             throw storageError(key, "malformed pending send")
         }
+        let threadId = o["threadId"]?.stringValue
+        if let t = o["threadId"], t.stringValue == nil || !isThreadId(t.stringValue!) { throw storageError(key, "invalid threadId") }
         let message: ACEMessage
         do { message = try decodeEnvelope(value: m) } catch { throw storageError(key, "pending envelope is invalid") }
         var requestTtl: Int?
         if let t = o["requestTtl"], !t.isNull {
             guard let n = t.wireInt else { throw storageError(key, "requestTtl must be an integer in [0, 2^53-1]") }
-            guard message.type == .request else { throw storageError(key, "requestTtl belongs to a request only") }
+            guard type == .request else { throw storageError(key, "requestTtl belongs to a request only") }
             requestTtl = n
         }
-        return PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message, requestTtl: requestTtl)
+        return PendingSend(requestId: requestId, status: status, stagedAt: stagedAt, message: message, intentDigest: intentDigest, type: type, schemaDigest: schemaDigest, threadId: threadId, requestTtl: requestTtl)
     }
 }
 
@@ -128,7 +144,6 @@ struct DeliveryRecord {
     let fingerprint: String
     let message: ParsedMessage
     let receivedAt: Int
-    let source: String
     var status: DeliveryStatus
     let thread: ThreadSnapshot?
 
@@ -142,11 +157,11 @@ struct DeliveryRecord {
         let messageObject: JValue = .object([
             "body": body, "conversationId": .string(m.conversationId), "from": .string(m.from),
             "messageId": .string(m.messageId), "threadId": m.threadId.map { .string($0) } ?? .null,
-            "timestamp": num(m.timestamp), "to": .string(m.to), "type": .string(m.type.rawValue),
+            "timestamp": num(m.timestamp), "to": .string(m.to), "type": .string(m.type.rawValue), "schemaDigest": .string(m.schemaDigest),
         ])
         return JSONWriter.serialize(.object([
             "fingerprint": .string(fingerprint), "message": messageObject, "receivedAt": num(receivedAt),
-            "source": .string(source), "status": .string(status.rawValue), "thread": thread?.jvalue ?? .null,
+            "status": .string(status.rawValue), "thread": thread?.jvalue ?? .null,
             "version": num(1),
         ]))
     }
@@ -155,11 +170,11 @@ struct DeliveryRecord {
         guard let o = v.objectValue else { throw storageError(key, "delivery record must be an object") }
         try checkVersion(o, key)
         guard let fingerprint = o["fingerprint"]?.stringValue, let receivedAt = o["receivedAt"]?.wireInt,
-              let source = o["source"]?.stringValue, source == "relay" || source == "direct",
               let statusText = o["status"]?.stringValue, let status = DeliveryStatus(rawValue: statusText),
               let m = o["message"]?.objectValue, let rawBody = m["body"], let body = JSONValue(rawBody)?.objectValue,
               let c = m["conversationId"]?.stringValue, let from = m["from"]?.stringValue,
               let mid = m["messageId"]?.stringValue, let ts = m["timestamp"]?.wireInt, let to = m["to"]?.stringValue,
+              let schemaDigest = m["schemaDigest"]?.stringValue, isSha256Hex(schemaDigest),
               let typeText = m["type"]?.stringValue, let type = MessageType(rawValue: typeText) else {
             throw storageError(key, "malformed delivery record")
         }
@@ -171,8 +186,8 @@ struct DeliveryRecord {
         var thread: ThreadSnapshot?
         if let t = o["thread"], !t.isNull { thread = try ThreadSnapshot.parse(t, key: key) }
         let message = ParsedMessage(messageId: mid, from: from, to: to, conversationId: c, type: type, threadId: threadId,
-                                    timestamp: ts, body: body)
-        return DeliveryRecord(fingerprint: fingerprint, message: message, receivedAt: receivedAt, source: source,
+                                    timestamp: ts, body: body, schemaDigest: schemaDigest)
+        return DeliveryRecord(fingerprint: fingerprint, message: message, receivedAt: receivedAt,
                               status: status, thread: thread)
     }
 }
@@ -186,7 +201,6 @@ func quarantineData(_ env: ACEMessage, error: ACEError, fingerprint: String, at:
         "fingerprint": .string(fingerprint),
         "quarantinedAt": num(at),
         "reason": .string(String(error.message.prefix(1000))),
-        "source": .string("relay"),
         "version": num(1),
     ]))
 }
@@ -207,7 +221,7 @@ struct PinnedPeer {
             "fetchedAt": num(fetchedAt),
             "profile": p.profile?.jvalue ?? .null,
             "registeredAt": num(p.registeredAt),
-            "registrationSignature": p.registrationSignature.map { .string($0) } ?? .null,
+            "registrationSignature": .string(p.registrationSignature),
             "scheme": .string(p.scheme.rawValue),
             "signingPublicKey": .string(ACEBase64.encode(p.signingPublicKey)),
             "source": .string(p.source.rawValue),
@@ -236,27 +250,14 @@ struct PinnedPeer {
             signature = text
         }
         do {
-            switch source {
-            case .relay:
-                guard let signature else { throw storageError(key, "relay binding without signature") }
-                let verified = try verifyPeerRecord(PeerRecord(aceId: id, scheme: schemeText, encryptionPublicKey: enc,
-                                                               signingPublicKey: spk, registrationSignature: signature,
-                                                               registeredAt: registeredAt, profile: profile),
-                                                clock: { fetchedAt })
-                return PinnedPeer(peer: verified, fetchedAt: fetchedAt)
-            case .registration:
-                guard signature == nil else { throw storageError(key, "registration binding with a signature") }
-                let signingKey = try decodeSigningKey(scheme: scheme, spk, code: .storageFailed)
-                guard computeACEId(signingKey) == id else { throw storageError(key, "aceId does not match the signing key") }
-                let encKey = try ACEEncryption.decodeKemPublicKey(enc, code: .storageFailed)
-                // Never restore a principal without validation; one that expired before fetchedAt is
-                // dropped (R-P40), any other failure makes the pin unloadable.
-                let profile = try dropExpiredPrincipal(profile, subjectSigningPublicKey: signingKey, now: fetchedAt)
-                let peer = VerifiedPeer(aceId: id, scheme: scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
-                                        registeredAt: registeredAt, registrationSignature: signature, source: .registration,
-                                        profile: profile)
-                return PinnedPeer(peer: peer, fetchedAt: fetchedAt)
-            }
+            guard let signature else { throw storageError(key, "binding without signature") }
+            let verified = try verifyPeerRecord(PeerRecord(aceId: id, scheme: schemeText, encryptionPublicKey: enc,
+                                                           signingPublicKey: spk, registrationSignature: signature,
+                                                           registeredAt: registeredAt, profile: profile), clock: { fetchedAt })
+            let peer = VerifiedPeer(aceId: id, scheme: scheme, signingPublicKey: verified.signingPublicKey,
+                                    encryptionPublicKey: verified.encryptionPublicKey, registeredAt: registeredAt,
+                                    registrationSignature: signature, source: source, profile: verified.profile)
+            return PinnedPeer(peer: peer, fetchedAt: fetchedAt)
         } catch let e as ACEError where e.code != .storageFailed {
             throw storageError(key, "re-verification failed: \(e.message)")
         }

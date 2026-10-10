@@ -211,12 +211,6 @@ public final class ReplayDetector: @unchecked Sendable {
         return ts <= max(_horizon, sh[sender] ?? _horizon)
     }
 
-    var horizon: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _horizon
-    }
-
     private static func checkArgs(_ messageId: String, _ sender: String, _ ts: Int) throws {
         guard !messageId.isEmpty, !sender.isEmpty else { throw ACEError(.invalidArgument, "messageId and sender must be non-empty strings") }
         guard isWireInt(ts) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }

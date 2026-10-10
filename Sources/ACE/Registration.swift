@@ -66,7 +66,10 @@ public struct RegistrationRequest: Encodable, Sendable, Equatable {
     }
 }
 
-/// The `register-request` payload (02).
+/// The `register-request` payload (02 § Registration authorization): `replace` appends 16 fields
+/// after `mode` (name, description, image, tags, capabilities, endpoint, `ext` canonical JSON or
+/// empty, `present|absent`, then the eight principal fields). A profile that reached this point
+/// passed `validateProfile`, so its `ext` always canonicalises.
 func registrationPayload(encryptionPublicKey: String, signingPublicKey: String, scheme: SigningScheme, profile: RegistrationProfile) -> Data {
     var fields: [ACESigning.Field] = [.string(encryptionPublicKey), .string(signingPublicKey), .string(scheme.rawValue)]
     switch profile {
@@ -77,9 +80,7 @@ func registrationPayload(encryptionPublicKey: String, signingPublicKey: String, 
             .string("replace"), .string(p.name ?? ""), .string(p.description ?? ""), .string(p.image ?? ""),
             .data(ACESigning.encodePayload((p.tags ?? []).map { .string($0) })),
             .data(ACESigning.encodePayload((p.capabilities ?? []).map { .string($0) })),
-            .data(ACESigning.encodePayload((p.chains ?? []).map { .string($0) })),
-            .string(p.endpoint ?? ""), .string(p.pricing == nil ? "absent" : "present"),
-            .string(p.pricing?.currency ?? ""), .string(p.pricing?.maxAmount ?? ""),
+            .string(p.endpoint ?? ""), .string((try? extCanonicalOrEmpty(p.ext)) ?? ""),
             .string(p.principal == nil ? "absent" : "present"),
             .string(p.principal?.account ?? ""), .string(p.principal?.roles.joined(separator: ",") ?? ""),
             .string(p.principal?.signer.scheme ?? ""), .string(p.principal?.signer.publicKey ?? ""),
@@ -105,11 +106,14 @@ public func createRegistrationRequest(
     guard enc.count == ACELimits.kemPublicKeySize else {
         throw ACEError(.invalidKey, "identity encryption public key must be \(ACELimits.kemPublicKeySize) bytes")
     }
-    if case .replace(let p) = profile {
+    var profile = profile
+    if case .replace(var p) = profile {
         try validateProfile(p)
         if let pr = p.principal {
             try validatePrincipalRecord(pr, subjectSigningPublicKey: identity.getSigningPublicKey(), now: ts)
         }
+        p.ext = normalizedExt(p.ext)  // an empty `ext` is absent: signed as "", not sent
+        profile = .replace(p)
     }
     let epk = ACEBase64.encode(enc), spk = ACEBase64.encode(identity.getSigningPublicKey())
     let aceId = identity.getACEId(), scheme = identity.getSigningScheme()

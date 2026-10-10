@@ -14,11 +14,8 @@ import Darwin
 /// - Reads refuse symlinks and files larger than 64 MiB.
 /// - Writes go to `<dir>/.tmp-<16 hex>` (`O_CREAT|O_EXCL|O_NOFOLLOW`), are fsynced, renamed
 ///   over the key and the directory is fsynced.
-/// - Locks are `<root>/locks/<name>.lock` files created with `O_EXCL` containing
-///   `{"createdAt":N,"host":"…","pid":N}`. A lock left by a dead process on the same host,
-///   or an unparseable lock file older than 60 s, is broken; otherwise the caller polls
-///   every 50 ms until the timeout. An in-process mutex keyed by (realpath(root), name)
-///   serializes callers within this process.
+/// - Locks use POSIX flock over permanent files on a local filesystem. The kernel releases
+///   them on process exit. Never unlink or replace lock files; network mounts are unsupported.
 public final class FileStore: ACEStore, @unchecked Sendable {
     public let directory: URL
     private let root: String
@@ -28,6 +25,11 @@ public final class FileStore: ACEStore, @unchecked Sendable {
     /// Opens (creating if needed, mode 0700) the store directory.
     public init(directory: URL) throws {
         let path = directory.standardizedFileURL.path
+        var parentDirectories: [String] = [], cursor = path, before = stat()
+        while lstat(cursor, &before) != 0 && errno == ENOENT {
+            cursor = (cursor as NSString).deletingLastPathComponent
+            parentDirectories.append(cursor)
+        }
         if mkdir(path, 0o700) != 0 && errno != EEXIST {
             // Create intermediate directories as well.
             do {
@@ -45,9 +47,14 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         defer { free(real) }
         self.root = String(cString: real)
         self.directory = URL(fileURLWithPath: self.root, isDirectory: true)
+        for parent in parentDirectories { try fsyncDirectory(parent) }
     }
 
     private func path(_ key: String) -> String { root + "/" + key }
+    private func validateDataKey(_ key: String) throws {
+        try validateStoreKey(key)
+        guard key != "locks", !key.hasPrefix("locks/") else { throw ACEError(.invalidArgument, "locks/ is reserved by FileStore") }
+    }
 
     private func posixError(_ op: String, _ key: String) -> ACEError {
         ACEError(.storageFailed, "\(op) \(key): \(String(cString: strerror(errno)))")
@@ -56,7 +63,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
     // MARK: ACEStore
 
     public func read(_ key: String) throws -> Data? {
-        try validateStoreKey(key)
+        try validateDataKey(key)
         let p = path(key)
         var st = stat()
         if lstat(p, &st) != 0 {
@@ -87,7 +94,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
     }
 
     public func write(_ key: String, _ value: Data) throws {
-        try validateStoreKey(key)
+        try validateDataKey(key)
         try validateStoreValue(value)
         let p = path(key)
         let dir = (p as NSString).deletingLastPathComponent
@@ -110,8 +117,10 @@ public final class FileStore: ACEStore, @unchecked Sendable {
     }
 
     public func delete(_ key: String) throws {
-        try validateStoreKey(key)
-        if unlink(path(key)) != 0 && errno != ENOENT && errno != ENOTDIR {
+        try validateDataKey(key)
+        if unlink(path(key)) == 0 {
+            try fsyncDirectory((path(key) as NSString).deletingLastPathComponent)
+        } else if errno != ENOENT && errno != ENOTDIR {
             throw posixError("unlink", key)
         }
     }
@@ -151,29 +160,15 @@ public final class FileStore: ACEStore, @unchecked Sendable {
 
     // MARK: Locks
 
-    private struct LockContent: Equatable {
-        let createdAt: Int
-        let host: String
-        let pid: Int32
-        var data: Data {
-            JSONWriter.serialize(.object([
-                "createdAt": num(createdAt), "host": .string(host), "pid": num(Int(pid)),
-            ]))
-        }
-    }
-
     public func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock {
         try validateLockName(name)
         let mutexKey = root + "\u{0}" + name
-        let deadline = Date(timeIntervalSinceNow: max(0, timeout))
+        let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
         guard Self.processMutexes.acquire(mutexKey, timeout: timeout) else { throw lockTimeoutError(name) }
         do {
-            let content = try acquireFileLock(name, deadline: deadline)
-            let lockKey = "locks/\(name).lock"
+            let fd = try acquireFileLock(name, deadline: deadline)
             return makeStoreLock {
-                if let current = (try? self.read(lockKey)) ?? nil, current == content.data {
-                    unlink(self.root + "/" + lockKey)
-                }
+                close(fd)
                 Self.processMutexes.release(mutexKey)
             }
         } catch {
@@ -182,51 +177,21 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         }
     }
 
-    private func acquireFileLock(_ name: String, deadline: Date) throws -> LockContent {
+    private func acquireFileLock(_ name: String, deadline: TimeInterval) throws -> Int32 {
         let dir = root + "/locks"
         try makeDirectories(dir)
-        let lockPath = dir + "/" + name + ".lock"
-        let content = LockContent(createdAt: systemClock(), host: Self.hostname(), pid: getpid())
-        while true {
-            let fd = open(lockPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-            if fd >= 0 {
-                defer { close(fd) }
-                do {
-                    try writeAll(fd, content.data, key: "locks/\(name).lock")
-                    guard fsync(fd) == 0 else { throw posixError("fsync", "locks/\(name).lock") }
-                } catch {
-                    unlink(lockPath)
-                    throw error
-                }
-                return content
+        let fd = open(dir + "/" + name + ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
+        guard fd >= 0 else { throw posixError("open lock", name) }
+        do {
+            var st = stat()
+            guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { throw ACEError(.storageFailed, "lock is not a regular file") }
+            while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                guard errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR else { throw posixError("flock", name) }
+                if ProcessInfo.processInfo.systemUptime >= deadline { throw lockTimeoutError(name) }
+                usleep(50_000)
             }
-            guard errno == EEXIST else { throw posixError("create", "locks/\(name).lock") }
-            if isStale("locks/\(name).lock") {
-                unlink(lockPath)
-                continue
-            }
-            if Date() >= deadline { throw lockTimeoutError(name) }
-            usleep(50_000)
-        }
-    }
-
-    private func isStale(_ lockKey: String) -> Bool {
-        var st = stat()
-        guard lstat(root + "/" + lockKey, &st) == 0 else { return false }
-        let raw = ((try? read(lockKey)) ?? nil) ?? Data()
-        if let v = try? JSONParser.parse(raw), let host = v["host"]?.stringValue,
-           let pidValue = v["pid"]?.wireInt, v["createdAt"]?.wireInt != nil {
-            guard host == Self.hostname(), pidValue <= Int(Int32.max) else { return false }
-            return kill(Int32(pidValue), 0) != 0 && errno == ESRCH
-        }
-        let age = systemClock() - Int(st.st_mtimespec.tv_sec)
-        return age > 60
-    }
-
-    private static func hostname() -> String {
-        var buf = [CChar](repeating: 0, count: 256)
-        guard gethostname(&buf, buf.count) == 0 else { return "unknown" }
-        return String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            return fd
+        } catch { close(fd); throw error }
     }
 
     // MARK: Helpers
@@ -243,6 +208,8 @@ public final class FileStore: ACEStore, @unchecked Sendable {
                 guard lstat(current, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else {
                     throw ACEError(.storageFailed, "\(part) is not a directory")
                 }
+            } else {
+                try fsyncDirectory((current as NSString).deletingLastPathComponent)
             }
         }
     }
@@ -266,10 +233,5 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         guard fd >= 0 else { throw posixError("open", dir) }
         defer { close(fd) }
         guard fsync(fd) == 0 else { throw posixError("fsync", dir) }
-    }
-
-    private func randomHex(_ bytes: Int) -> String {
-        var rng = SystemRandomNumberGenerator()
-        return hexEncode((0..<bytes).map { _ in UInt8.random(in: .min ... .max, using: &rng) })
     }
 }

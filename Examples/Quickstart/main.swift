@@ -38,16 +38,20 @@ let bobPinned = try await alicePeers.pinRegistrationFile(createRegistrationFile(
 try await bobPeers.pinRegistrationFile(createRegistrationFile(for: alice, name: "Alice", endpoint: "https://alice.example/ace"))
 
 // onMessage must persist the host effect idempotently, keyed by (from, messageId).
-let inbox = try await Inbox.open(identity: bob, store: bobStore, peers: bobPeers) { message in
+let inbox = try await Inbox.open(identity: bob, store: bobStore, peers: bobPeers, onMessage: { message in
     print("bob received:", message.type, message.body)
-}
-let outbox = try await Outbox.open(identity: alice, store: aliceStore)
+}, commerce: true)
+let outbox = try await Outbox.open(identity: alice, store: aliceStore, commerce: true)
 
 let staged = try await outbox.stage(recipient: bobPinned, type: .rfq, body: ["need": "Summarize a PDF"], threadId: "job-42")
-// With a relay: `try await outbox.deliver(staged.requestId) { try await relay.send($0) }`
-// and on the receiving side `await inbox.pull(relay).messages` or `for try await o in inbox.follow(relay)`.
+// In-process demonstration only: `Inbox.receive(bytes)` is the application codec. On the
+// network the transport is `SecureTransport` / `SecureMailbox` with `NativeMLSEngine`
+// (`openSecureMailbox(…)` on the receiver, then `mailbox.pull()` / `follow()` /
+// `receiveDirect(body)`; `deliverSecure(outbox, requestId, …)` on the sender); never expose
+// this inner Inbox as a network receiver. `swift run SecureInterop` (session-core/tests)
+// exercises the full authenticated handshake.
 try await outbox.deliver(staged.requestId) { envelope in
-    let outcome = try await inbox.receive(envelope.jsonData(), source: .direct)
+    let outcome = try await inbox.receive(envelope.jsonData())
     guard case .delivered = outcome else { throw outcome.error ?? ACEError(.relayRejected) }
 }
 let threads = try ThreadStore(store: bobStore, localAceId: bob.getACEId())

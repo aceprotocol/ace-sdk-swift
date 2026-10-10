@@ -12,9 +12,9 @@ import Foundation
 /// - `stage` signs the message and persists it with its resulting thread state in one
 ///   write (economic: in the thread record; otherwise `outbox/<sha256(requestId)>.json`).
 ///   Staging an existing `requestId` returns the pending send unchanged.
-/// - `deliver(_:transport:)` calls the transport (e.g. `relay.send` or
-///   `deliverDirectOrRelay`); success records a principal `request` in `requests/` (lock
-///   `requests`; a write failure leaves the send pending) and then clears the pending send, `envelope_expired` marks it
+/// - `deliver(_:transport:)` calls the transport (`secure.deliver(envelope, peer, exchange)`
+///   or `mailbox.deliver(envelope, peer:)`); a principal request is recorded before transport (a write failure
+///   prevents sending); success clears the pending send, `envelope_expired` marks it
 ///   `expired`, any other error leaves it unchanged. An `expired` send is refused with
 ///   `envelope_expired` before any transport call. A pending send is never abandoned
 ///   automatically.
@@ -26,7 +26,9 @@ public actor Outbox {
     private let identity: any ACEIdentity
     private let store: any ACEStore
     private let clock: @Sendable () -> Int
+    private let commerce: Bool
     private let threads: ThreadStore
+    private let schemas: [String: SchemaValidator]
     /// Thread of each economic pending send staged or found by this instance. Only a hint:
     /// `find` checks the record and falls back to scanning every thread.
     private var threadHints: [String: (conversationId: String, threadId: String)] = [:]
@@ -35,9 +37,13 @@ public actor Outbox {
     /// records whose snapshot strictly extends the stored history (divergence is
     /// `storage_failed`); records already `acked` and covered by the replay horizon are
     /// skipped (their threads may have been pruned). Nothing is handed over and replay state
-    /// is not written.
+    /// is not written. `schemas` installs deterministic validators by `schemaDigest` (64
+    /// lowercase hex, else `invalid_argument`); `stage` runs one on the outgoing body before
+    /// anything is persisted.
     public static func open(identity: any ACEIdentity, store: any ACEStore,
-                            clock: @escaping @Sendable () -> Int = systemClock) async throws -> Outbox {
+                            clock: @escaping @Sendable () -> Int = systemClock, commerce: Bool = false,
+                            schemas: [String: SchemaValidator] = [:]) async throws -> Outbox {
+        try checkSchemas(schemas)
         let clock = wireClock(clock)
         let threads = try ThreadStore(store: store, localAceId: identity.getACEId(), clock: clock)
         var replay: ReplayDetector?
@@ -58,18 +64,25 @@ public actor Outbox {
                 if let snap = rec.thread { try threads.repair(from: snap, recordKey: key) }
             }
         }
-        return Outbox(identity: identity, store: store, clock: clock, threads: threads)
+        return Outbox(identity: identity, store: store, clock: clock, threads: threads, commerce: commerce, schemas: schemas)
     }
 
-    private init(identity: any ACEIdentity, store: any ACEStore, clock: @escaping @Sendable () -> Int, threads: ThreadStore) {
+    private init(identity: any ACEIdentity, store: any ACEStore, clock: @escaping @Sendable () -> Int, threads: ThreadStore, commerce: Bool,
+                 schemas: [String: SchemaValidator]) {
         self.identity = identity
         self.store = store
         self.clock = clock
         self.threads = threads
+        self.commerce = commerce
+        self.schemas = schemas
     }
 
     private static func outboxKey(_ requestId: String) -> String {
         "outbox/" + sha256Hex(Data(requestId.utf8)) + ".json"
+    }
+
+    private static func sentKey(_ requestId: String) -> String {
+        "sent/" + sha256Hex(Data(requestId.utf8)) + ".json"
     }
 
     private static func checkRequestId(_ id: String) throws -> String {
@@ -115,15 +128,32 @@ public actor Outbox {
         type: MessageType,
         body: [String: JSONValue],
         threadId: String? = nil,
-        requestId: String? = nil
+        requestId: String? = nil,
+        schemaDigest: String? = nil
     ) throws -> PendingSend {
         let rid = try requestId.map(Self.checkRequestId) ?? UUID().uuidString.lowercased()
         let local = identity.getACEId()
+        try checkJSONValue(.object(body))
+        let schemaDigest = try resolveSchemaDigest(type, schemaDigest)
+        // Installed schema, before anything is persisted; a failure stages nothing.
+        try validateInstalledSchema(schemas, SchemaMessage(type: type, schemaDigest: schemaDigest, threadId: threadId, body: body))
+        let digest = try intentDigest(.object([
+            "from": .string(local), "to": .string(recipient.aceId), "type": .string(type.rawValue),
+            "threadId": threadId.map(JSONValue.string) ?? .null, "body": .object(body), "schemaDigest": .string(schemaDigest),
+        ]))
         return try store.withLock("threads") {
             // A generated requestId is fresh, so only a caller-supplied one can already exist.
-            if requestId != nil, let found = try find(rid) { return found.0 }
+            let found = try requestId != nil ? find(rid) : nil
+            let archived = found == nil ? try store.readJSON(Self.sentKey(rid)) : nil
+            let prior = try found?.0 ?? archived.map { try PendingSend.parse($0, key: Self.sentKey(rid), versioned: true) }
+            if let prior {
+                guard prior.requestId == rid else { throw ACEError(.storageFailed, "sent record does not match its requestId") }
+                guard prior.intentDigest == digest else { throw ACEError(.pendingSendConflict, "requestId is already bound to different parameters") }
+                if found == nil { try writeOutbox(prior) }
+                return prior
+            }
             let now = clock()
-            if type.isEconomic, let threadId {
+            if commerce && type.isEconomic, let threadId {
                 let conversationId = try ACEEncryption.computeConversationId(
                     pubA: identity.getEncryptionPublicKey(), pubB: recipient.encryptionPublicKey)
                 let (rec, machine) = try threads.loadWithMachine(conversationId: conversationId, threadId: threadId)
@@ -135,8 +165,8 @@ public actor Outbox {
                     try threads.checkCanOpenThread(peer: recipient.aceId)
                 }
                 let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
-                                            threads: machine, threadId: threadId, timestamp: now)
-                let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env)
+                                            threads: machine, threadId: threadId, timestamp: now, schemaDigest: schemaDigest)
+                let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env, intentDigest: digest, type: type, schemaDigest: schemaDigest, threadId: threadId)
                 guard let snap = machine.getSnapshot(conversationId: conversationId, threadId: threadId) else {
                     throw ACEError(.storageFailed, "thread snapshot missing after createMessage")
                 }
@@ -145,17 +175,18 @@ public actor Outbox {
                 return pending
             }
             let env = try createMessage(sender: identity, recipient: recipient, type: type, body: body,
-                                        threads: try ThreadStateMachine(localAceId: local), threadId: threadId, timestamp: now)
-            let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env,
+                                        threadId: threadId, timestamp: now, schemaDigest: schemaDigest)
+            let pending = PendingSend(requestId: rid, status: .pending, stagedAt: now, message: env, intentDigest: digest, type: type, schemaDigest: schemaDigest, threadId: threadId,
                                       requestTtl: type == .request ? body["ttl"]?.wireInt : nil)
             try writeOutbox(pending)
             return pending
         }
     }
 
-    /// Hand the staged envelope to `transport` (e.g. `{ try await relay.send($0) }` or
-    /// `deliverDirectOrRelay(relay:endpoint:)`) and return its result. Unknown `requestId`
-    /// is `invalid_argument`; an `expired` send is `envelope_expired` (re-sign it first).
+    /// Hand the staged envelope to `transport` (the authenticated secure delivery:
+    /// `{ try await secure.deliver($0, peer: peer, exchange: exchange) }` or
+    /// `{ try await mailbox.deliver($0, peer: peer) }`) and return its result. Unknown
+    /// `requestId` is `invalid_argument`; an `expired` send is `envelope_expired` (re-sign it first).
     @discardableResult
     public func deliver<T: Sendable>(_ requestId: String, transport: @Sendable (ACEMessage) async throws -> T) async throws -> T {
         let rid = try Self.checkRequestId(requestId)
@@ -166,19 +197,19 @@ public actor Outbox {
             throw ACEError(.envelopeExpired, "the pending send expired; resign it first")
         }
         let message = found.0.message
+        if found.0.type == .request {
+            // Persist correlation before transport: a reply may arrive before its ACK.
+            // A failed write prevents delivery.
+            try store.withLock("requests") {
+                try recordRequest(store, message: message, sentAt: clock(), ttl: found.0.requestTtl)
+            }
+        }
         let result: T
         do {
             result = try await transport(message)
         } catch let e as ACEError where e.code == .envelopeExpired {
             try update(rid, messageId: message.messageId) { $0.with(status: .expired) }
             throw e
-        }
-        if message.type == .request {
-            // 06 § Durable Delivery, Sender: recorded before the pending send is cleared; a failure
-            // here leaves it pending and the retry writes it.
-            try store.withLock("requests") {
-                try recordRequest(store, message: message, sentAt: clock(), ttl: found.0.requestTtl)
-            }
         }
         try update(rid, messageId: message.messageId) { _ in nil }
         return result
@@ -195,6 +226,7 @@ public actor Outbox {
             } else if let new {
                 try writeOutbox(new)
             } else {
+                try store.checkedWrite(Self.sentKey(rid), JSONWriter.serialize(p.jvalue(version: true)))
                 try store.checkedDelete(Self.outboxKey(rid))
             }
         }
@@ -205,8 +237,12 @@ public actor Outbox {
     public func resign(_ requestId: String) throws -> PendingSend {
         let rid = try Self.checkRequestId(requestId)
         return try store.withLock("threads") {
+            guard try store.checkedRead(Self.sentKey(rid)) == nil else {
+                throw ACEError(.invalidArgument, "a completed operation cannot be renewed")
+            }
             guard let (p, rec) = try find(rid) else { throw ACEError(.invalidArgument, "no pending send with this requestId") }
             guard p.status == .expired else { throw ACEError(.invalidArgument, "only an expired pending send can be re-signed") }
+            guard p.requestTtl == nil else { throw ACEError(.invalidArgument, "a request deadline cannot be extended by transport retry") }
             let now = clock()
             let env = try ACE.resign(p.message, sender: identity, timestamp: now)
             let new = p.with(status: .pending, message: env)
@@ -232,6 +268,7 @@ public actor Outbox {
         let rid = try Self.checkRequestId(requestId)
         try store.withLock("threads") {
             guard let (p, rec) = try find(rid) else { return }
+            try store.checkedWrite(Self.sentKey(rid), JSONWriter.serialize(p.jvalue(version: true)))
             threadHints[rid] = nil
             guard let rec else {
                 try store.checkedDelete(Self.outboxKey(rid))
