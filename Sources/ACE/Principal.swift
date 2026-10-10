@@ -43,6 +43,13 @@ public struct PrincipalRecord: Codable, Sendable, Equatable {
         return a == b
     }
 
+    /// R-P36 monotonicity within one (subject, account, signer) authority domain: this record
+    /// may replace `old` only with a strictly newer `issuedAt`, or the same signed claims at the
+    /// same `issuedAt`.
+    func supersedes(_ old: PrincipalRecord) -> Bool {
+        issuedAt > old.issuedAt || (issuedAt == old.issuedAt && sameClaims(as: old))
+    }
+
     public init(account: String, roles: [String], signer: PrincipalKey, issuedAt: Int, expiresAt: Int,
                 scope: String? = nil, signature: String) {
         self.account = account
@@ -190,21 +197,26 @@ private func checkFields(_ r: PrincipalRecord, now: Int) throws -> (SigningSchem
 /// `subjectSigningPublicKey` is the key the caller has verified, never anything from the record.
 @discardableResult
 public func validatePrincipalRecord(_ r: PrincipalRecord, subjectSigningPublicKey: Data, now: Int) throws -> PrincipalRecord {
+    try validatePrincipalSignature(r, subjectSigningPublicKey: subjectSigningPublicKey, now: now)  // 1-9
+    guard r.expiresAt > now else { throw principalError("principal record has expired") }  // 10
+    return r
+}
+
+/// 09 § Validation rules 1-9: every rule except expiry (rule 10).
+private func validatePrincipalSignature(_ r: PrincipalRecord, subjectSigningPublicKey: Data, now: Int) throws {
     let (scheme, signerKey) = try checkFields(r, now: now)  // 1-7
     let sig = try decodeSignature(r.signature, scheme: scheme, code: .invalidPrincipal)  // 8
     guard ACESigning.verify(signData: try principalSignData(r, subjectSigningPublicKey: subjectSigningPublicKey),
                             signature: sig, scheme: scheme, publicKey: signerKey) else {  // 9
         throw principalError("principal.signature does not verify for this subject")
     }
-    guard r.expiresAt > now else { throw principalError("principal record has expired") }  // 10
-    return r
 }
 
 /// R-P40: true when `r` fails `validatePrincipalRecord` at `now` only at the expiry step (rule 10):
-/// rules 1-9 pass (checked at `expiresAt - 1`) and `expiresAt <= now`. Any other outcome is false.
+/// rules 1-9 pass and `expiresAt <= now`. Any other outcome is false.
 func isExpiredOnly(_ r: PrincipalRecord, subjectSigningPublicKey: Data, now: Int) -> Bool {
     guard r.expiresAt <= now else { return false }
-    return (try? validatePrincipalRecord(r, subjectSigningPublicKey: subjectSigningPublicKey, now: r.expiresAt - 1)) != nil
+    return (try? validatePrincipalSignature(r, subjectSigningPublicKey: subjectSigningPublicKey, now: now)) != nil
 }
 
 /// R-P40, fetched records: validate `profile.principal`; one that fails only because it has expired is
@@ -316,18 +328,8 @@ public func checkPrincipalRules(
 ) throws {
     guard type.isPrincipal else { throw ACEError(.invalidArgument, "not a principal message type") }
     guard let selfAccount else { throw ACEError(.wrongPrincipal, "the receiver has no principal") }  // 1
-    guard let senderPrincipal else { throw ACEError(.wrongPrincipal, "the sender has no principal") }  // 2
-    let p: PrincipalRecord
-    do {  // 3
-        p = try validatePrincipalRecord(senderPrincipal, subjectSigningPublicKey: senderSigningPublicKey, now: now)
-    } catch let e as ACEError where e.code == .invalidPrincipal {
-        throw ACEError(.wrongPrincipal, "the sender's principal is invalid: \(e.message)")
-    }
-    guard isAccountAuthority(p, selfSigner: selfSigner, trustedSigners: trustedSigners) else {  // 4
-        throw ACEError(.wrongPrincipal, "signer is not an authority of the account")
-    }
-    guard p.account == selfAccount else { throw ACEError(.wrongPrincipal, "the sender belongs to another account") }  // 5
-    guard p.scope == nil else { throw ACEError(.wrongPrincipal, "unsupported principal scope") }
+    let p = try checkSenderPrincipal(senderPrincipal, senderSigningPublicKey: senderSigningPublicKey, account: selfAccount,
+                                selfSigner: selfSigner, trustedSigners: trustedSigners, now: now)  // 2-5
     if type == .decision {
         guard p.roles.contains("controller") else {  // 6
             throw ACEError(.wrongPrincipal, "only a controller may send a decision")
@@ -345,16 +347,35 @@ public func checkPrincipalRules(
     }
 }
 
+/// 09 § Same-Account Rules steps 2-5 (present, valid, signed by an authority of the account, same
+/// account, no scope); returns the validated record, else throws `wrong_principal`.
+private func checkSenderPrincipal(_ senderPrincipal: PrincipalRecord?, senderSigningPublicKey: Data, account: String,
+                             selfSigner: PrincipalKey?, trustedSigners: Set<PrincipalKey>, now: Int) throws -> PrincipalRecord {
+    guard let senderPrincipal else { throw ACEError(.wrongPrincipal, "the sender has no principal") }  // 2
+    let p: PrincipalRecord
+    do {  // 3
+        p = try validatePrincipalRecord(senderPrincipal, subjectSigningPublicKey: senderSigningPublicKey, now: now)
+    } catch let e as ACEError where e.code == .invalidPrincipal {
+        throw ACEError(.wrongPrincipal, "the sender's principal is invalid: \(e.message)")
+    }
+    guard isAccountAuthority(p, selfSigner: selfSigner, trustedSigners: trustedSigners) else {  // 4
+        throw ACEError(.wrongPrincipal, "signer is not an authority of the account")
+    }
+    guard p.account == account else { throw ACEError(.wrongPrincipal, "the sender belongs to another account") }  // 5
+    guard p.scope == nil else { throw ACEError(.wrongPrincipal, "unsupported principal scope") }
+    return p
+}
+
 /// True when the pinned sender principal passes 09 steps 2-5 (present, valid, signed by an
 /// authority of the account, same account). False means a peer refresh may help (R-P20).
+/// Only a `wrong_principal` failure is false; any other error throws.
 func senderPrincipalUsable(_ senderPrincipal: PrincipalRecord?, senderSigningPublicKey: Data,
-                           principal: InboxPrincipal, now: Int) -> Bool {
-    guard let senderPrincipal,
-          let p = try? validatePrincipalRecord(senderPrincipal, subjectSigningPublicKey: senderSigningPublicKey, now: now) else {
-        return false
-    }
-    return p.scope == nil && isAccountAuthority(p, selfSigner: principal.selfSigner, trustedSigners: principal.trustedSigners)
-        && p.account == principal.account
+                           principal: PrincipalContext, now: Int) throws -> Bool {
+    do {
+        _ = try checkSenderPrincipal(senderPrincipal, senderSigningPublicKey: senderSigningPublicKey, account: principal.account,
+                                     selfSigner: principal.selfSigner, trustedSigners: principal.trustedSigners, now: now)
+        return true
+    } catch let e as ACEError where e.code == .wrongPrincipal { return false }
 }
 
 // MARK: - requests/ ledger (09 § Persistence, 06 Appendix A)

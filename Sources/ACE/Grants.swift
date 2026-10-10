@@ -39,7 +39,7 @@ public enum ACEGrants {
             }
         }
         try depth(.object(intent), 0)
-        guard try JSONValue.object(intent).jsonData().count <= 60000 else { throw bad() }
+        guard try JSONValue.object(intent).jsonData().count <= ACELimits.maxExecutionJSONBytes else { throw bad() }
         return try intentDigest(.object(intent))
     }
     /// Validated grant claims and their digest.

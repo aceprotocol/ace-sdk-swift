@@ -12,7 +12,7 @@ public struct ExecutionRequest: Sendable {
         guard Set(body.keys) == ["intent", "grants"], let intent = body["intent"]?.objectValue,
               let values = body["grants"]?.arrayValue, (1...8).contains(values.count) else { throw ACEGrants.bad() }
         let grants = values.compactMap(\.objectValue)
-        guard grants.count == values.count, try JSONValue.object(body).jsonData().count <= 60_000 else { throw ACEGrants.bad() }
+        guard grants.count == values.count, try JSONValue.object(body).jsonData().count <= ACELimits.maxExecutionJSONBytes else { throw ACEGrants.bad() }
         _ = try ACEGrants.executionIntentDigest(intent)
         self.intent = intent; self.grants = grants
     }

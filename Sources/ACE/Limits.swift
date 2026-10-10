@@ -49,6 +49,8 @@ public enum ACELimits {
     public static let defaultLockTimeoutSeconds: TimeInterval = 10
     /// Lifetime of one secure handshake attempt: frame expiry and the sender's wait for each reply.
     static let secureAttemptSeconds = 120
+    /// Compact JSON of an execution intent or request body (10 § Execution Grants).
+    static let maxExecutionJSONBytes = 60_000
 }
 
 /// 2^53 − 1: the largest wire integer.

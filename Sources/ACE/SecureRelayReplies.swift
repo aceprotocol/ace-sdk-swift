@@ -16,7 +16,10 @@ public actor SecureRelayReplies {
         self.identity = identity; self.secure = secure; self.relay = relay; self.peer = peer; self.send = send; cursor = since
     }
     public func exchange(_ packet: ACEMessage, expected: SecureTransport.Route) async throws -> ACEMessage {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(ACELimits.secureAttemptSeconds))
+        // Never wait past the attempt itself (at most the 120-second handshake lifetime).
+        let remaining = min(ACELimits.secureAttemptSeconds, expected.expiresAt - secure.clock())
+        guard remaining > 0 else { throw MLSError("delivery_expired") }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(remaining))
         path = try await send(packet, peer)
         while ContinuousClock.now < deadline {
             try Task.checkCancellation()

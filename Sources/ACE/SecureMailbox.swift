@@ -142,7 +142,8 @@ public actor SecureMailbox {
         while ContinuousClock.now < deadline {
             try Task.checkCancellation(); try checkOpen()
             if let response = waiting[key]?.packet { return response }
-            let result = await pull(limit: ACELimits.maxInboxPage, maxPages: 1)
+            // Never wait here for this process's own offers: the reply being awaited is on the relay.
+            let result = await pull(limit: ACELimits.maxInboxPage, maxPages: 1, awaitHandshakes: false)
             if let error = result.blocked { throw error }
             if let response = waiting[key]?.packet { return response }
             try await Task.sleep(for: .milliseconds(250))
@@ -199,17 +200,28 @@ public actor SecureMailbox {
             }
         }
     }
+    /// Drain the relay inbox. `maxPages` counts non-empty pages. While an offer this transport
+    /// issued still awaits its data frame, the pull keeps polling (1 s) instead of returning, so a
+    /// short-lived receive does not destroy those keys (13); the whole pull is bounded by the
+    /// 120-second handshake lifetime and 10,000 outcomes (`hasMore`).
     public func pull(limit: Int = ACELimits.maxInboxPage, maxPages: Int? = nil) async -> PullResult {
+        await pull(limit: limit, maxPages: maxPages, awaitHandshakes: true)
+    }
+    private func pull(limit: Int, maxPages: Int?, awaitHandshakes: Bool) async -> PullResult {
         await enter(); defer { leave() }
         var outcomes: [ReceiveOutcome] = []
         do {
             try checkOpen()
             guard (1...ACELimits.maxInboxPage).contains(limit), maxPages == nil || maxPages! > 0 else { throw ACEError(.invalidArgument, "Invalid page bounds") }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(ACELimits.secureAttemptSeconds))
             var pages = 0
-            while !Task.isCancelled {
-                if let maxPages, pages >= maxPages { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
-                let page = try await relay.fetchInbox(identity, since: currentCursor, limit: limit); pages += 1
+            func pending() async -> Bool { awaitHandshakes ? await secure.pendingHandshakes() : false }
+            while !Task.isCancelled, ContinuousClock.now < deadline {
+                if let maxPages, pages >= maxPages, !(await pending()) { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
+                let page = try await relay.fetchInbox(identity, since: currentCursor, limit: limit)
+                if !page.entries.isEmpty { pages += 1 }
                 for entry in page.entries {
+                    if Task.isCancelled { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
                     if let cursor = currentCursor, compareStreamIds(entry.streamId, cursor) <= 0 { continue }
                     let next: [ReceiveOutcome]
                     do { next = try await ingest(entry.message) }
@@ -217,7 +229,11 @@ public actor SecureMailbox {
                     try advance(entry.streamId)
                     outcomes += next; publish(next)
                 }
-                if page.entries.count < limit { return PullResult(outcomes: outcomes, blocked: nil) }
+                if page.entries.count < limit {
+                    if !(await pending()) { return PullResult(outcomes: outcomes, blocked: nil) }
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                if outcomes.count >= 10_000 { return PullResult(outcomes: outcomes, blocked: nil, hasMore: true) }
             }
             return PullResult(outcomes: outcomes, blocked: nil, hasMore: true)
         } catch { return PullResult(outcomes: outcomes, blocked: ACEError.wrap(error)) }

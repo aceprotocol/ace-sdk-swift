@@ -23,6 +23,10 @@ public actor PeerStore {
     /// ACE ID (so the signing key), account and signer, so equal bytes validate identically.
     private var horizons: [String: (raw: Data, record: PrincipalRecord)] = [:]
     private static let horizonsCap = 1024
+    /// Pins already parsed and re-verified, by key with their exact bytes. Parsing is pure (it
+    /// verifies at the record's own `fetchedAt`), so equal bytes yield the same pin.
+    private var pins: [String: (raw: Data, pin: PinnedPeer)] = [:]
+    private static let pinsCap = 256
 
     public init(store: any ACEStore, relay: RelayClient? = nil, ttlSeconds: Int = 86400,
                 clock: @escaping @Sendable () -> Int = systemClock) throws {
@@ -35,8 +39,17 @@ public actor PeerStore {
 
     private func load(_ aceId: String, enforceHorizon: Bool = true) throws -> PinnedPeer? {
         let key = PinnedPeer.key(aceId)
-        guard let v = try store.readJSON(key) else { return nil }
-        let result = try PinnedPeer.parse(v, key: key, aceId: aceId)
+        guard let raw = try store.checkedRead(key) else { return nil }
+        let result: PinnedPeer
+        if let cached = pins[key], cached.raw == raw {
+            result = cached.pin
+        } else {
+            let v: JValue
+            do { v = try JSONParser.parse(raw) } catch { throw ACEError(.storageFailed, "\(key) is not valid JSON") }
+            result = try PinnedPeer.parse(v, key: key, aceId: aceId)
+            if pins.count >= Self.pinsCap { pins.removeAll() }
+            pins[key] = (raw, result)
+        }
         if enforceHorizon {
             do { try checkPrincipalHorizon(result.peer, persist: false) }
             catch { throw storageError(key, "principal conflicts with durable horizon") }
@@ -127,7 +140,7 @@ public actor PeerStore {
                 horizons[key] = (raw, high!)
             }
         }
-        if let high, next.issuedAt < high.issuedAt || (next.issuedAt == high.issuedAt && !next.sameClaims(as: high)) {
+        if let high, !next.supersedes(high) {
             throw ACEError(.invalidPrincipal, "principal rolls back or conflicts with the durable horizon")
         }
         if persist && (high == nil || next.issuedAt > high!.issuedAt) {

@@ -92,8 +92,12 @@ public actor SecureTransport {
     private let identity: any ACEIdentity
     private let engine: any MLSEngine
     let store: any ACEStore
-    private let clock: @Sendable () -> Int
+    nonisolated let clock: @Sendable () -> Int
     private var sessions: [String: Incoming] = [:]
+    /// Next time-based sweep of expired `secure/in/` rows; a full table sweeps at once.
+    private var nextSweep = 0
+    private static let sweepSeconds = 30
+    private static let maxInboundRows = 1024
     /// Frames whose signature, decryption and shape already verified, by packet and sender keys.
     /// `route` then `respond` (or `read`) of one packet verifies it once; admission and expiry,
     /// which change with time and policy, are rechecked on every read.
@@ -208,8 +212,10 @@ public actor SecureTransport {
         let generation = try allowed(peer.aceId)
         let hello = Frame(body: ["kind": "hello", "attempt": .string(randomHex(32)), "expiresAt": .number(Double(clock() + ACELimits.secureAttemptSeconds)),
             "messageId": .string(inner.messageId), "digest": .string(envelopeFingerprint(inner))])
-        let request: Exchange = { packet, route in
-            do { return try await exchange(packet, route) }
+        // Bounded at the attempt deadline (13: bounded network timeouts and cancellation): a stuck
+        // exchange is cancelled and no longer holds an outgoing slot.
+        let request: Exchange = { [clock = self.clock] packet, route in
+            do { return try await withDeadline(seconds: min(ACELimits.secureAttemptSeconds, hello.expiresAt - clock())) { try await exchange(packet, route) } }
             catch let error as ACEError where error.code == .envelopeExpired { throw MLSError("delivery_expired") }
         }
         let offer = try read(await request(packet(peer, hello), Route(attempt: hello.attempt, kind: "offer", expiresAt: hello.expiresAt)), peer)
@@ -230,10 +236,11 @@ public actor SecureTransport {
             let prefix = Data(data.receiptPrefix.utf8)
             guard plaintext.starts(with: prefix), let rest = String(data: plaintext.dropFirst(prefix.count), encoding: .utf8),
                   let outcome = SecureOutcome(receipt: rest) else { throw MLSError("invalid_delivery_receipt") }
+            // The sender snapshot is checked after the receipt, before its verdict is reported (13).
+            guard try allowed(peer.aceId) == generation else { throw MLSError("delivery_peer_disabled") }
             if case .rejected(let code) = outcome {
                 throw ACEError(.deliveryRejected, "the receiver's Inbox rejected the envelope: \(code)", remoteCode: code)
             }
-            guard try allowed(peer.aceId) == generation else { throw MLSError("delivery_peer_disabled") }
             try session.close()
         } catch { try? session.close(); throw error }
         guard clock() < hello.expiresAt else { throw MLSError("delivery_expired") }
@@ -251,18 +258,16 @@ public actor SecureTransport {
         let f = try read(packet, peer)
         guard f.kind == "hello" || f.kind == "data" else { throw MLSError("invalid_delivery_frame") }
         let held = try store.lock(Self.peerLock(peer.aceId)); defer { held.release() }
-        let generation = try allowed(peer.aceId); try closeExpiredSessions()
+        let generation = try allowed(peer.aceId); try sweep()
         let key = "secure/in/\(f.attempt).json"
         if f.kind == "hello" {
             if let active = sessions[f.attempt] {
                 guard active.peer == peer.aceId, active.generation == generation, active.hello.matches(f) else { throw MLSError("invalid_delivery_frame") }
                 return active.response
             }
-            // Only a new attempt grows the journal, so only it pays for the sweep. A data frame
-            // never needs it: its row expires with the frame, which `read` already refused.
-            let journal = try sweepJournal()
+            // A prior attempt never gets a replacement key package after process loss.
             guard try store.read(key) == nil else { throw MLSError("session_closed") }
-            guard sessions.count < 32, journal < 1024 else { throw MLSError("session_limit") }
+            guard sessions.count < 32, try inboundRoom() else { throw MLSError("session_limit") }
             let session = try PairwiseMLS(engine: engine, store: store, local: identity.getACEId(), peer: peer.aceId)
             do {
                 var body = f.body; body["kind"] = "offer"; body["nonce"] = .string(randomHex(32)); body["keyPackage"] = .string(session.state.keyPackage)
@@ -295,7 +300,7 @@ public actor SecureTransport {
             guard envelope.from == peer.aceId, envelope.to == identity.getACEId(), envelope.messageId == f.messageId,
                   envelopeFingerprint(envelope) == f.digest else { throw MLSError("invalid_delivery_frame") }
             var received = Received(version: 1, generation: generation, expiresAt: f.expiresAt, peer: peer.aceId, input: input, envelope: envelope, response: nil, outcome: nil)
-            try store.write(key, encode(received))
+            try store.write(key, encodeSortedJSON(received))
             // The receipt is NEVER produced before the Inbox commits: its outcome is the Inbox's verdict.
             let outcome = try await accept(envelope.jsonData())
             if case .rejected(let code) = outcome, !isRemoteCode(code) { throw MLSError("invalid_session_input") }
@@ -304,30 +309,36 @@ public actor SecureTransport {
                 "messageId": .string(f.messageId), "digest": .string(f.digest), "nonce": .string(f.nonce), "ciphertext": .string(cipher)]))
             received.envelope = nil; received.response = response; received.outcome = outcome.receipt
             // Durable before release; a replayed data frame for this attempt returns the same receipt.
-            try store.write(key, encode(received))
+            try store.write(key, encodeSortedJSON(received))
         }
         guard clock() < f.expiresAt else { throw MLSError("delivery_expired") }
         try allowed(peer.aceId)
         return response
     }
-    private func encode(_ received: Received) throws -> Data {
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(received)
+    /// Room for another inbound attempt row; a full table is swept before it is refused.
+    private func inboundRoom() throws -> Bool {
+        if try store.list(prefix: "secure/in/").count < Self.maxInboundRows { return true }
+        try sweep(force: true)
+        return try store.list(prefix: "secure/in/").count < Self.maxInboundRows
     }
-    /// Delete expired `secure/in/` rows; the number left.
-    private func sweepJournal() throws -> Int {
-        var left = 0
-        for key in try store.list(prefix: "secure/in/") {
-            guard let raw = try store.read(key) else { continue }
-            if let expires = try JSONValue(json: raw)["expiresAt"]?.intValue, expires <= clock() { try store.delete(key) } else { left += 1 }
+    /// Delete expired `secure/in/` rows (at most every `sweepSeconds`, or now when `force`) and
+    /// close expired in-memory sessions.
+    private func sweep(force: Bool = false) throws {
+        let now = clock()
+        if force || now >= nextSweep {
+            nextSweep = now + Self.sweepSeconds
+            for key in try store.list(prefix: "secure/in/") {
+                guard let raw = try store.read(key) else { continue }
+                if let expires = try JSONValue(json: raw)["expiresAt"]?.intValue, expires <= now { try store.delete(key) }
+            }
         }
-        return left
-    }
-    private func closeExpiredSessions() throws {
-        for (id, active) in sessions where active.hello.expiresAt <= clock() {
+        for (id, active) in sessions where active.hello.expiresAt <= now {
             sessions[id] = nil; try active.session.close()
         }
     }
+    /// True while an offer this transport issued still awaits its data frame. A short-lived
+    /// receive may wait for it up to the handshake deadline (13); otherwise its keys are lost.
+    public func pendingHandshakes() -> Bool { sessions.values.contains { $0.hello.expiresAt > clock() } }
     public func close() async throws {
         closed = true
         await enter(); defer { leave() }
@@ -337,5 +348,55 @@ public actor SecureTransport {
         }
         sessions.removeAll()
         if let failure { throw failure }
+    }
+}
+
+/// Race `operation` against a `seconds` deadline (`delivery_expired`), cancelling the loser. The
+/// caller resumes at the deadline even if `operation` ignores cancellation.
+func withDeadline<T: Sendable>(seconds: Int, _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+    guard seconds > 0 else { throw MLSError("delivery_expired") }
+    let gate = DeadlineGate<T>()
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+            gate.wait(continuation)
+            gate.attach(Task { do { gate.finish(.success(try await operation())) } catch { gate.finish(.failure(error)) } })
+            gate.attach(Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                gate.finish(.failure(MLSError("delivery_expired")))
+            })
+        }
+    } onCancel: { gate.finish(.failure(CancellationError())) }
+}
+
+/// First result wins: resumes the continuation once and cancels the racing tasks.
+private final class DeadlineGate<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, any Error>?
+    private var result: Result<T, any Error>?
+    private var tasks: [Task<Void, Never>] = []
+    func wait(_ c: CheckedContinuation<T, any Error>) {
+        let ready: Result<T, any Error>? = lock.withLock {
+            if result == nil { continuation = c }
+            return result
+        }
+        if let ready { c.resume(with: ready) }
+    }
+    func attach(_ task: Task<Void, Never>) {
+        let finished: Bool = lock.withLock {
+            if result == nil { tasks.append(task) }
+            return result != nil
+        }
+        if finished { task.cancel() }
+    }
+    func finish(_ r: Result<T, any Error>) {
+        let pending: (CheckedContinuation<T, any Error>?, [Task<Void, Never>])? = lock.withLock {
+            guard result == nil else { return nil }
+            result = r
+            defer { continuation = nil; tasks = [] }
+            return (continuation, tasks)
+        }
+        guard let (c, racing) = pending else { return }
+        racing.forEach { $0.cancel() }
+        c?.resume(with: r)
     }
 }

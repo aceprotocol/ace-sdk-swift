@@ -342,29 +342,34 @@ public enum AdoptOutcome: String, Sendable {
     case adopted, unchanged, rotated
 }
 
-/// R-P36: within one (subject, account, signer) authority domain, a principal replaces the cached
-/// one only with a strictly newer `issuedAt`, or the same signed claims at the same `issuedAt`
-/// (signature bytes may differ). Another domain's principal replaces it only when `crossDomain`
-/// (a relay record; never a registration file, whose principal the key binding does not cover, 02).
-private func supersedes(_ new: PrincipalRecord, _ old: PrincipalRecord, crossDomain: Bool) -> Bool {
-    guard new.account == old.account, new.signer == old.signer else { return crossDomain }
-    return new.issuedAt > old.issuedAt || (new.issuedAt == old.issuedAt && new.sameClaims(as: old))
+/// The principal a merge leaves in the pin. An expired cached one is dropped first (R-P35); within
+/// one (subject, account, signer) authority domain `next` replaces the cached one only when it
+/// `supersedes` it (R-P36). A relay record also replaces another domain's principal and withdraws
+/// it when absent; a registration file does neither (the key binding does not cover it, 02, R-P26).
+private func pickPrincipal(cached: PrincipalRecord?, next: PrincipalRecord?, now: Int, source: PeerSource) -> PrincipalRecord? {
+    let fromRelay = source == .relay
+    guard let old = cached, old.expiresAt > now else { return next }
+    guard let next else { return fromRelay ? nil : old }
+    guard next.account == old.account, next.signer == old.signer else { return fromRelay ? next : old }
+    return next.supersedes(old) ? next : old
+}
+
+private func withPrincipal(_ profile: AgentProfile, _ principal: PrincipalRecord?) -> AgentProfile? {
+    var p = profile
+    p.principal = principal
+    return p == AgentProfile() ? nil : p
 }
 
 /// Profile a signed (relay) candidate leaves in the pin (R-P36): an older `registeredAt` keeps the
 /// cached profile (minus a cached principal expired at `now`, R-P35); otherwise the candidate's
-/// replaces it, a principal only per `supersedes`, and a candidate without one withdraws it (an
-/// expired cached principal is dropped first, R-P35).
+/// replaces it, its principal per `pickPrincipal`.
 private func relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: Int) -> AgentProfile? {
     guard candidate.registeredAt >= pin.registeredAt else {
-        guard var kept = pin.profile, let old = kept.principal, old.expiresAt <= now else { return pin.profile }
-        kept.principal = nil
-        return kept == AgentProfile() ? nil : kept
+        guard let kept = pin.profile, let old = kept.principal, old.expiresAt <= now else { return pin.profile }
+        return withPrincipal(kept, nil)
     }
     guard var p = candidate.profile else { return nil }
-    if let new = p.principal, let old = pin.profile?.principal, old.expiresAt > now, !supersedes(new, old, crossDomain: true) {
-        p.principal = old
-    }
+    p.principal = pickPrincipal(cached: pin.principal, next: p.principal, now: now, source: .relay)
     return p
 }
 
@@ -375,13 +380,8 @@ private func withProfile(_ pin: VerifiedPeer, _ profile: AgentProfile?) -> Verif
 }
 
 /// A kept registration-file candidate replaces only the profile members it supplies (absent
-/// members carry over, R-P27). `principal` is replaced only by a validated one that `supersedes`
-/// the cached one within its own authority domain, and never removed (R-P26) unless expired at
-/// `now` (R-P35).
+/// members carry over, R-P27); its principal per `pickPrincipal`.
 private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: Int) -> AgentProfile? {
-    // An expired cached principal is dropped (R-P35): the refreshed fetchedAt would otherwise make the pin unloadable.
-    let old = cached?.principal.flatMap { $0.expiresAt > now ? $0 : nil }, new = candidate?.principal
-    let keep: PrincipalRecord? = old == nil ? new : (new.map { supersedes($0, old!, crossDomain: false) } == true ? new : old)
     var m = cached ?? AgentProfile()
     if let c = candidate {
         if let v = c.name { m.name = v }
@@ -392,8 +392,7 @@ private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: I
         if let v = c.endpoint { m.endpoint = v }
         if let v = normalizedExt(c.ext) { m.ext = v }
     }
-    m.principal = keep
-    return m == AgentProfile() ? nil : m
+    return withPrincipal(m, pickPrincipal(cached: cached?.principal, next: candidate?.principal, now: now, source: .registration))
 }
 
 /// Pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
@@ -412,13 +411,8 @@ func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws
         ? fileProfile(cached: pin.profile, candidate: candidate.profile, now: now)
         : relayProfile(pin: pin, candidate: candidate, now: now)
     if pin.encryptionPublicKey == candidate.encryptionPublicKey {
-        let newer = candidate.registeredAt > pin.registeredAt ? candidate : pin
-        let merged = VerifiedPeer(
-            aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
-            encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
-            registrationSignature: newer.registrationSignature, source: newer.source, profile: profile
-        )
-        return (merged, .unchanged)
+        // Same keys (signing checked above): only the binding time, signature, source and profile can differ.
+        return (withProfile(candidate.registeredAt > pin.registeredAt ? candidate : pin, profile), .unchanged)
     }
     if candidate.registeredAt > pin.registeredAt { return (withProfile(candidate, profile), .rotated) }
     throw ACEError(.stalePeerBinding, "a different encryption key requires a newer registeredAt")

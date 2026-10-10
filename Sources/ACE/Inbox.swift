@@ -64,7 +64,8 @@ public actor Inbox {
     private let clock: @Sendable () -> Int
     private let threads: ThreadStore
     private let commerce: Bool
-    private let principal: InboxPrincipal?
+    /// Step-7 context (nil without a `principal`), built once at `open`.
+    private let principal: PrincipalContext?
     private let schemas: [String: SchemaValidator]
     private let receiveLock: any ACEStoreLock
     private var replay: ReplayDetector
@@ -139,7 +140,11 @@ public actor Inbox {
         self.offlineWindow = offlineWindow
         self.clock = clock
         self.threads = threads
-        self.principal = principal
+        self.principal = principal.map { p in
+            PrincipalContext(account: p.account,
+                             openRequestTo: { c, r, now in try openRequestTo(store, conversationId: c, messageId: r, now: now) },
+                             selfSigner: p.selfSigner, trustedSigners: p.trustedSigners)
+        }
         self.commerce = commerce
         self.schemas = schemas
         self.receiveLock = lock
@@ -254,7 +259,7 @@ public actor Inbox {
             }
             if rec.status == .pending { pending.append((key, rec)) } else { acked[key] = (m.from, m.timestamp) }
         }
-        if !decisions.isEmpty, let context = principalContext() {  // 1a: no-op when already filled
+        if !decisions.isEmpty, let context = principal {  // 1a: no-op when already filled
             // Pinned senders only (no network); read before the lock, as `PeerStore` is an actor.
             var senders: [String: VerifiedPeer] = [:]
             for from in Set(decisions.map(\.from)) { senders[from] = try await peers.get(from) }
@@ -379,7 +384,7 @@ public actor Inbox {
         catch let e as ACEError { return rejected(e, env: env, verified: gate.verified) }
         catch { return .retryable(.wrap(error)) }
         if principal != nil && parsed.type.isPrincipal {
-            do { peer = try await refreshPrincipalSender(env, peer: peer, now: now) }
+            do { peer = try await refreshPrincipalSender(peer, now: now) }
             catch { return .retryable(.wrap(error)) }
         }
         // Actor reentrancy: another receive may have failed while this one was suspended at
@@ -453,7 +458,7 @@ public actor Inbox {
             guard try replay.accepts(env.messageId, from: env.from, timestamp: env.timestamp) else {
                 return .done(.duplicate(from: env.from, messageId: env.messageId))
             }
-            try applyMessageRules(parsed, threads: economic ? machine : nil, principal: principalContext(), sender: peer, now: now)
+            try applyMessageRules(parsed, threads: economic ? machine : nil, principal: principal, sender: peer, now: now)
             if economic && rec == nil { try threads.checkCanOpenThread(peer: env.from) }
         } catch let e as ACEError { return .done(rejected(e, env: env, verified: true)) }
         catch { return .done(.retryable(.wrap(error))) }
@@ -480,29 +485,19 @@ public actor Inbox {
         return .handOver(delivery)
     }
 
-    /// Step-7 context. `receiveOne` refreshes the sender before parsing, outside the
-    /// `requests` lock.
-    private func principalContext() -> PrincipalContext? {
-        guard let principal else { return nil }
-        let store = self.store
-        return PrincipalContext(account: principal.account,
-                                openRequestTo: { c, r, now in try openRequestTo(store, conversationId: c, messageId: r, now: now) },
-                                selfSigner: principal.selfSigner, trustedSigners: principal.trustedSigners)
-    }
-
     /// R-P20 / R-P29 / R-P30 (09 § Same-Account Rules, SDK note): when the pinned sender
-    /// principal fails steps 2-5 and the envelope verifies under the pinned key and scheme,
-    /// refresh the sender from the relay once (rollback barrier) and return the binding the
-    /// rules run on. Only a transient error propagates (retryable); a permanent error from the
+    /// principal fails steps 2-5, refresh the sender from the relay once (rollback barrier) and
+    /// return the binding the rules run on. Only a transient error propagates (retryable); a permanent error from the
     /// relay or adopt, or no relay, leaves the pinned binding to decide. The refreshed binding is
     /// adopted as is, including an encryption-key rotation; its signing key cannot differ (the
     /// ACE ID is the hash of the signing key). A forged envelope triggers no relay call; the
-    /// pipeline rejects it later.
-    private func refreshPrincipalSender(_ env: ACEMessage, peer: VerifiedPeer, now: Int) async throws -> VerifiedPeer {
+    /// pipeline rejects it before this point. Called only after `parseMessage` accepted `env`
+    /// under `peer` (recipient, window, replay and signature checked, R-P38), so nothing here
+    /// repeats those checks.
+    private func refreshPrincipalSender(_ peer: VerifiedPeer, now: Int) async throws -> VerifiedPeer {
         guard let principal,
-              !senderPrincipalUsable(peer.principal, senderSigningPublicKey: peer.signingPublicKey, principal: principal, now: now),
-              wouldPassPreSignatureChecks(env, now: now),
-              Self.authenticated(env, by: peer) else { return peer }
+              try !senderPrincipalUsable(peer.principal, senderSigningPublicKey: peer.signingPublicKey, principal: principal, now: now)
+        else { return peer }
         let fresh: VerifiedPeer?
         do {
             fresh = try await peers.refresh(peer.aceId)
@@ -515,25 +510,6 @@ public actor Inbox {
         guard let fresh, fresh.aceId == peer.aceId else { return peer }
         assert(fresh.signingPublicKey == peer.signingPublicKey, "ACE ID binds the signing key")
         return fresh
-    }
-
-    /// R-P38: the cheap pipeline checks that precede the signature (recipient, timestamp window
-    /// and floor, replay — a pure read, nothing committed), so a misaddressed, stale or replayed
-    /// envelope never costs a relay call; the pipeline rejects it afterwards.
-    private func wouldPassPreSignatureChecks(_ env: ACEMessage, now: Int) -> Bool {
-        guard env.to == localAceId, env.timestamp >= floor, env.timestamp <= now + ACELimits.timestampWindowSeconds else {
-            return false
-        }
-        return (try? replay.accepts(env.messageId, from: env.from, timestamp: env.timestamp)) == true
-    }
-
-    /// The envelope signature verifies under `peer`'s pinned key and scheme (as parse steps
-    /// 2-4 and 8); malformed signatures are false.
-    private static func authenticated(_ env: ACEMessage, by peer: VerifiedPeer) -> Bool {
-        guard env.from == peer.aceId, env.signature.scheme == peer.scheme,
-              let sig = try? decodeSignature(env.signature.value, scheme: env.signature.scheme, code: .invalidEnvelope),
-              let data = try? messageSignData(env) else { return false }
-        return ACESigning.verify(signData: data, signature: sig, scheme: peer.scheme, publicKey: peer.signingPublicKey)
     }
 
 }

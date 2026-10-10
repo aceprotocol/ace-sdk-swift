@@ -365,16 +365,15 @@ func parseMessage(
 func applyMessageRules(_ parsed: ParsedMessage, threads: ThreadStateMachine?, principal: PrincipalContext?,
                        sender: VerifiedPeer, now: Int) throws {
     if parsed.type.isEconomic { try threads?.apply(event(parsed), body: parsed.body) }
-    if parsed.type.isPrincipal, let principal { try checkPrincipal(parsed, body: parsed.body, sender: sender, context: principal, now: now) }
+    if parsed.type.isPrincipal, let principal { try checkPrincipal(parsed, sender: sender, context: principal, now: now) }
 }
 
 /// 06 step 7 for principal types (09 § Same-Account Rules), against the sender binding as given.
 /// The `Inbox` refreshes a stale sender once before parsing (R-P20, outside any store lock).
-private func checkPrincipal(_ env: ParsedMessage, body: [String: JSONValue], sender: VerifiedPeer,
-                            context: PrincipalContext?, now: Int) throws {
+private func checkPrincipal(_ m: ParsedMessage, sender: VerifiedPeer, context: PrincipalContext, now: Int) throws {
     try checkPrincipalRules(
-        type: env.type, body: body, conversationId: env.conversationId, senderPrincipal: sender.principal,
-        senderSigningPublicKey: sender.signingPublicKey, selfAccount: context?.account,
-        openRequestTo: context?.openRequestTo, now: now,
-        selfSigner: context?.selfSigner, trustedSigners: context?.trustedSigners ?? [])
+        type: m.type, body: m.body, conversationId: m.conversationId, senderPrincipal: sender.principal,
+        senderSigningPublicKey: sender.signingPublicKey, selfAccount: context.account,
+        openRequestTo: context.openRequestTo, now: now,
+        selfSigner: context.selfSigner, trustedSigners: context.trustedSigners)
 }

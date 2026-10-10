@@ -57,6 +57,8 @@ public final class PairwiseMLS: @unchecked Sendable {
     static let maxPlaintextBytes = 40_000
     static let maxMessageBytes = 64_000
     static let maxKeyPackageBytes = 10_924
+    /// One engine command or response, serialized.
+    static let maxEngineIOBytes = 140_000
     private struct Gate: Codable {
         let version: Int
         let context: String
@@ -198,11 +200,7 @@ public final class PairwiseMLS: @unchecked Sendable {
         }
     }
 
-    private func encodeGate(_ gate: Gate) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(gate)
-    }
+    private func encodeGate(_ gate: Gate) throws -> Data { try encodeSortedJSON(gate) }
 
     private func destroy() {
         closed = true
@@ -211,9 +209,9 @@ public final class PairwiseMLS: @unchecked Sendable {
 
     private static func call<T: Decodable>(_ engine: any MLSEngine, _ command: [String: Any]) throws -> Response<T> {
         let input = try JSONSerialization.data(withJSONObject: command)
-        guard input.count <= 140_000 else { throw MLSError("session_limit") }
+        guard input.count <= maxEngineIOBytes else { throw MLSError("session_limit") }
         let raw = try engine.execute(input)
-        guard raw.count <= 140_000 else { throw MLSError("invalid_engine_response") }
+        guard raw.count <= maxEngineIOBytes else { throw MLSError("invalid_engine_response") }
         return try JSONDecoder().decode(Response<T>.self, from: raw)
     }
 }

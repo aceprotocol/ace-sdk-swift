@@ -191,3 +191,49 @@ private actor RestartingReceiver {
     } catch let error as ACEError { #expect(error.code == .envelopeExpired) }
     try await s.close()
 }
+
+@Test func revocationAfterARejectedReceiptReportsThePeerDisabled() async throws {
+    // 13: the sender snapshot is checked after the receipt, before its verdict is reported.
+    let digest = String(repeating: "ab", count: 32), type = MessageType(rawValue: "https://example.org/schemas/task/1")!
+    let s = try await DeliveryFixture.make(schemas: [digest: { _ in throw ACEError(.badReference, "task required") }])
+    let bad = try createMessage(sender: s.a, recipient: s.pb, type: type, body: ["nope": 1], schemaDigest: digest)
+    await #expect(throws: MLSError("delivery_peer_disabled")) {
+        try await s.ta.deliver(bad, peer: s.pb) { packet, route in
+            let reply = try await s.tb.respond(packet, peer: s.pa, accept: s.accept)
+            if route.kind == "ack" { try SecureTransport.setPeerAllowed(store: s.sa, peer: s.pb.aceId, allowed: false) }
+            return reply
+        }
+    }
+    try await s.close()
+}
+
+/// Holds the first frame a sender produced.
+private actor FirstFrame {
+    var packet: ACEMessage?
+    func set(_ p: ACEMessage) { if packet == nil { packet = p } }
+}
+
+@Test func pullWaitsForAnOfferItIssued() async throws {
+    let s = try await DeliveryFixture.make()
+    let first = FirstFrame()
+    _ = try? await s.ta.deliver(s.pending.message, peer: s.pb) { packet, _ in await first.set(packet); throw MLSError("stop") }
+    let hello = try #require(await first.packet)
+    #expect(!(await s.tb.pendingHandshakes()))
+    _ = try await s.tb.respond(hello, peer: s.pa, accept: s.accept)
+    #expect(await s.tb.pendingHandshakes())
+
+    let fake = FakeRelay()
+    let relay = try makeRelay(fake.handle)
+    let mailbox = try SecureMailbox.open(identity: s.b, store: s.sb, peers: try PeerStore(store: s.sb), relay: relay, secure: s.tb,
+                                         inbox: s.inbox, send: { packet, _ in try await relay.send(packet); return .relay })
+    let start = ContinuousClock.now
+    let pulling = Task { await mailbox.pull() }
+    try await Task.sleep(for: .milliseconds(1500))
+    pulling.cancel()
+    let result = await pulling.value
+    // An empty inbox would return at once; the pending offer kept the pull polling until cancelled.
+    #expect(ContinuousClock.now - start >= .milliseconds(1500))
+    #expect(result.hasMore && result.blocked == nil && result.outcomes.isEmpty)
+    await mailbox.close()
+    try await s.close()
+}

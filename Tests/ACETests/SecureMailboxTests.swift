@@ -45,6 +45,20 @@ struct SecureMailboxTests {
         return false
     }
 
+    @Test func deadlineReleasesACallerFromAnExchangeThatIgnoresCancellation() async throws {
+        let start = ContinuousClock.now
+        await #expect(throws: MLSError("delivery_expired")) {
+            try await withDeadline(seconds: 1) {
+                await withCheckedContinuation { (c: CheckedContinuation<Int, Never>) in
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { c.resume(returning: 1) }
+                }
+            }
+        }
+        #expect(ContinuousClock.now - start < .seconds(3))
+        #expect(try await withDeadline(seconds: 5) { 7 } == 7)
+        await #expect(throws: MLSError("delivery_expired")) { try await withDeadline(seconds: 0) { 7 } }
+    }
+
     @Test func pullRefusesStaticEnvelopesPagesAndAdvancesTheCursor() async throws {
         let p = try await Pair()
         let fake = FakeRelay()

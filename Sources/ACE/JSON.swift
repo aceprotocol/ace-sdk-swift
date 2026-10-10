@@ -330,3 +330,10 @@ enum JSONWriter {
 func utf16Less(_ a: String, _ b: String) -> Bool {
     a.utf16.lexicographicallyPrecedes(b.utf16)
 }
+
+/// `Codable` state rows (MLS gates, secure journal): sorted keys, slashes unescaped.
+func encodeSortedJSON<T: Encodable>(_ value: T) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return try encoder.encode(value)
+}

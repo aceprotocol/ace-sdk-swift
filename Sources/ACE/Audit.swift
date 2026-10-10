@@ -82,15 +82,22 @@ public enum ACEAudit {
 
 /// Reference builder. Inputs are commitments, never plaintext or salts.
 public struct AuditTree: Sendable {
-    private let leaves: [String]
+    /// `levels[j][i]`: the perfect subtree of `2^j` leaves starting at `i * 2^j` (`levels[0]` are
+    /// the leaves). Every split lands on such a subtree, and it is the same in every prefix
+    /// tree, so each is hashed once (< 2n hashes).
+    private let levels: [[String]]
     public init(commitments: [String] = []) throws {
         guard commitments.count <= 65536, commitments.allSatisfy(isSha256Hex) else { throw ACEAudit.bad() }
-        leaves = commitments.map(ACEAudit.leaf)
+        var levels = [commitments.map(ACEAudit.leaf)]
+        while let last = levels.last, last.count > 1 {
+            levels.append(stride(from: 0, to: last.count - 1, by: 2).map { ACEAudit.node(last[$0], last[$0 + 1]) })
+        }
+        self.levels = levels
     }
-    public var size: Int { leaves.count }
+    public var size: Int { levels[0].count }
     private func root(_ start: Int, _ count: Int) -> String {
         if count == 0 { return ACEAudit.empty }
-        if count == 1 { return leaves[start] }
+        if count & (count - 1) == 0 { return levels[count.trailingZeroBitCount][start / count] }
         let k = ACEAudit.split(count)
         return ACEAudit.node(root(start, k), root(start + k, count - k))
     }
