@@ -93,6 +93,8 @@ public actor PeerStore {
         try store.withLock("peers") {
             let now = clock()
             let pin = try load(peer.aceId, enforceHorizon: false)
+            // Backfill the horizon of a pin cached before horizons existed, so a later strip cannot erase it (02).
+            if let pinned = pin?.peer, pinned.principal != nil { try checkPrincipalHorizon(pinned) }
             let (next, outcome) = try adoptDecision(pin: pin?.peer, candidate: peer, now: now)
             try checkPrincipalHorizon(next)
             // A kept candidate replaces the cached profile and fetchedAt (02).

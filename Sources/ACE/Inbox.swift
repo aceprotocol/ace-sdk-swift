@@ -229,8 +229,10 @@ public actor Inbox {
 
     /// Repair thread state, `requests/` decision fills (1a) and replay state from delivery
     /// records (by timestamp, key), then hand over pending records; the first handler failure
-    /// throws `handler_failed`. A fill that is `bad_reference` / `wrong_principal` (only with a
-    /// corrupted store: step 7 and the fill run under one `requests` lock) fails `open`.
+    /// throws `handler_failed`. A decision's fill is a replayed processing (09 § Requests Ledger):
+    /// the Same-Account Rules run again on the pinned sender, and a record that fails them with
+    /// `wrong_principal` / `bad_reference` (delivered as data while no principal was installed, or
+    /// the request is already decided) changes nothing. Other errors fail `open`.
     private func recover() async throws {
         var pending: [(String, DeliveryRecord)] = []
         var decisions: [ParsedMessage] = []
@@ -252,8 +254,22 @@ public actor Inbox {
             }
             if rec.status == .pending { pending.append((key, rec)) } else { acked[key] = (m.from, m.timestamp) }
         }
-        if !decisions.isEmpty {  // 1a: no-op when already filled
-            try store.withLock("requests") { for m in decisions { try fillDecision(store, m) } }
+        if !decisions.isEmpty, let context = principalContext() {  // 1a: no-op when already filled
+            // Pinned senders only (no network); read before the lock, as `PeerStore` is an actor.
+            var senders: [String: VerifiedPeer] = [:]
+            for from in Set(decisions.map(\.from)) { senders[from] = try await peers.get(from) }
+            let now = clock()
+            try store.withLock("requests") {
+                for m in decisions {
+                    guard let sender = senders[m.from] else { continue }
+                    do {
+                        try applyMessageRules(m, threads: nil, principal: context, sender: sender, now: now)
+                    } catch let e as ACEError where e.code == .wrongPrincipal || e.code == .badReference {
+                        continue
+                    }
+                    try fillDecision(store, m)
+                }
+            }
         }
         if replayChanged { try persistReplay() }
         for (key, rec) in pending {

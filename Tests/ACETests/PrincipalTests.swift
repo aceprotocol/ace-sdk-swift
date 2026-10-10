@@ -432,6 +432,65 @@ struct PrincipalTests {
         #expect(try await peers.get(subject.getACEId())?.principal == valid)
     }
 
+    // MARK: principal horizon hardening (02 § Rollback Barrier)
+
+    static let ACC2 = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:9xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+
+    func relayPeer(_ id: SoftwareIdentity, _ profile: AgentProfile, ts: Int = NOW) throws -> VerifiedPeer {
+        try verifyPeerRecord(try peerRecord(id, profile, ts: ts), clock: { Self.NOW })
+    }
+
+    @Test func pinWithoutHorizonIsBackfilledSoStripThenReplayCannotRollBack() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), subject = try SoftwareIdentity.generate(scheme: .ed25519)
+        let store = MemoryStore()
+        let older = try rec(owner, subject, roles: ["controller"], issuedAt: Self.NOW - 100)
+        let newer = try rec(owner, subject, roles: ["delegate"], issuedAt: Self.NOW - 10)
+        try await PeerStore(store: store, clock: { Self.NOW }).adopt(try relayPeer(subject, AgentProfile(principal: newer)))
+        for k in try store.list(prefix: "principal-horizons/") { try store.delete(k) }  // a store from before horizons
+        let peers = try PeerStore(store: store, clock: { Self.NOW })
+        try await peers.adopt(try relayPeer(subject, AgentProfile(name: "n")))  // the relay strips the principal
+        let replay = try relayPeer(subject, AgentProfile(principal: older))
+        await expectCodeAsync(.invalidPrincipal) { try await peers.adopt(replay) }
+    }
+
+    @Test func registrationFileRotationKeepsCachedPrincipal() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), subject = try SoftwareIdentity.generate(scheme: .ed25519)
+        let peers = try PeerStore(store: MemoryStore(), clock: { Self.NOW })
+        let principal = try rec(owner, subject)
+        try await peers.adopt(try relayPeer(subject, AgentProfile(principal: principal), ts: Self.NOW - 50))
+        let rotated = try SoftwareIdentity(scheme: .ed25519, signingPrivateKey: ACEBase64.decode(subject.exportPrivateKey().signingPrivateKey),
+                                           encryptionSeed: Data(repeating: 42, count: 32))
+        let file = try createRegistrationFile(for: rotated, name: "n", endpoint: "https://a.example/ace", timestamp: Self.NOW)
+        let peer = try await peers.pinRegistrationFile(file)
+        #expect(peer.encryptionPublicKey == rotated.getEncryptionPublicKey())
+        #expect(peer.principal == principal)
+    }
+
+    @Test func registrationFileNeverMovesUnexpiredPrincipalToAnotherDomain() async throws {
+        let x = try SoftwareIdentity.generate(scheme: .ed25519), y = try SoftwareIdentity.generate(scheme: .ed25519)
+        let subject = try SoftwareIdentity.generate(scheme: .ed25519)
+        let peers = try PeerStore(store: MemoryStore(), clock: { Self.NOW })
+        let inX = try rec(x, subject, issuedAt: Self.NOW - 100)
+        let inY = try rec(y, subject, roles: ["delegate"], issuedAt: Self.NOW - 10, account: Self.ACC2)
+        try await peers.adopt(try relayPeer(subject, AgentProfile(principal: inX), ts: Self.NOW - 60))
+        try await peers.adopt(try relayPeer(subject, AgentProfile(principal: inY), ts: Self.NOW - 50))  // the relay may move it
+        #expect(try await peers.get(subject.getACEId())?.principal == inY)
+        var file = try createRegistrationFile(for: subject, name: "n", endpoint: "https://a.example/ace", timestamp: Self.NOW - 50)
+        file.principal = inX  // an endpoint re-attaches the older account's principal
+        #expect(try await peers.pinRegistrationFile(file).principal == inY)
+    }
+
+    @Test func registrationFileCannotSwapInPrincipalSignedBySomeoneElse() async throws {
+        let owner = try SoftwareIdentity.generate(scheme: .ed25519), attacker = try SoftwareIdentity.generate(scheme: .ed25519)
+        let subject = try SoftwareIdentity.generate(scheme: .ed25519)
+        let peers = try PeerStore(store: MemoryStore(), clock: { Self.NOW })
+        let legit = try rec(owner, subject)
+        try await peers.adopt(try relayPeer(subject, AgentProfile(principal: legit), ts: Self.NOW - 50))
+        var file = try createRegistrationFile(for: subject, name: "n", endpoint: "https://a.example/ace", timestamp: Self.NOW - 50)
+        file.principal = try rec(attacker, subject, issuedAt: Self.NOW - 5)
+        #expect(try await peers.pinRegistrationFile(file).principal == legit)
+    }
+
     @Test func opaqueScopeFailsClosed() throws {
         let owner = try SoftwareIdentity.generate(scheme: .ed25519), subject = try SoftwareIdentity.generate(scheme: .ed25519)
         let scoped = try rec(owner, subject, scope: "read-only")
@@ -1191,4 +1250,48 @@ final class Counter: @unchecked Sendable {
     private var n = 0
     var value: Int { lock.withLock { n } }
     func bump() { lock.withLock { n += 1 } }
+}
+
+// MARK: - principal recovery replays the account rules (06 step 1a, 09 § Requests Ledger)
+
+extension PrincipalPipelineTests {
+    /// The store as a crash leaves it: `close()` would write `replay.json` and prune the acked
+    /// delivery records, so recovery would have nothing to replay.
+    static func crashCopy(_ store: any ACEStore) throws -> MemoryStore {
+        let copy = MemoryStore()
+        for k in try store.list(prefix: "") { try copy.write(k, try #require(try store.read(k))) }
+        return copy
+    }
+
+    @Test func dataOnlyDecisionNeverFillsRequestsWhenReopenedWithPrincipal() async throws {
+        let w = try await Self.world()  // b is a delegate, not a controller
+        let ib = try await Self.inbox(w, w.b, principal: .some(nil))
+        let ia0 = try await Self.inbox(w, w.a, principal: .some(nil))
+        let (_, req) = try await Self.send(w, w.a, w.b, ib, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        let (d, _) = try await Self.send(w, w.b, w.a, ia0, .decision,
+                                         #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#, 1)
+        #expect(isDelivered(d))
+        let crashed = try Self.crashCopy(w.a.store)
+        #expect(try !crashed.list(prefix: "deliveries/").isEmpty)
+        let ia1 = try await Self.inbox(w, w.a, store: crashed)
+        #expect(try #require(try Self.request(crashed, req)).decision == nil)
+        await ia1.close(); await ia0.close(); await ib.close()
+    }
+
+    @Test func twoDataOnlyDecisionsDoNotFailOpenWithPrincipal() async throws {
+        let w = try await Self.world(rolesB: ["controller"])
+        let ib = try await Self.inbox(w, w.b, principal: .some(nil))
+        let ia0 = try await Self.inbox(w, w.a, principal: .some(nil))
+        let (_, req) = try await Self.send(w, w.a, w.b, ib, .request, #"{"action":"pay","summary":"s"}"#, 1)
+        let (d1, _) = try await Self.send(w, w.b, w.a, ia0, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"deny"}"#, 1)
+        w.clock.now += 1
+        let (d2, _) = try await Self.send(w, w.b, w.a, ia0, .decision, #"{"requestId":"\#(req.message.messageId)","outcome":"approve"}"#, 2)
+        #expect(isDelivered(d1) && isDelivered(d2))
+        let crashed = try Self.crashCopy(w.a.store)
+        #expect(try crashed.list(prefix: "deliveries/").count == 2)
+        let ia1 = try await Self.inbox(w, w.a, store: crashed)
+        // the first decision passes the rules at the replayed processing; the second finds the request decided
+        #expect(try Self.request(crashed, req)?.decision?.outcome == "deny")
+        await ia1.close(); await ia0.close(); await ib.close()
+    }
 }

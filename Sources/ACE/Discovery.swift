@@ -342,11 +342,13 @@ public enum AdoptOutcome: String, Sendable {
     case adopted, unchanged, rotated
 }
 
-/// R-P36: a principal replaces the cached one only with a strictly newer `issuedAt`, or the
-/// same signed claims at the same `issuedAt` (signature bytes may differ).
-private func supersedes(_ new: PrincipalRecord, _ old: PrincipalRecord) -> Bool {
-    new.account != old.account || new.signer != old.signer ||
-        new.issuedAt > old.issuedAt || (new.issuedAt == old.issuedAt && new.sameClaims(as: old))
+/// R-P36: within one (subject, account, signer) authority domain, a principal replaces the cached
+/// one only with a strictly newer `issuedAt`, or the same signed claims at the same `issuedAt`
+/// (signature bytes may differ). Another domain's principal replaces it only when `crossDomain`
+/// (a relay record; never a registration file, whose principal the key binding does not cover, 02).
+private func supersedes(_ new: PrincipalRecord, _ old: PrincipalRecord, crossDomain: Bool) -> Bool {
+    guard new.account == old.account, new.signer == old.signer else { return crossDomain }
+    return new.issuedAt > old.issuedAt || (new.issuedAt == old.issuedAt && new.sameClaims(as: old))
 }
 
 /// Profile a signed (relay) candidate leaves in the pin (R-P36): an older `registeredAt` keeps the
@@ -360,7 +362,7 @@ private func relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: Int) 
         return kept == AgentProfile() ? nil : kept
     }
     guard var p = candidate.profile else { return nil }
-    if let new = p.principal, let old = pin.profile?.principal, old.expiresAt > now, !supersedes(new, old) {
+    if let new = p.principal, let old = pin.profile?.principal, old.expiresAt > now, !supersedes(new, old, crossDomain: true) {
         p.principal = old
     }
     return p
@@ -373,12 +375,13 @@ private func withProfile(_ pin: VerifiedPeer, _ profile: AgentProfile?) -> Verif
 }
 
 /// A kept registration-file candidate replaces only the profile members it supplies (absent
-/// members carry over, R-P27). `principal` is replaced only by a validated one whose `issuedAt`
-/// is not older than the cached one, and never removed (R-P26) unless expired at `now` (R-P35).
+/// members carry over, R-P27). `principal` is replaced only by a validated one that `supersedes`
+/// the cached one within its own authority domain, and never removed (R-P26) unless expired at
+/// `now` (R-P35).
 private func fileProfile(cached: AgentProfile?, candidate: AgentProfile?, now: Int) -> AgentProfile? {
     // An expired cached principal is dropped (R-P35): the refreshed fetchedAt would otherwise make the pin unloadable.
     let old = cached?.principal.flatMap { $0.expiresAt > now ? $0 : nil }, new = candidate?.principal
-    let keep: PrincipalRecord? = old == nil ? new : (new.map { supersedes($0, old!) } == true ? new : old)
+    let keep: PrincipalRecord? = old == nil ? new : (new.map { supersedes($0, old!, crossDomain: false) } == true ? new : old)
     var m = cached ?? AgentProfile()
     if let c = candidate {
         if let v = c.name { m.name = v }
@@ -404,17 +407,20 @@ func adoptDecision(pin: VerifiedPeer?, candidate: VerifiedPeer, now: Int) throws
     guard pin.signingPublicKey == candidate.signingPublicKey, pin.scheme == candidate.scheme else {
         throw ACEError(.invalidPeer, "signing key or scheme differs from the pinned binding")
     }
+    // A rotation merges the profile like a kept binding: a registration file never removes a principal (02).
+    let profile = candidate.source == .registration
+        ? fileProfile(cached: pin.profile, candidate: candidate.profile, now: now)
+        : relayProfile(pin: pin, candidate: candidate, now: now)
     if pin.encryptionPublicKey == candidate.encryptionPublicKey {
         let newer = candidate.registeredAt > pin.registeredAt ? candidate : pin
         let merged = VerifiedPeer(
             aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
             encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
-            registrationSignature: newer.registrationSignature, source: newer.source,
-            profile: candidate.source == .registration ? fileProfile(cached: pin.profile, candidate: candidate.profile, now: now) : relayProfile(pin: pin, candidate: candidate, now: now)
+            registrationSignature: newer.registrationSignature, source: newer.source, profile: profile
         )
         return (merged, .unchanged)
     }
-    if candidate.registeredAt > pin.registeredAt { return (candidate, .rotated) }
+    if candidate.registeredAt > pin.registeredAt { return (withProfile(candidate, profile), .rotated) }
     throw ACEError(.stalePeerBinding, "a different encryption key requires a newer registeredAt")
 }
 
