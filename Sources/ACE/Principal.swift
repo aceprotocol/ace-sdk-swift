@@ -149,7 +149,7 @@ public func isCAIP10(_ value: String) -> Bool { regexFullMatch(caip10Regex, valu
 // MARK: - Signing context
 
 /// `encodePayload(account, join(roles), signer.scheme, signer.publicKey, subjectKeyB64,
-/// scopeOrEmpty, decimal(expiresAtOr0))` (09 § Signing Context).
+/// scopeOrEmpty, decimal(expiresAt))` (09 § Signing Context).
 public func principalPayload(_ r: PrincipalRecord, subjectSigningPublicKey: Data) -> Data {
     ACESigning.encodePayload(r.account, r.roles.joined(separator: ","), r.signer.scheme, r.signer.publicKey,
                              ACEBase64.encode(subjectSigningPublicKey), r.scope ?? "", String(r.expiresAt))
