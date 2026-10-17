@@ -119,6 +119,18 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
         #expect(try await alice.network.outbox.entry(entry.messageId)?.status == .delivered)
     }
 
+    @Test func attemptRetriesAPendingMessageNow() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connected(relay, clock)
+        let entry = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "hi"])
+        let again = try #require(try await alice.network.attempt(entry.messageId))  // pending (no receipt yet), not due: attempted now
+        #expect(again.status == .pending && again.attempts == entry.attempts + 1)
+        #expect(try await alice.network.attempt(UUID().uuidString.lowercased()) == nil)
+        try await alice.network.outbox.abandon(entry.messageId)
+        let final = try #require(try await alice.network.attempt(entry.messageId))
+        #expect(final.status == .expired && final.attempts == again.attempts)  // final: as is
+    }
+
     @Test func duplicatesAreReceiptedAndBeyondTheHorizonIsDropped() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let (alice, bob) = try await connected(relay, clock)

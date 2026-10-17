@@ -351,6 +351,14 @@ public actor NetworkClient: PacketTransport {
     @discardableResult
     public func flush() async throws -> [OutboxEntry] { try await outbox.flush(via: self) }
 
+    /// One attempt of `messageId` now, due or not (TS `outbox.attempt`): nil for an unknown message, a final entry as is,
+    /// a pending one after the attempt (unchanged while another attempt holds it).
+    @discardableResult
+    public func attempt(_ messageId: String) async throws -> OutboxEntry? {
+        guard try await outbox.entry(messageId) != nil else { return nil }
+        return try await outbox.deliver(messageId, via: self)
+    }
+
     package func prekey(for aceId: String, refresh: Bool) async throws -> Prekey {
         try await agent(aceId, refresh: refresh).descriptor.prekey
     }
