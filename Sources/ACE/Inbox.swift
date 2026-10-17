@@ -169,12 +169,15 @@ package actor Inbox {
     // MARK: Fetching
 
     /// One pass over the relay inbox: process entries in stream order, stop at the first entry without a final
-    /// disposition, and acknowledge through the last entry with one. Repeats while pages are full.
-    package func pull(limit: Int) async throws -> [ReceiveOutcome] {
-        try await serialized {
+    /// disposition, and acknowledge through the last entry with one. Repeats while pages are full, at most `maxPages`.
+    package func pull(limit: Int, maxPages: Int? = nil) async throws -> [ReceiveOutcome] {
+        if let maxPages, maxPages < 1 { throw ACEError(.invalidArgument, "maxPages must be at least 1") }
+        return try await serialized {
             guard lock != nil else { throw ACEError(.invalidArgument, "the inbox is closed") }
             var outcomes: [ReceiveOutcome] = []
+            var pages = 0
             while true {
+                pages += 1
                 let page = try await network.relay.fetchInbox(identity, since: nil, limit: limit)
                 var through: String?
                 var stopped = false
@@ -185,7 +188,7 @@ package actor Inbox {
                     through = entry.streamId
                 }
                 if let through { try await network.relay.ackInbox(identity, through: through) }
-                if stopped || page.entries.count < limit || through == nil { return outcomes }
+                if stopped || page.entries.count < limit || through == nil || pages == maxPages { return outcomes }
             }
         }
     }

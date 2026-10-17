@@ -52,6 +52,18 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
         #expect(relay.queued(bob.aceId).isEmpty && relay.queued(alice.aceId).isEmpty)
     }
 
+    /// `maxPages` bounds one pass (a notification extension's budget): the rest stays queued, unacknowledged.
+    @Test func pullStopsAtMaxPages() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connected(relay, clock)
+        for i in 0..<3 { _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": .string("m\(i)")]) }
+        let first = try await bob.network.pull(limit: 1, maxPages: 2)
+        #expect(first.count == 2 && relay.queued(bob.aceId).count == 1)
+        let rest = try await bob.network.pull()
+        #expect(rest.count == 1 && relay.queued(bob.aceId).isEmpty && bob.received.value.count == 3)
+        await expectCodeAsync(.invalidArgument) { try await bob.network.pull(maxPages: 0) }
+    }
+
     @Test func acceptProfilesAutoAccepts() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)

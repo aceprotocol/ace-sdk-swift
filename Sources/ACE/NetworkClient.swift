@@ -404,10 +404,11 @@ public actor NetworkClient: PacketTransport {
 
     /// Fetch the home relay's inbox: process entries in stream order (receipts, contact requests and messages), send
     /// each receipt, and acknowledge through the last entry with a final disposition. Stops at the first entry without
-    /// one (it stays on the relay); repeats while pages are full. Returns the outcomes.
+    /// one (it stays on the relay); repeats while pages are full, at most `maxPages` pages (nil = until drained) — a
+    /// bounded pass for a host with a short time or memory budget. Returns the outcomes.
     @discardableResult
-    public func pull(limit: Int = ACELimits.maxInboxPage) async throws -> [ReceiveOutcome] {
-        try await receiving().pull(limit: limit)
+    public func pull(limit: Int = ACELimits.maxInboxPage, maxPages: Int? = nil) async throws -> [ReceiveOutcome] {
+        try await receiving().pull(limit: limit, maxPages: maxPages)
     }
 
     /// Follow the home relay's listen stream: each entry is processed and acknowledged before its outcome is yielded.
