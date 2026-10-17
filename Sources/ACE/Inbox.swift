@@ -175,9 +175,7 @@ package actor Inbox {
         return try await serialized {
             guard lock != nil else { throw ACEError(.invalidArgument, "the inbox is closed") }
             var outcomes: [ReceiveOutcome] = []
-            var pages = 0
-            while true {
-                pages += 1
+            for _ in 1...(maxPages ?? .max) {
                 let page = try await network.relay.fetchInbox(identity, since: nil, limit: limit)
                 var through: String?
                 var stopped = false
@@ -188,8 +186,9 @@ package actor Inbox {
                     through = entry.streamId
                 }
                 if let through { try await network.relay.ackInbox(identity, through: through) }
-                if stopped || page.entries.count < limit || through == nil || pages == maxPages { return outcomes }
+                if stopped || page.entries.count < limit || through == nil { break }
             }
+            return outcomes
         }
     }
 
