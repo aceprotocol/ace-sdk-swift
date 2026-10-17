@@ -307,6 +307,24 @@ public actor RelayClient {
         _ = try await call("POST", "/v1/blocks", body: try body.jsonData(), auth: (identity, .block(peer: peer, blocked: blocked, revision: revision)))
     }
 
+    /// `PUT /v1/wake {gateway, token}` (action `wake`, 07 § Wake hints): register or replace the gateway this relay wakes
+    /// when entries are queued for `identity`. `gateway` is a canonical relay URL (loopback `http` only with
+    /// `allowLoopbackRelays`) and `token` the gateway's `^[A-Za-z0-9_-]{22,512}$` token (`invalid_argument`). A relay
+    /// without wake hints answers `relay_rejected` with relay code `not_found`.
+    public func setWake(_ identity: any ACEIdentity, gateway: String, token: String) async throws {
+        // Signing validates gateway and token; a loopback http gateway is this client's development policy.
+        guard isRelayRoute(gateway, allowLoopback: allowLoopbackRelays) else {
+            throw ACEError(.invalidArgument, "wake gateway must be a canonical https URL (loopback http only in development)")
+        }
+        let body: JSONValue = ["gateway": .string(gateway), "token": .string(token)]
+        _ = try await call("PUT", "/v1/wake", body: try body.jsonData(), auth: (identity, .setWake(gateway: gateway, token: token)))
+    }
+
+    /// `DELETE /v1/wake` (action `wake`): remove the wake registration (idempotent).
+    public func clearWake(_ identity: any ACEIdentity) async throws {
+        _ = try await call("DELETE", "/v1/wake", auth: (identity, .clearWake))
+    }
+
     /// `POST /v1/send {packet, permit?}`. `{ok: true}` means queued, never delivered. A permit not issued by `packet.to` to
     /// `packet.from` is `invalid_argument` (never sent).
     public func send(_ packet: Packet, permit: JSONValue? = nil) async throws {

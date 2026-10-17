@@ -15,6 +15,10 @@ public enum RelayAuthRequest: Sendable, Equatable {
     case inboxAck(through: String)
     case unregister
     case block(peer: String, blocked: Bool, revision: Int)
+    /// `PUT /v1/wake` (07 § Wake hints).
+    case setWake(gateway: String, token: String)
+    /// `DELETE /v1/wake`.
+    case clearWake
 
     public var action: String {
         switch self {
@@ -23,6 +27,7 @@ public enum RelayAuthRequest: Sendable, Equatable {
         case .inboxAck: return "inbox-ack"
         case .unregister: return "unregister"
         case .block: return "block"
+        case .setWake, .clearWake: return "wake"
         }
     }
 
@@ -40,21 +45,27 @@ public enum RelayAuthRequest: Sendable, Equatable {
             }
         case .block(let peer, _, let revision):
             guard isACEId(peer), isWireInt(revision) else { throw ACEError(.invalidArgument, "invalid block") }
-        case .unregister:
+        case .setWake(let gateway, let token):
+            // Like the audience, loopback HTTP is accepted here; `RelayClient.setWake` applies `allowLoopbackRelays`.
+            guard isRelayRoute(gateway, allowLoopback: true), isWakeToken(token) else {
+                throw ACEError(.invalidArgument, "wake needs a canonical relay URL gateway and a token")
+            }
+        case .unregister, .clearWake:
             break
         }
     }
 
     /// The action payload (02 § Signing actions): `listen` `encodePayload(sinceOrDash)`, `inbox`
     /// `encodePayload(sinceOrDash, decimal(limit))`, `inbox-ack` `encodePayload(through)`, `unregister` empty, `block`
-    /// `encodePayload(peer, "block" | "unblock", decimal(revision))`.
+    /// `encodePayload(peer, "block" | "unblock", decimal(revision))`, `wake` `encodePayload(gateway, token)` or empty (clear).
     func payload() -> Data {
         switch self {
         case .listen(let since): return ACESigning.encodePayload(since)
         case .inboxAck(let through): return ACESigning.encodePayload(through)
         case .inbox(let since, let limit): return ACESigning.encodePayload(since, String(limit))
         case .block(let peer, let blocked, let revision): return ACESigning.encodePayload(peer, blocked ? "block" : "unblock", String(revision))
-        case .unregister: return Data()
+        case .setWake(let gateway, let token): return ACESigning.encodePayload(gateway, token)
+        case .unregister, .clearWake: return Data()
         }
     }
 }
@@ -63,6 +74,13 @@ public enum RelayAuthRequest: Sendable, Equatable {
 func isStreamCursor(_ s: String) -> Bool {
     let parts = s.utf8.split(separator: UInt8(ascii: "-"), omittingEmptySubsequences: false)
     return parts.count == 2 && parts.allSatisfy { (1...20).contains($0.count) && $0.allSatisfy { $0 >= 0x30 && $0 <= 0x39 } }
+}
+
+/// `^[A-Za-z0-9_-]{22,512}$` (a wake token, 07 § Wake hints).
+func isWakeToken(_ s: String) -> Bool {
+    (22...512).contains(s.utf8.count) && s.utf8.allSatisfy { b in
+        (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F || b == 0x2D
+    }
 }
 
 /// `encodePayload(audience, nonce, actionPayload)`: what a header-authenticated request signs (07 § Authentication).

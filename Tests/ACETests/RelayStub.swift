@@ -139,6 +139,7 @@ final class FakeRelay: @unchecked Sendable {
     private var agents: [String: VerifiedAgent] = [:]
     private var queues: [String: [(id: String, packet: Data)]] = [:]
     private var blocks: [String: [String: (blocked: Bool, revision: Int)]] = [:]
+    private var wakes: [String: (gateway: String, token: String)] = [:]
     private var seq = 0
     private(set) var sends: [String] = []
     private(set) var requests: [String] = []
@@ -168,6 +169,8 @@ final class FakeRelay: @unchecked Sendable {
     func take(_ aceId: String) -> [Data] { withLock { let q = queues[aceId] ?? []; queues[aceId] = []; return q.map(\.packet) } }
     /// The block `owner` registered for `peer` (nil when none).
     func blocked(by owner: String, _ peer: String) -> Bool? { withLock { blocks[owner]?[peer]?.blocked } }
+    /// The wake registration `aceId` holds (nil when none).
+    func wake(_ aceId: String) -> (gateway: String, token: String)? { withLock { wakes[aceId] } }
     func registered(_ aceId: String) -> KelState? { withLock { kels[aceId] } }
     func sendCount(to aceId: String) -> Int { withLock { sends.filter { $0 == aceId }.count } }
 
@@ -207,6 +210,16 @@ final class FakeRelay: @unchecked Sendable {
                       let caller = authed(headers, .block(peer: peer, blocked: b, revision: rev), now: now) else { return err(401, "invalid_signature") }
                 if let old = blocks[caller]?[peer], old.revision >= rev { return err(409, "stale_revision") }
                 blocks[caller, default: [:]][peer] = (b, rev)
+                return ok
+            case ("PUT", "/v1/wake"):
+                guard let o = body?.objectValue, Set(o.keys) == ["gateway", "token"], let g = o["gateway"]?.stringValue,
+                      let t = o["token"]?.stringValue else { return err(400, "invalid_argument") }
+                guard let caller = authed(headers, .setWake(gateway: g, token: t), now: now) else { return err(401, "invalid_signature") }
+                wakes[caller] = (g, t)
+                return ok
+            case ("DELETE", "/v1/wake"):
+                guard raw.isEmpty, let caller = authed(headers, .clearWake, now: now) else { return err(401, "invalid_signature") }
+                wakes[caller] = nil
                 return ok
             case ("POST", "/v1/send"):
                 guard let pv = body?["packet"], let packet = try? Packet(json: try pv.jsonData()) else { return err(400, "invalid_packet") }

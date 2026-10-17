@@ -500,6 +500,7 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
         case "inbox": return .inbox(since: r["since"]!.s, limit: r["limit"]!.i)
         case "inbox-ack": return .inboxAck(through: r["through"]!.s)
         case "block": return .block(peer: r["peer"]!.s, blocked: r["blocked"] == true, revision: r["revision"]!.i)
+        case "wake": return r["gateway"].map { .setWake(gateway: $0.s, token: r["token"]!.s) } ?? .clearWake
         default: return .unregister
         }
     }
@@ -535,6 +536,21 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
                                            publicKey: st.signing!.publicKey))
         let mine = try createRegistrationRequest(identity: try identity(r["agent"]!.s), timestamp: r["request"]!["timestamp"]!.i, audience: r["audience"]!.s)
         #expect(Set(mine.objectValue!.keys) == Set(r["request"]!.o.keys) && mine["kel"] == r["request"]!["kel"] && mine["audience"] == r["request"]!["audience"])
+    }
+
+    /// `auth.wake`: the client-side `{gateway, token}` check. The typed `setWake(gateway:token:)` cannot express a body with
+    /// an extra member or a missing token (the relay refuses those), so those two cases are skipped here.
+    @Test func wakeValidation() throws {
+        let w = V["auth"]!["wake"]!
+        for b in w["valid"]!.a {
+            try RelayAuthRequest.setWake(gateway: b["gateway"]!.s, token: b["token"]!.s).validate()
+        }
+        for c in w["invalid"]!.a {
+            #expect(c["error"]!.s == "invalid_argument")
+            let body = c["body"]!.o
+            guard Set(body.keys) == ["gateway", "token"] else { continue }  // not expressible through setWake(gateway:token:)
+            expectCode(.invalidArgument, label(c)) { try RelayAuthRequest.setWake(gateway: body["gateway"]!.s, token: body["token"]!.s).validate() }
+        }
     }
 
     @Test func relayErrorMapping() {

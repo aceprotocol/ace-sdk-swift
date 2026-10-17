@@ -579,6 +579,17 @@ public actor NetworkClient: PacketTransport {
         }
     }
 
+    /// Ask the home relay to wake `gateway` with `token` when entries are queued for this identity (07 § Wake hints). A
+    /// hint only: delivery still comes from `pull` / `follow`.
+    public func setWake(gateway: String, token: String) async throws {
+        try await relay.setWake(identity, gateway: gateway, token: token)
+    }
+
+    /// Remove the home relay's wake registration.
+    public func clearWake() async throws {
+        try await relay.clearWake(identity)
+    }
+
     /// The permit to attach to a receipt to `peer` (05 § Renewal): a fresh one when ours has less than
     /// `PERMIT_RENEWAL_SECONDS` left or is no longer valid under our current KEL; nil otherwise or when `peer` is neither
     /// pending nor admitted. The caller records it once the receipt was sent.
