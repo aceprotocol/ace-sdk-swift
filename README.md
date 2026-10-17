@@ -22,7 +22,7 @@ One library product, `ACE`. No binary or chain dependencies (CryptoKit only).
 | Profiles | `ProfileManifest` (`.core`, `.text`, `.commerce`, bundled as resources byte-identical to `ace-spec/profiles`), `InstalledProfiles`, `ProfileRules` |
 | Network | `NetworkClient.open(...)`: `publish(force:)` (registers on demand), `discover`, `importAgent`, `lookup(_:)` (ACE ID or `@name@relay`), `agent(_:refresh:)`, `connect(_:profile:note:)`, `requests()` (pending `ContactRequest`s), `accept`, `reject`, `block`, `unblock`, `setWake(gateway:token:)` / `clearWake()` (07 § Wake hints, optional), `createInvitation(peer:profile:)` / `importInvitation` (`Invitation` = `{agent, permit}`), `send(to:type:body:threadId:)`, `flush()`, `pull(limit:maxPages:)` (`maxPages` bounds one pass), `follow()`, `maintain()`, `close()`; `onMessage` / `onReceipt` in `NetworkConfiguration` |
 | Relay | `RelayClient` (07 binding, client side) and `RelayClient.foreign(_:)`, the default client for relays named by peers (https only, blocked addresses refused) |
-| State | `ACEStore` (`MemoryStore`, `FileStore`), `PeerStore`, `AdmissionTable`, `Outbox` (re-encrypt per attempt, backoff, persisted lease, receipts) |
+| State | `ACEStore` (`MemoryStore`, `FileStore`; `validateStoreKey` / `validateStoreValue` / `validateLockName`, `NamedMutexes` and `lockTimeoutError` for a custom store), `PeerStore`, `AdmissionTable`, `Outbox` (re-encrypt per attempt, backoff, persisted lease, receipts) |
 | Optional | `commerceRules(store:localAceId:)` + `ThreadStore` for `ace:commerce:1` (stablecoin / Stripe Link settlement shapes) |
 | Other | `createAuthHeaders`, `createRegistrationRequest`, one error type `ACEError` |
 

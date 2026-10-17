@@ -29,8 +29,13 @@ public protocol ACEStore: Sendable {
     func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock
 }
 
+// MARK: - Contract checks
+//
+// The `ACEStore` key, value and lock-name rules, public so a custom store (or any store-like backend a host builds)
+// enforces exactly the grammar `MemoryStore` and `FileStore` do.
+
 /// Lock-name grammar `^[a-z0-9][a-z0-9_-]{0,63}$` (`invalid_argument`).
-package func validateLockName(_ name: String) throws {
+public func validateLockName(_ name: String) throws {
     let u = Array(name.utf8)
     func alnum(_ b: UInt8) -> Bool { (b >= 0x61 && b <= 0x7A) || (b >= 0x30 && b <= 0x39) }
     guard let first = u.first, u.count <= 64, alnum(first),
@@ -40,18 +45,18 @@ package func validateLockName(_ name: String) throws {
 }
 
 /// Value size cap (`invalid_argument`).
-package func validateStoreValue(_ value: Data) throws {
+public func validateStoreValue(_ value: Data) throws {
     guard value.count <= ACELimits.maxStoreValueBytes else {
         throw ACEError(.invalidArgument, "store value exceeds \(ACELimits.maxStoreValueBytes) bytes")
     }
 }
 
 /// Key grammar check (`invalid_argument`).
-package func validateStoreKey(_ key: String) throws {
+public func validateStoreKey(_ key: String) throws {
     guard isValidStoreKey(key) else { throw ACEError(.invalidArgument, "invalid store key '\(String(key.prefix(64)))'") }
 }
 
-package func isValidStoreKey(_ key: String) -> Bool {
+public func isValidStoreKey(_ key: String) -> Bool {
     let u = Array(key.utf8)
     guard !u.isEmpty, u.count <= 200 else { return false }
     var segmentStart = true
@@ -72,19 +77,20 @@ package func isValidStoreKey(_ key: String) -> Bool {
     return !segmentStart
 }
 
-package func lockTimeoutError(_ name: String) -> ACEError {
+/// The `lock_busy` a lock wait that timed out reports.
+public func lockTimeoutError(_ name: String) -> ACEError {
     name == "receive"
         ? ACEError(.lockBusy, "another receiver holds the '\(name)' lock")
         : ACEError(.lockBusy, "timed out waiting for the '\(name)' lock")
 }
 
-/// A process-local mutex per name that can be acquired with a timeout.
-package final class NamedMutexes: @unchecked Sendable {
-    package init() {}
+/// A process-local mutex per name that can be acquired with a timeout (the in-process half of an `ACEStore` lock).
+public final class NamedMutexes: @unchecked Sendable {
+    public init() {}
     private let cond = NSCondition()
     private var held: Set<String> = []
 
-    package func acquire(_ name: String, timeout: TimeInterval) -> Bool {
+    public func acquire(_ name: String, timeout: TimeInterval) -> Bool {
         let deadline = Date(timeIntervalSinceNow: max(0, timeout))
         cond.lock()
         defer { cond.unlock() }
@@ -97,7 +103,7 @@ package final class NamedMutexes: @unchecked Sendable {
         return true
     }
 
-    package func release(_ name: String) {
+    public func release(_ name: String) {
         cond.lock()
         held.remove(name)
         cond.broadcast()
