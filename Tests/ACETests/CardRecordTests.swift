@@ -206,6 +206,12 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         relay.bindHandle("alice", to: mallory.aceId)
         await expectCodeAsync(.invalidAuthorization) { try await bob.network.lookupCard("@alice@\(relay.host)") }
         await expectCodeAsync(.invalidAuthorization) { try await bob.network.lookup("@alice@\(relay.host)") }
+        // Hosts tell this refusal apart without parsing messages: an SDK-local reason, same wire code.
+        do { _ = try await bob.network.lookupCard("@alice@\(relay.host)"); Issue.record("expected a refusal") } catch let e as ACEError {
+            #expect(e.code == .invalidAuthorization && e.reason == .handleRebound)
+        }
+        // Other refusals carry no reason.
+        #expect(ACEError(.invalidAuthorization).reason == nil)
         // The reverse pin is durable.
         let again = try await NetworkClient.open(identity: bob.identity, store: bob.store, relay: try relay.client(clock: clock.fn),
                                                  prekeys: StorePrekeyVault(store: bob.store), receive: false, clock: clock.fn)

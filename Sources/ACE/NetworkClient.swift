@@ -438,7 +438,7 @@ public actor NetworkClient: PacketTransport {
             let owner = try ownerKey.flatMap { try readPin($0, Self.validOwnerPin) }
             if let owner {
                 guard owner["aceId"]?.stringValue == v.aceId else {
-                    throw ACEError(.invalidAuthorization, "the handle resolved to another identity than before")
+                    throw ACEError(.invalidAuthorization, "the handle resolved to another identity than before", reason: .handleRebound)
                 }
             }
             try advanceCardPin(r, digest: digest, key: key)
