@@ -1,10 +1,11 @@
 //
 //  ACEInterop: the ACE interop matrix driver for the Swift SDK (contract: ace-spec/interop/README.md).
 //
-//    ACEInterop gen-identity <dir> --now N
+//    ACEInterop gen-identity <dir> [--handle H] --now N
 //    ACEInterop create-packet <dir> --to-agent F --kind K --out P [--prekey-agent F2] [--message M] [--message-id ID]
 //                             [--ref-message-id ID] [--ref-prekey ID] [--code C] [--note N] --now N
 //    ACEInterop open-packet <dir> --from-agent F --packet P --out R --now N
+//    ACEInterop verify-card <card.json> --now N        (prints {"ok": true, aceId, handle?, contact, listed} or {"error": code})
 //
 //  The identity export (identity.json) and the prekey vault (store/, a FileStore with 0600 files) live in <dir>.
 //  Exit 0 on success (a protocol rejection while opening is a success whose result is {"error": code}); 2 otherwise.
@@ -39,7 +40,7 @@ func loadIdentity(_ dir: String, now: Int) throws -> SoftwareIdentity {
     return try SoftwareIdentity(export: SoftwareIdentityExport(json: data), now: now)
 }
 
-func genIdentity(_ dir: String, now: Int) throws {
+func genIdentity(_ dir: String, handle: String?, now: Int) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let identity = try SoftwareIdentity.generate(now: now)
     let prekey = try vault(dir).rotate(now: now).prekey
@@ -49,6 +50,21 @@ func genIdentity(_ dir: String, now: Int) throws {
     let export = try identity.exportPrivateKey().jsonData()
     FileManager.default.createFile(atPath: path(dir, "identity.json"), contents: export, attributes: [.posixPermissions: 0o600])
     try writeJSON(path(dir, "agent.json"), agent.source)
+    let card = try createCardRecord(identity: identity, home: relayRoute, handle: handle, contact: .open, listed: false, now: now)
+    try writeJSON(path(dir, "card.json"), card)
+}
+
+func verifyCardCommand(_ file: String, now: Int) throws -> JSONValue {
+    let value = try readJSON(file)
+    do {
+        let record = try verifyCardBundle(value, now: now).record
+        var out: [String: JSONValue] = ["ok": true, "aceId": .string(record.aceId), "contact": .string(record.contact.rawValue),
+                                        "listed": .bool(record.listed)]
+        if let h = record.handle { out["handle"] = .string(h) }
+        return .object(out)
+    } catch let e as ACEError {
+        return ["error": .string(e.outcomeCode)]
+    }
 }
 
 func createPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws {
@@ -137,7 +153,7 @@ func openPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws ->
 
 func main() throws {
     var args = Array(CommandLine.arguments.dropFirst())
-    guard args.count >= 2 else { throw Failure(description: "usage: ACEInterop <gen-identity|create-packet|open-packet> <dir> [options] --now N") }
+    guard args.count >= 2 else { throw Failure(description: "usage: ACEInterop <gen-identity|create-packet|open-packet|verify-card> <dir> [options] --now N") }
     let command = args.removeFirst(), dir = args.removeFirst()
     var options: [String: String] = [:]
     while !args.isEmpty {
@@ -149,7 +165,11 @@ func main() throws {
         throw Failure(description: "--now is required")
     }
     switch command {
-    case "gen-identity": try genIdentity(dir, now: now)
+    case "gen-identity": try genIdentity(dir, handle: options["handle"], now: now)
+    case "verify-card":
+        var line = try verifyCardCommand(dir, now: now).jsonData()
+        line.append(0x0A)
+        FileHandle.standardOutput.write(line)
     case "create-packet": try createPacketCommand(dir, options, now: now)
     case "open-packet":
         guard let out = options["out"] else { throw Failure(description: "--out is required") }
