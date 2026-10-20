@@ -256,6 +256,107 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         #expect(try await carol.network.peers.pinned(alice.aceId) == nil)
     }
 
+    private func reopened(_ who: NetPeer, _ relay: FakeRelay, _ clock: TestClock) async throws -> NetworkClient {
+        try await NetworkClient.open(identity: who.identity, store: who.store, relay: try relay.client(clock: clock.fn),
+                                     prekeys: StorePrekeyVault(store: who.store), receive: false, clock: clock.fn)
+    }
+
+    @Test func fallbackPinnedKelStaysKelLiveFalseOnLaterLookups() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        clock.now += 8 * 86_400
+        let bob = try await peer(relay, clock)
+        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == false)
+        // The pin exists now, but no live descriptor ever confirmed it: every later lookup says so, durably.
+        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == false)
+        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").kelLive == false)
+        let again = try await reopened(bob, relay, clock)
+        #expect(try await again.lookupCard(alice.aceId).kelLive == false)
+        await again.close()
+    }
+
+    @Test func aLaterLiveDescriptorConfirmsAFallbackPinnedKel() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        clock.now += 8 * 86_400
+        let bob = try await peer(relay, clock)
+        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").kelLive == false)
+        // Alice comes back online: her new descriptor reconciles with the pin and confirms it.
+        try await alice.network.publish()
+        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").kelLive == true)
+        // Confirmed for good, durably: even after she goes offline again.
+        clock.now += 8 * 86_400
+        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == true)
+        let again = try await reopened(bob, relay, clock)
+        #expect(try await again.lookupCard(alice.aceId).kelLive == true)
+        await again.close()
+    }
+
+    @Test func transientOnOneRoutePlusUnknownPeerOnAnotherDoesNotFallBack() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn), relayB = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open)
+        let path = "/v1/descriptor/\(alice.aceId)"
+        func expectTransient(_ body: () async throws -> VerifiedCard) async {
+            do {
+                _ = try await body()
+                Issue.record("expected a transient failure")
+            } catch let e as ACEError {
+                #expect(e.isTransient, "\(e)")
+            } catch { Issue.record("\(error)") }
+        }
+        // Without a pin, an unreachable home relay is a failure, never "no live descriptor".
+        let carol = try await peer(relay, clock)
+        relay.withLock { relay.down = [path] }
+        await expectTransient { try await carol.network.lookupCard(alice.aceId) }
+        #expect(try await carol.network.peers.pinned(alice.aceId) == nil)
+        relay.withLock { relay.down = [] }
+        // Alice's descriptor names relay B first; her home relay has lost it, so bob pins her card's KEL.
+        let own = try #require(relay.publishedAgent(alice.aceId))
+        let twoRoutes = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+            relays: [relayB.url, relay.url], prekey: own.descriptor.prekey, profiles: [ProfileManifest.text.ref]), now: clock.now)
+        relay.dropAgent(alice.aceId)
+        let store = MemoryStore()
+        let bob = try await NetworkClient.open(identity: try makeIdentity(now: clock.now), store: store, relay: try relay.client(clock: clock.fn),
+                                               prekeys: StorePrekeyVault(store: store), receive: false,
+                                               foreignRelay: { _ in try relayB.client(clock: clock.fn) }, clock: clock.fn)
+        #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
+        _ = try await bob.importAgent(twoRoutes.source)  // shared out of band; it expires before bob looks again
+        clock.now += 8 * 86_400
+        // Relay B is unreachable and the home relay answers unknown_peer: the lookup fails instead of reporting not live.
+        relayB.withLock { relayB.down = [path] }
+        await expectTransient { try await bob.lookupCard(alice.aceId) }
+        // Both routes answering unknown_peer: no live descriptor, still not confirmed.
+        relayB.withLock { relayB.down = [] }
+        #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
+        await bob.close()
+    }
+
+    @Test func pinMissingRequiredFieldsIsStorageFailed() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        let bob = try await peer(relay, clock)
+        let seen = try await bob.network.lookupCard("@alice@\(relay.host)")
+        let cardPin = "network/handles/\(sha256Hex(Data(alice.aceId.utf8))).json"
+        let ownerPin = "network/handle-owners/\(sha256Hex(Data("\(relay.url) alice".utf8))).json"
+        let full: [String: JSONValue] = ["home": .string(relay.url), "handle": "alice", "issuedAt": .number(Double(seen.record.issuedAt)), "digest": "x"]
+        var cases: [(String, JSONValue)] = [(cardPin, .object([:]))]
+        for missing in ["issuedAt", "digest", "home"] { cases.append((cardPin, .object(full.filter { $0.key != missing }))) }
+        cases.append((ownerPin, ["home": .string(relay.url), "handle": "alice"]))
+        for (key, bad) in cases {
+            let good = try #require(try bob.store.read(key))
+            try bob.store.checkedWrite(key, try bad.jsonData())
+            await expectCodeAsync(.storageFailed) { try await bob.network.lookupCard("@alice@\(relay.host)") }
+            try bob.store.checkedWrite(key, good)
+        }
+        // The record of how a KEL pin was confirmed, without its flag.
+        clock.now += 8 * 86_400
+        let carol = try await peer(relay, clock)
+        #expect(try await carol.network.lookupCard(alice.aceId).kelLive == false)
+        try carol.store.checkedWrite("network/kel-provenance/\(sha256Hex(Data(alice.aceId.utf8))).json",
+                                     try JSONValue.object(["aceId": .string(alice.aceId)]).jsonData())
+        await expectCodeAsync(.storageFailed) { try await carol.network.lookupCard(alice.aceId) }
+    }
+
     @Test func kelLiveIsTrueWithALiveDescriptor() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await peer(relay, clock, contact: .open, handle: "alice")
