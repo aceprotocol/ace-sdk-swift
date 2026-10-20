@@ -99,9 +99,11 @@ package enum KelSteps {
         try ACEKel.verify(state.events + [event], now: now)
     }
 
-    /// `icp` committing `nextDigest`, then `dlg` of `signingPublicKey`, both at `ts`.
-    package static func incept(root: any ACEKeyProvider, nextDigest: Data, signingPublicKey: Data, ts: Int) throws -> KelState {
-        let icp = try ACEKel.createInception(root: root, nextDigest: nextDigest, ts: ts)
+    /// `icp` committing `nextDigest` (dated `inceptedAt`, default `ts`), then `dlg` of `signingPublicKey` at `ts`.
+    package static func incept(root: any ACEKeyProvider, nextDigest: Data, signingPublicKey: Data, ts: Int, inceptedAt: Int? = nil) throws -> KelState {
+        let icpTs = inceptedAt ?? ts
+        guard icpTs >= 0, icpTs <= ts else { throw ACEError(.invalidArgument, "the inception must not postdate the delegation") }
+        let icp = try ACEKel.createInception(root: root, nextDigest: nextDigest, ts: icpTs)
         let st = try ACEKel.verify([icp], now: ts)
         return try appended(st, try ACEKel.createDelegation(state: st, root: root, keyPublic: signingPublicKey, ts: ts), ts)
     }

@@ -11,7 +11,7 @@ import Testing
 
     static func incept(now: Int = NOW) throws -> (ExternalRootIdentity, SoftwareKey) {
         let signing = SoftwareKey.generate()
-        let id = try ExternalRootIdentity.incept(root: root(0), nextRootDigest: digest(1), signingKey: signing, now: now)
+        let id = try ExternalRootIdentity.incept(root: root(0), nextRootDigest: digest(1), signingKey: signing, inceptedAt: 0, now: now)
         return (id, signing)
     }
 
@@ -31,14 +31,28 @@ import Testing
 
     @Test func inceptRefusesABadOrReusedNextDigest() {
         expectCode(.invalidArgument, "short") {
-            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Data(count: 31), signingKey: SoftwareKey.generate(), now: NOW)
+            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Data(count: 31), signingKey: SoftwareKey.generate(),
+                                            inceptedAt: 0, now: NOW)
         }
         expectCode(.invalidArgument, "root itself") {
-            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Self.digest(0), signingKey: SoftwareKey.generate(), now: NOW)
+            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Self.digest(0), signingKey: SoftwareKey.generate(),
+                                            inceptedAt: 0, now: NOW)
+        }
+        expectCode(.invalidArgument, "inception after now") {
+            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Self.digest(1), signingKey: SoftwareKey.generate(),
+                                            inceptedAt: NOW + 1, now: NOW)
         }
     }
 
-    @Test func rootIsNotRetainedAfterInceptDelegateRotate() throws {
+    /// A fixed inception time makes the ACE ID a function of the root chain: another signing key, another day, same ID.
+    @Test func aFixedInceptionTimeGivesADeterministicACEId() throws {
+        let (a, _) = try Self.incept(now: NOW)
+        let (b, _) = try Self.incept(now: NOW + 86_400)
+        #expect(a.getACEId() == b.getACEId())
+        #expect(try ACEKel.verify(b.getKel(), now: NOW + 86_400).aceId == a.getACEId())
+    }
+
+    @Test func rootIsNotRetainedAfterInceptRotate() throws {
         let (id, _) = try Self.incept()
         func check(_ label: String) throws {
             let export = id.exportKeyReferences()
@@ -55,8 +69,6 @@ import Testing
             #expect(!kelRoots.contains(held) && !text.contains(held), "\(label): next root public key")
         }
         try check("incept")
-        try id.delegate(root: Self.root(0), signingKey: SoftwareKey.generate(), now: NOW + 1)
-        try check("delegate")
         try id.rotate(revealing: Self.root(1), nextRootDigest: Self.digest(2), now: NOW + 2)
         try check("rotate")
     }
@@ -101,22 +113,17 @@ import Testing
         }
     }
 
-    @Test func rotateThenDelegateKeepsACEId() throws {
+    @Test func rotateKeepsACEIdAndSigningKey() throws {
         let (id, signing) = try Self.incept()
         let aceId = id.getACEId()
         try id.rotate(revealing: Self.root(1), nextRootDigest: Self.digest(2), now: NOW + 1)
         #expect(id.getACEId() == aceId && id.rotationCount == 1)
         #expect(try checkUsable(id, now: NOW + 1).signing?.publicKey == signing.publicKey())
-        let next = SoftwareKey.generate()
-        try id.delegate(root: Self.root(1), signingKey: next, now: NOW + 2)
-        #expect(id.getACEId() == aceId && id.getSigningPublicKey() == next.publicKey())
-        #expect(try checkUsable(id, now: NOW + 2).signing?.publicKey == next.publicKey())
-        expectCode(.invalidArgument, "old root") { try id.delegate(root: Self.root(0), signingKey: SoftwareKey.generate(), now: NOW + 3) }
         expectCode(.invalidArgument, "not committed") {
             try id.rotate(revealing: Self.root(3), nextRootDigest: Self.digest(4), now: NOW + 3)
         }
         expectCode(.invalidArgument, "root-less delegate") { try id.delegate(now: NOW + 3, notAfter: nil) }
-        #expect(try checkUsable(id, now: NOW + 3).signing?.publicKey == next.publicKey())
+        #expect(try checkUsable(id, now: NOW + 3).signing?.publicKey == signing.publicKey())
     }
 
     @Test func verifiesUnderVerifyKelAfterEveryStep() throws {
@@ -132,9 +139,6 @@ import Testing
         for k in 1...3 {
             now += 1
             try id.rotate(revealing: Self.root(k), nextRootDigest: Self.digest(k + 1), now: now)
-            try check()
-            now += 1
-            try id.delegate(root: Self.root(k), signingKey: SoftwareKey.generate(), now: now, notAfter: now + 3600)
             try check()
         }
         #expect(id.rotationCount == 3)

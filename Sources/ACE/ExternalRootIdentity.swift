@@ -44,8 +44,8 @@ public struct ExternalRootIdentityExport: Sendable, Equatable {
 public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @unchecked Sendable {
     private let lock = NSLock()
     private var state: KelState
-    private var signing: any ACEKeyProvider
-    private var signingReference: String
+    private let signing: any ACEKeyProvider
+    private let signingReference: String
 
     private init(state: KelState, signing: any ACEKeyProvider) throws {
         guard let s = state.signing else { throw ACEError(.invalidKel, "kel has no signing delegation") }
@@ -68,13 +68,16 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
         return d
     }
 
-    /// `icp` by `root` (key(0)) committing `nextRootDigest` (digest(key(1))), then `dlg` of `signingKey`, both at `now`.
-    public static func incept(root: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider, now: Int? = nil) throws -> ExternalRootIdentity {
+    /// `icp` by `root` (key(0)) committing `nextRootDigest` (digest(key(1))) dated `inceptedAt`, then `dlg` of
+    /// `signingKey` at `now`. The ACE ID hashes the inception, so a fixed `inceptedAt` makes it a function of the root
+    /// chain alone (the KEL bounds `ts` only from above, 01 § Verifier rules). `inceptedAt` after `now` is `invalid_argument`.
+    public static func incept(root: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider, inceptedAt: Int,
+                              now: Int? = nil) throws -> ExternalRootIdentity {
         let d = try digest(nextRootDigest)
         let ts = try identityNow(now)
         try KelSteps.checkFreshNext(d, current: root.publicKey(), events: [])
-        return try ExternalRootIdentity(state: KelSteps.incept(root: root, nextDigest: d, signingPublicKey: signingKey.publicKey(), ts: ts),
-                                        signing: signingKey)
+        let state = try KelSteps.incept(root: root, nextDigest: d, signingPublicKey: signingKey.publicKey(), ts: ts, inceptedAt: inceptedAt)
+        return try ExternalRootIdentity(state: state, signing: signingKey)
     }
 
     /// Take the identity over from its log (another device's, or a relay's copy): fork at the start of the current root
@@ -97,22 +100,9 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
         try self.init(state: ACEKel.verify(export.kel, now: try identityNow(now)), signing: signingKey)
     }
 
-    /// `dlg` of `signingKey`, signed by `root` (the current root key(`rotationCount`), else `invalid_argument`),
-    /// optionally expiring at `notAfter`. The previous signing key stops verifying.
-    public func delegate(root: SoftwareKey, signingKey: any ACEKeyProvider, now: Int? = nil, notAfter: Int? = nil) throws {
-        let ref = try Self.reference(of: signingKey)
-        try withLock {
-            guard root.publicKey() == state.rootPublicKey else { throw ACEError(.invalidArgument, "root does not match the kel") }
-            let ts = try identityNow(now)
-            state = try KelSteps.delegate(state, root: root, keyPublic: signingKey.publicKey(), ts: ts, notAfter: notAfter)
-            signing = signingKey
-            signingReference = ref
-        }
-    }
-
     /// `rot` revealing `nextRoot` (the committed next root, key(`rotationCount` + 1), else `invalid_argument`) and
     /// committing `nextRootDigest`, then `dlg` of the current signing key by the revealed root (a `rot` revokes the
-    /// signing delegation). `delegate(root:signingKey:)` with the revealed root moves to a new signing key.
+    /// signing delegation). A new signing key comes with `recover` (a new device).
     public func rotate(revealing nextRoot: SoftwareKey, nextRootDigest: Data, now: Int? = nil) throws {
         let d = try Self.digest(nextRootDigest)
         try withLock {
@@ -161,9 +151,9 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
 
     public func getState() -> KelState { withLock { state } }
 
-    /// Always `invalid_argument`: the root is held outside this identity; use `delegate(root:signingKey:now:notAfter:)`.
+    /// Always `invalid_argument`: the root is held outside this identity; a new signing key comes with `recover`.
     public func delegate(now: Int?, notAfter: Int?) throws {
-        throw ACEError(.invalidArgument, "an external-root identity delegates only with its root: delegate(root:signingKey:)")
+        throw ACEError(.invalidArgument, "an external-root identity delegates only with its root: recover on the new device")
     }
 }
 
