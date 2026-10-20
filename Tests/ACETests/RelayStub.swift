@@ -184,6 +184,8 @@ final class FakeRelay: @unchecked Sendable {
     /// Bind `handle` to `aceId` as is.
     func bindHandle(_ handle: String, to aceId: String) { withLock { handles[handle] = aceId } }
     func handleOwner(_ handle: String) -> String? { withLock { handles[handle] } }
+    /// The stored PublishedAgent of `aceId` (nil when none was published).
+    func publishedAgent(_ aceId: String) -> VerifiedAgent? { withLock { agents[aceId] } }
 
     /// The unexpired descriptor of a registered identity.
     private func live(_ aceId: String, now: Int) -> VerifiedAgent? {

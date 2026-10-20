@@ -180,16 +180,16 @@ public actor NetworkClient: PacketTransport {
 
     // MARK: Publishing
 
-    /// Publish this identity's descriptor, then its card record. The PublishedAgent is re-signed and posted to the home
-    /// relay when it is missing, changed, expiring within an hour or when the prekey rotates (every 24 hours); the card
-    /// record is re-signed when its settings change or after a new `dlg`. Unchanged ones are posted again only with
-    /// `force`. A relay holding no registration (`not_registered`) or an older KEL (`kel_conflict`) gets the current KEL
-    /// registered first. Prunes the prekey vault. Returns the PublishedAgent.
+    /// Publish this identity's card record, then its descriptor. The card record goes first because it is the post a relay
+    /// refuses (handle rules); a refused card leaves the published descriptor unchanged. The card record is re-signed when
+    /// its settings change or after a new `dlg`; the PublishedAgent is re-signed and posted to the home relay when it is
+    /// missing, changed, expiring within an hour or when the prekey rotates (every 24 hours). Unchanged ones are posted
+    /// again only with `force`. A relay holding no registration (`not_registered`) or an older KEL (`kel_conflict`) gets
+    /// the current KEL registered first. Prunes the prekey vault. Returns the PublishedAgent.
     @discardableResult
     public func publish(force: Bool = false) async throws -> VerifiedAgent {
-        let agent = try await publishDescriptor(force: force)
         try await publishCard(force: force)
-        return agent
+        return try await publishDescriptor(force: force)
     }
 
     private func publishDescriptor(force: Bool) async throws -> VerifiedAgent {
@@ -306,56 +306,105 @@ public actor NetworkClient: PacketTransport {
     @discardableResult
     public func lookup(_ target: String) async throws -> VerifiedAgent {
         if isACEId(target) { return try await agent(target) }
-        let (bundle, url) = try await cardByHandle(target)
-        let card = try await checkCard(bundle)
-        return try await adoptFetched(try await onRoutes([url]) { try await $0.descriptor(card.aceId) })
+        let (bundle, url, handle) = try await cardByHandle(target)
+        let id = bundle["card"]?["aceId"]?.stringValue ?? ""
+        let fetch = { try await self.adoptFetched(try await self.onRoutes([url]) { try await $0.descriptor(id) }) }
+        let pinned = try await pinKel(id, fetch)
+        _ = try await checkCard(bundle, resolved: (home: url, handle: handle))
+        if let pinned { return pinned }
+        return try await fetch()
     }
 
     /// The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
     /// `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). Every record is checked against
     /// the identity's card pin, kept durably: an older `issuedAt` than one already verified, or an equal one with other
     /// claims, is `stale_descriptor`; a handle is set once per home, so after a record with a handle was seen, a record
-    /// naming the same home with another or no handle is `invalid_authorization` (a new home re-pins).
+    /// naming the same home with another or no handle is `invalid_authorization` (a new home re-pins). A handle's first
+    /// resolution pins its ACE ID; a later resolution to another one is `invalid_authorization`. Without a KEL pin for the
+    /// identity, its descriptor is looked up first and its KEL pinned, so the card is verified under the current KEL, never
+    /// one a relay chose.
     public func lookupCard(_ target: String) async throws -> VerifiedCard {
-        if isACEId(target) { return try await checkCard(try await fetchCard(target)) }
-        return try await checkCard(try await cardByHandle(target).bundle)
+        if isACEId(target) {
+            _ = try await pinKel(target) { try await self.agent(target) }
+            return try await checkCard(try await fetchCard(target))
+        }
+        let (bundle, url, handle) = try await cardByHandle(target)
+        let id = bundle["card"]?["aceId"]?.stringValue ?? ""
+        _ = try await pinKel(id) { try await self.adoptFetched(try await self.onRoutes([url]) { try await $0.descriptor(id) }) }
+        return try await checkCard(bundle, resolved: (home: url, handle: handle))
+    }
+
+    /// When `aceId` has no KEL pin, pin it through `fetch` (a descriptor lookup) and return what it fetched; else nil.
+    private func pinKel(_ aceId: String, _ fetch: () async throws -> VerifiedAgent) async throws -> VerifiedAgent? {
+        guard isACEId(aceId), try await peers.pinned(aceId) == nil else { return nil }
+        return try await fetch()
     }
 
     private static func cardPinKey(_ aceId: String) -> String { "network/handles/\(sha256Hex(Data(aceId.utf8))).json" }
 
+    /// The reverse handle pin: the ACE ID `@handle@home` first resolved to. A binding is permanent, so a later other one is
+    /// misbehavior.
+    private static func handleOwnerKey(home: String, handle: String) -> String {
+        "network/handle-owners/\(sha256Hex(Data("\(home) \(handle)".utf8))).json"
+    }
+
+    /// A stored pin object, nil when absent; one that does not parse as an object is `storage_failed`, never no pin.
+    private nonisolated func readPin(_ key: String) throws -> JSONValue? {
+        guard let v = try store.readJSON(key) else { return nil }
+        guard v.objectValue != nil else { throw ACEError(.storageFailed, "\(key) is invalid") }
+        return v
+    }
+
     /// Verify a fetched card record against the identity's KEL pin and its card pin `{home, handle?, issuedAt, digest}`
-    /// (written on first sight, only after full verification): no rollback first, then the set-once handle per home.
-    private func checkCard(_ bundle: CardBundle) async throws -> VerifiedCard {
+    /// (written on first sight, only after full verification): no rollback first, then the set-once handle per home. A
+    /// record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
+    private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil) async throws -> VerifiedCard {
         let id = bundle["card"]?["aceId"]?.stringValue ?? ""
         let pinned = isACEId(id) ? try await peers.pinned(id) : nil
         let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays, pinned: pinned)
         let r = v.record, digest = try documentDigest(r.value), key = Self.cardPinKey(v.aceId)
+        let ownerKey = resolved.map { Self.handleOwnerKey(home: $0.home, handle: $0.handle) }
         try store.withLock("network-handles") {
-            let pin = try store.checkedRead(key).flatMap { JSONValue(stored: $0) }
-            let pinHome = pin?["home"]?.stringValue, pinHandle = pin?["handle"]?.stringValue
-            if let pinAt = pin?["issuedAt"]?.wireInt {
-                if r.issuedAt < pinAt { throw ACEError(.staleDescriptor, "an older card record than one already verified") }
-                if r.issuedAt == pinAt {
-                    guard digest == pin?["digest"]?.stringValue else { throw ACEError(.staleDescriptor, "another card record with the same issuedAt") }
-                    return
+            let owner = try ownerKey.flatMap { try readPin($0) }
+            if let owner {
+                guard owner["aceId"]?.stringValue == v.aceId else {
+                    throw ACEError(.invalidAuthorization, "the handle resolved to another identity than before")
                 }
             }
-            if let pinHandle, pinHome == r.home, pinHandle != r.handle {
-                throw ACEError(.invalidAuthorization, "the card record does not carry the handle this identity set")
+            try advanceCardPin(r, digest: digest, key: key)
+            if let ownerKey, let resolved, owner == nil {
+                let pin: JSONValue = .object(["home": .string(resolved.home), "handle": .string(resolved.handle), "aceId": .string(v.aceId)])
+                try store.checkedWrite(ownerKey, try pin.jsonData())
             }
-            // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
-            // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
-            var next: [String: JSONValue] = ["issuedAt": .number(Double(r.issuedAt)), "digest": .string(digest)]
-            if let pinHandle, let pinHome, r.handle == nil || pinHome == r.home {
-                next["home"] = .string(pinHome)
-                next["handle"] = .string(pinHandle)
-            } else {
-                next["home"] = .string(r.home)
-                if let h = r.handle { next["handle"] = .string(h) }
-            }
-            try store.checkedWrite(key, try JSONValue.object(next).jsonData())
         }
         return v
+    }
+
+    /// The card pin checks and update of `checkCard`, under the `network-handles` lock.
+    private nonisolated func advanceCardPin(_ r: CardRecord, digest: String, key: String) throws {
+        let pin = try readPin(key)
+        let pinHome = pin?["home"]?.stringValue, pinHandle = pin?["handle"]?.stringValue
+        if let pinAt = pin?["issuedAt"]?.wireInt {
+            if r.issuedAt < pinAt { throw ACEError(.staleDescriptor, "an older card record than one already verified") }
+            if r.issuedAt == pinAt {
+                guard digest == pin?["digest"]?.stringValue else { throw ACEError(.staleDescriptor, "another card record with the same issuedAt") }
+                return
+            }
+        }
+        if let pinHandle, pinHome == r.home, pinHandle != r.handle {
+            throw ACEError(.invalidAuthorization, "the card record does not carry the handle this identity set")
+        }
+        // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
+        // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
+        var next: [String: JSONValue] = ["issuedAt": .number(Double(r.issuedAt)), "digest": .string(digest)]
+        if let pinHandle, let pinHome, r.handle == nil || pinHome == r.home {
+            next["home"] = .string(pinHome)
+            next["handle"] = .string(pinHandle)
+        } else {
+            next["home"] = .string(r.home)
+            if let h = r.handle { next["handle"] = .string(h) }
+        }
+        try store.checkedWrite(key, try JSONValue.object(next).jsonData())
     }
 
     /// The peer's card record from the first route that serves it: its cached descriptor's relays, then the home relay.
@@ -370,8 +419,8 @@ public actor NetworkClient: PacketTransport {
         throw last
     }
 
-    /// `@name@relay-host`: the CardBundle the relay serves for that handle, and the relay's URL.
-    private func cardByHandle(_ target: String) async throws -> (bundle: CardBundle, url: String) {
+    /// `@name@relay-host`: the CardBundle the relay serves for that handle, the relay's URL and the handle.
+    private func cardByHandle(_ target: String) async throws -> (bundle: CardBundle, url: String, handle: String) {
         let parts = target.split(separator: "@", omittingEmptySubsequences: false)
         guard parts.count == 3, parts[0].isEmpty, isHandle(String(parts[1])), !parts[2].isEmpty,
               parts[2].utf8.allSatisfy({ ($0 >= 0x61 && $0 <= 0x7A) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2E || $0 == 0x2D || $0 == 0x3A }) else {
@@ -383,7 +432,7 @@ public actor NetworkClient: PacketTransport {
         let home = relay.baseURLString
         let rest = home.range(of: "://").map { home[$0.upperBound...] } ?? ""
         let url = rest[..<(rest.firstIndex(of: "/") ?? rest.endIndex)] == host ? home : "https://\(host)"
-        return (try await client(url).handle(String(parts[1])), url)
+        return (try await client(url).handle(String(parts[1])), url, String(parts[1]))
     }
 
     /// The peer's current descriptor (04 § Caching): the pinned one while it is unexpired, bound to the current pins and
