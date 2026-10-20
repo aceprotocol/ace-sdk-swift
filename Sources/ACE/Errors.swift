@@ -39,6 +39,8 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         case blockedAddress = "blocked_address"
         case deliveryRejected = "delivery_rejected"
         case expired = "expired"
+        /// No rollback of descriptors and card records (04, 07).
+        case staleDescriptor = "stale_descriptor"
         // permanent: commerce profile rule codes (profiles/commerce.md § Check order)
         case transitionNotAllowed = "transition_not_allowed"
         case wrongRole = "wrong_role"
@@ -89,13 +91,23 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
     public let retryAfterSeconds: Int?
     /// For `rule_rejected`: the profile rule's own code (outcome-code grammar).
     public let ruleCode: String?
+    /// An SDK-local refinement of `code` a host can act on (never on the wire; equality still compares `code` only).
+    public let reason: Reason?
+
+    /// SDK-local reasons (not protocol error codes).
+    public enum Reason: String, Sendable {
+        /// `invalid_authorization`: a handle now resolves to another identity than the one it first resolved to
+        /// (the reverse handle pin). Hosts must stop, never follow the new binding.
+        case handleRebound
+    }
 
     public init(
         _ code: Code,
         _ message: String = "",
         status: Int? = nil,
         relayCode: String? = nil,
-        retryAfterSeconds: Int? = nil
+        retryAfterSeconds: Int? = nil,
+        reason: Reason? = nil
     ) {
         self.code = code
         self.message = message.isEmpty ? code.rawValue : message
@@ -103,6 +115,7 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         self.relayCode = relayCode
         self.retryAfterSeconds = retryAfterSeconds
         self.ruleCode = nil
+        self.reason = reason
     }
 
     /// A permanent rejection by a profile rule with its own outcome code (`^[a-z0-9_]{1,64}$`, 06 § Error codes): a
@@ -123,6 +136,7 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         self.relayCode = nil
         self.retryAfterSeconds = nil
         self.ruleCode = code
+        self.reason = nil
     }
 
     /// The code on the wire (a `rejected` receipt): `ruleCode` for `rule_rejected`, else `code`.

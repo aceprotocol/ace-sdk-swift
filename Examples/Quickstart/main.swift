@@ -10,7 +10,7 @@ let bobPrekeys = StorePrekeyVault(store: MemoryStore())
 let prekey = try bobPrekeys.rotate(now: systemClock()).prekey
 let text = try InstalledProfiles([.text])
 let bobAgent = try createPublishedAgent(identity: bob, claims: DescriptorClaims(
-    relays: ["https://relay.aceprotocol.org"], prekey: prekey, profiles: text.refs, card: AgentCard(name: "Bob")))
+    relays: ["https://relay.aceprotocol.org"], prekey: prekey, profiles: text.refs))
 
 // Alice verifies Bob's PublishedAgent (its keys come only from the verified KEL and descriptor) and sends a text packet.
 let verifiedBob = try verifyPublishedAgent(bobAgent.source, now: systemClock())

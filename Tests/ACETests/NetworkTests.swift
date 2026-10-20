@@ -5,8 +5,8 @@ import Testing
 private let translation = try! ProfileManifest(json: Data(#"{"id":"urn:example:translation:1","messages":[{"type":"urn:example:translation:request:1","schema":{"type":"object","properties":{"text":{"type":"string","maxLength":100}},"required":["text"],"additionalProperties":false}}]}"#.utf8))
 
 /// Alice connects to Bob (public) about `ace:text:1`; Bob accepts explicitly; both pulls done.
-private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig: NetworkConfiguration = NetworkConfiguration(visibility: .public),
-                       bob bobConfig: NetworkConfiguration = NetworkConfiguration(visibility: .public)) async throws -> (NetPeer, NetPeer) {
+private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true),
+                       bob bobConfig: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true)) async throws -> (NetPeer, NetPeer) {
     let alice = try await NetPeer.make(relay, clock: clock, configuration: aliceConfig)
     let bob = try await NetPeer.make(relay, clock: clock, configuration: bobConfig)
     try await alice.network.connect(bob.aceId, profile: "ace:text:1", note: "hello")
@@ -67,7 +67,7 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
     @Test func acceptProfilesAutoAccepts() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(acceptProfiles: ["ace:text:1"], visibility: .public))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(acceptProfiles: ["ace:text:1"], contact: .open, listed: true))
         try await alice.network.connect(bob.aceId, profile: "ace:text:1")
         _ = try await bob.network.pull()
         let held = try await bob.network.requests()
@@ -80,7 +80,7 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
     /// Admission runs before any lookup: a stranger's packet to a private agent is dropped with no network call and no pin.
     @Test func admissionBeforeLookup() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let carol = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .private))
+        let carol = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration())
         let mallory = try TestAgent(now: clock.now)
         let carolAgent = try await carol.network.publish()
         let content = try carol.network.profiles.content(type: "ace:text:1", body: ["message": "spam"])
@@ -101,7 +101,7 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
 
     @Test func unknownSchemaIsRejectedWithAReceipt() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await connected(relay, clock, alice: NetworkConfiguration(profiles: [.text, translation], visibility: .public))
+        let (alice, bob) = try await connected(relay, clock, alice: NetworkConfiguration(profiles: [.text, translation], contact: .open, listed: true))
         let entry = try await alice.network.send(to: bob.aceId, type: "urn:example:translation:request:1", body: ["text": "bonjour"])
         #expect(try await bob.network.pull() == [.rejected("unsupported_schema")])
         #expect(bob.received.value.isEmpty)
@@ -325,7 +325,7 @@ private final class GateTransport: PacketTransport, @unchecked Sendable {
     /// accept it automatically (through the contact-candidate path, since its old permits no longer resolve it).
     @Test func signingKeyChangePushesFreshPermits() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await connected(relay, clock, alice: NetworkConfiguration(visibility: .private))
+        let (alice, bob) = try await connected(relay, clock, alice: NetworkConfiguration())
         let before = try #require(try bob.network.admission.heldPermit(alice.aceId)?["signature"]?["seq"]?.wireInt)
         try alice.identity.delegate(now: clock.now, notAfter: nil)
         try await alice.network.maintain()

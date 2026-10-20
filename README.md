@@ -18,9 +18,9 @@ One library product, `ACE`. No binary or chain dependencies (CryptoKit only).
 | Identity | `SoftwareIdentity`, `SecureEnclaveIdentity` (an `ml-dsa-65` root, a committed next root, one delegated `ml-dsa-65` signing key), `ACEKel`, `checkUsable`; exports hold no encryption seed (`jsonData()` / `init(json:)`) |
 | Prekeys | `PrekeyVault` (`current`, `rotate(now:)`, `open(_:now:)`, `prune(now:)`), `StorePrekeyVault(store:protection:)` over `MemoryStore` / `FileStore`, `.secureEnclave` seals seeds with Secure Enclave ML-KEM |
 | Packet | `createPacket`, `Packet(json:)`, `verifyPacketSignature`, `decryptPacket`, `PrivateContent`, `conversationKey` |
-| Documents | `createPublishedAgent` / `verifyPublishedAgent` (`DescriptorClaims`, `AgentCard`, `Visibility`), `createDelegation` / `verifyDelegation`, `createPermit` / `verifyPermit` (30 days), `ERC8004Binding`, `verifyErc8004Registration` |
+| Documents | `createPublishedAgent` / `verifyPublishedAgent` (`DescriptorClaims`), `createCardRecord` / `verifyCardBundle` (`CardRecord`, `AgentCard`, `Contact`), `createDelegation` / `verifyDelegation`, `createPermit` / `verifyPermit` (30 days), `ERC8004Binding`, `verifyErc8004Registration` |
 | Profiles | `ProfileManifest` (`.core`, `.text`, `.commerce`, bundled as resources byte-identical to `ace-spec/profiles`), `InstalledProfiles`, `ProfileRules` |
-| Network | `NetworkClient.open(...)`: `publish(force:)` (registers on demand), `discover`, `importAgent`, `lookup(_:)` (ACE ID or `@name@relay`), `agent(_:refresh:)`, `connect(_:profile:note:)`, `requests()` (pending `ContactRequest`s), `accept`, `reject`, `block`, `unblock`, `setWake(gateway:token:)` / `clearWake()` (07 § Wake hints, optional), `createInvitation(peer:profile:)` / `importInvitation` (`Invitation` = `{agent, permit}`), `send(to:type:body:threadId:)`, `flush()`, `pull(limit:maxPages:)` (`maxPages` bounds one pass), `follow()`, `maintain()`, `close()`; `onMessage` / `onReceipt` in `NetworkConfiguration` |
+| Network | `NetworkClient.open(...)`: `publish(force:)` (registers on demand), `discover`, `importAgent`, `lookup(_:)` (ACE ID or `@name@relay`), `lookupCard(_:)`, `agent(_:refresh:)`, `connect(_:profile:note:)`, `requests()` (pending `ContactRequest`s), `accept`, `reject`, `block`, `unblock`, `setWake(gateway:token:)` / `clearWake()` (07 § Wake hints, optional), `createInvitation(peer:profile:)` / `importInvitation` (`Invitation` = `{agent, permit}`), `send(to:type:body:threadId:)`, `flush()`, `pull(limit:maxPages:)` (`maxPages` bounds one pass), `follow()`, `maintain()`, `close()`; `onMessage` / `onReceipt` in `NetworkConfiguration` |
 | Relay | `RelayClient` (07 binding, client side) and `RelayClient.foreign(_:)`, the default client for relays named by peers (https only, blocked addresses refused) |
 | State | `ACEStore` (`MemoryStore`, `FileStore`; `validateStoreKey` / `validateStoreValue` / `validateLockName`, `NamedMutexes` and `lockTimeoutError` for a custom store), `PeerStore`, `AdmissionTable`, `Outbox` (re-encrypt per attempt, backoff, persisted lease, receipts) |
 | Optional | `commerceRules(store:localAceId:)` + `ThreadStore` for `ace:commerce:1` (stablecoin / Stripe Link settlement shapes) |
@@ -37,10 +37,10 @@ packet to a peer's descriptor prekey and opens it. Over a relay:
 let network = try await NetworkClient.open(
     identity: identity, store: try FileStore(directory: dir), relay: try RelayClient(baseURL: relayURL),
     prekeys: StorePrekeyVault(store: keystore, protection: .secureEnclave),
-    configuration: NetworkConfiguration(profiles: [.text], visibility: .public,
+    configuration: NetworkConfiguration(profiles: [.text], handle: "bob", contact: .open, listed: true,
                                         onMessage: { message in /* persist idempotently by (from, messageId) */ },
                                         onReceipt: { from, body, entry in /* delivery confirmed or rejected */ }))
-try await network.publish()                 // registers the identity at the relay when needed
+try await network.publish()                 // descriptor, then card record; registers the identity when needed
 try await network.connect(peerId, profile: "ace:text:1", note: "hi")
 try await network.pull()                    // contact replies, messages, receipts
 try await network.send(to: peerId, type: "ace:text:1", body: ["message": "hello"])

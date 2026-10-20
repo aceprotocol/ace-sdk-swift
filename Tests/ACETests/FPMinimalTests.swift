@@ -12,8 +12,8 @@ import Testing
 private let fpTranslation = try! ProfileManifest(json: Data(#"{"id":"urn:example:translation:1","messages":[{"type":"urn:example:translation:request:1","schema":{"type":"object","properties":{"text":{"type":"string","maxLength":100}},"required":["text"],"additionalProperties":false}}]}"#.utf8))
 
 /// Alice connects to Bob (public) about `ace:text:1`; Bob accepts explicitly; both pull.
-private func linked(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig: NetworkConfiguration = NetworkConfiguration(visibility: .public),
-                    bob bobConfig: NetworkConfiguration = NetworkConfiguration(visibility: .public)) async throws -> (NetPeer, NetPeer) {
+private func linked(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true),
+                    bob bobConfig: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true)) async throws -> (NetPeer, NetPeer) {
     let alice = try await NetPeer.make(relay, clock: clock, configuration: aliceConfig)
     let bob = try await NetPeer.make(relay, clock: clock, configuration: bobConfig)
     try await alice.network.connect(bob.aceId, profile: "ace:text:1", note: "hello")
@@ -159,7 +159,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
 
     @Test func refreshPermitsRetriedAfterATransientFailure() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await linked(relay, clock, alice: NetworkConfiguration(visibility: .private))
+        let (alice, bob) = try await linked(relay, clock, alice: NetworkConfiguration())
         try alice.identity.delegate(now: clock.now, notAfter: nil)
         relay.withLock { relay.failSend = (503, "internal_error") }
         try await alice.network.maintain()  // the permit push fails once
@@ -216,7 +216,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
     /// else the first shared one.
     @Test func refreshPermitsUsesAProfileThePeerStillLists() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await linked(relay, clock, alice: NetworkConfiguration(profiles: [fpTranslation, .text], visibility: .private))
+        let (alice, bob) = try await linked(relay, clock, alice: NetworkConfiguration(profiles: [fpTranslation, .text]))
         // the recorded profile is installed here, but Bob's descriptor does not list it
         try alice.network.admission.update(bob.aceId) { r in
             var r = r
@@ -234,10 +234,10 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
     /// No profile in common with the peer's current descriptor: the peer is skipped.
     @Test func refreshPermitsSkipsAPeerSharingNoProfile() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await linked(relay, clock, alice: NetworkConfiguration(visibility: .private))
+        let (alice, bob) = try await linked(relay, clock, alice: NetworkConfiguration())
         let reopened = try await NetworkClient.open(identity: alice.identity, store: alice.store, relay: try relay.client(clock: clock.fn),
                                                     prekeys: StorePrekeyVault(store: alice.store),
-                                                    configuration: NetworkConfiguration(profiles: [fpTranslation], visibility: .private),
+                                                    configuration: NetworkConfiguration(profiles: [fpTranslation]),
                                                     receive: false, foreignRelay: { _ in throw ACEError(.blockedAddress) }, clock: clock.fn)
         try alice.identity.delegate(now: clock.now, notAfter: nil)
         let queued = relay.queued(bob.aceId).count
@@ -298,7 +298,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         for _ in 0..<5 {
             let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
             // A host that takes a moment: another pass reaching the message meanwhile finds its hand-over pending.
-            let slow = NetworkConfiguration(visibility: .public, onMessage: { _ in try await Task.sleep(for: .milliseconds(20)) })
+            let slow = NetworkConfiguration(contact: .open, listed: true, onMessage: { _ in try await Task.sleep(for: .milliseconds(20)) })
             let (alice, bob) = try await linked(relay, clock, bob: slow)
             _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "once"])
             let packet = try #require(relay.queued(bob.aceId).last)
@@ -368,7 +368,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
     /// `hold` (no host capacity) stops consuming without counting toward the quarantine.
     @Test func holdDoesNotCountTowardQuarantine() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await linked(relay, clock, bob: NetworkConfiguration(visibility: .public, onMessage: { _ in
+        let (alice, bob) = try await linked(relay, clock, bob: NetworkConfiguration(contact: .open, listed: true, onMessage: { _ in
             throw ACEError(.receiverCapacity)
         }))
         _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "m"])
@@ -447,7 +447,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
     @Test func fetchAttemptsArePersistedAndClearedOnAFinalOutcome() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let failing = LockedValue(true)
-        let (alice, bob) = try await linked(relay, clock, bob: NetworkConfiguration(visibility: .public, onMessage: { _ in
+        let (alice, bob) = try await linked(relay, clock, bob: NetworkConfiguration(contact: .open, listed: true, onMessage: { _ in
             if failing.value { throw ACEError(.storageFailed, "host down") }
         }))
         _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "m"])
@@ -463,10 +463,10 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
     @Test func lookupByHandleAndOnReceipt() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let receipts = LockedValue<[String]>([])
-        let alice = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .public, onReceipt: { from, body, entry in
+        let alice = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(contact: .open, listed: true, onReceipt: { from, body, entry in
             receipts.value.append("\(body["outcome"]?.stringValue ?? "?"):\(entry?.status.rawValue ?? "none")")
         }))
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .public, handle: "bob"))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(handle: "bob", contact: .open, listed: true))
         let host = String(relay.url.dropFirst("https://".count))
         #expect(try await alice.network.lookup("@bob@\(host)").aceId == bob.aceId)
         try await alice.network.connect("@bob@\(host)", profile: "ace:text:1")
@@ -520,7 +520,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
     @Test func hostFailuresUseSpecCodes() async throws {
         struct HostBug: Error {}
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await linked(relay, clock, bob: NetworkConfiguration(visibility: .public, onMessage: { _ in throw HostBug() }))
+        let (alice, bob) = try await linked(relay, clock, bob: NetworkConfiguration(contact: .open, listed: true, onMessage: { _ in throw HostBug() }))
         _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "m"])
         #expect(try await bob.network.pull() == [.retry(.storageFailed)])
         #expect(try await bob.network.pull() == [.retry(.storageFailed)])

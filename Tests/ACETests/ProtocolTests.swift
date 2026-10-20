@@ -163,22 +163,30 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
 
 @Suite struct DocumentTests {
     @Test func descriptorFieldsAndVerification() throws {
-        let a = try TestAgent(visibility: .public)
+        let a = try TestAgent()
         let d = a.agent.descriptor
-        #expect(d.relays == ["https://relay.example"] && d.profiles == [ProfileManifest.text.ref] && d.visibility == .public)
+        #expect(d.relays == ["https://relay.example"] && d.profiles == [ProfileManifest.text.ref])
         let wire = a.agent.source["descriptor"]!.objectValue!
-        #expect(Set(wire.keys) == ["aceId", "issuedAt", "expiresAt", "relays", "prekey", "profiles", "visibility", "card", "signature"])
+        #expect(Set(wire.keys) == ["aceId", "issuedAt", "expiresAt", "relays", "prekey", "profiles", "signature"])
+        #expect(d.expiresAt - d.issuedAt == ACELimits.defaultDescriptorSeconds)
         _ = try verifyPublishedAgent(a.agent.source, now: NOW + 100)
-        expectCode(.invalidAuthorization) { try verifyPublishedAgent(a.agent.source, now: NOW + ACELimits.maxDescriptorSeconds) }
-        // any edit breaks the signature; unknown members are invalid
+        expectCode(.invalidAuthorization) { try verifyPublishedAgent(a.agent.source, now: NOW + ACELimits.defaultDescriptorSeconds) }
+        // any edit breaks the signature; unknown members (the retired visibility, handle and card too) are invalid
         var o = a.agent.source.objectValue!, desc = wire
-        desc["visibility"] = "private"
+        desc["expiresAt"] = .number(Double(NOW + 10))
         o["descriptor"] = .object(desc)
         expectCode(.invalidAuthorization) { try verifyPublishedAgent(.object(o), now: NOW) }
-        desc = wire
-        desc["contact"] = "requests"
-        o["descriptor"] = .object(desc)
-        expectCode(.invalidAuthorization) { try verifyPublishedAgent(.object(o), now: NOW) }
+        for (key, value) in [("visibility", "public"), ("handle", "bob"), ("card", [:]), ("contact", "requests")] as [(String, JSONValue)] {
+            desc = wire
+            desc[key] = value
+            o["descriptor"] = .object(desc)
+            expectCode(.invalidAuthorization, key) { try verifyPublishedAgent(.object(o), now: NOW) }
+        }
+        // the lifetime is at most 7 days
+        let claims = DescriptorClaims(relays: ["https://relay.example"], prekey: d.prekey)
+        let week = try createPublishedAgent(identity: a.identity, claims: claims, now: NOW, lifetime: ACELimits.maxDescriptorSeconds)
+        #expect(week.descriptor.expiresAt == NOW + 604_800)
+        expectCode(.invalidArgument) { try createPublishedAgent(identity: a.identity, claims: claims, now: NOW, lifetime: 604_801) }
     }
 
     @Test func claimRules() throws {
@@ -187,8 +195,6 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
         func make(_ c: DescriptorClaims) throws -> VerifiedAgent { try createPublishedAgent(identity: id, claims: c, now: NOW) }
         expectCode(.invalidAuthorization) { try make(DescriptorClaims(relays: ["http://relay.example"], prekey: prekey)) }
         expectCode(.invalidAuthorization) { try make(DescriptorClaims(relays: ["https://Relay.example/"], prekey: prekey)) }
-        expectCode(.invalidAuthorization) { try make(DescriptorClaims(relays: ["https://r.example"], prekey: prekey, handle: "bob")) }  // private
-        _ = try make(DescriptorClaims(relays: ["https://r.example"], prekey: prekey, visibility: .public, handle: "bob"))
         _ = try createPublishedAgent(identity: id, claims: DescriptorClaims(relays: ["http://127.0.0.1:8080"], prekey: prekey), now: NOW, allowLoopback: true)
         // ext: listed profile, object values, official schemas
         let commerce = ProfileManifest.commerce.ref
@@ -201,7 +207,6 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
             try make(DescriptorClaims(relays: ["https://r.example"], prekey: prekey, profiles: [ProfileManifest.text.ref], ext: ["ace:text:1": [:]]))
         }
         expectCode(.invalidAuthorization) { try make(DescriptorClaims(relays: ["https://r.example"], prekey: prekey, ext: ["urn:x:1": [:]])) }  // not listed
-        expectCode(.invalidAuthorization) { try make(DescriptorClaims(relays: ["https://r.example"], prekey: prekey, card: AgentCard(tags: ["A"]))) }
     }
 
     @Test func delegationsAndErc8004() throws {

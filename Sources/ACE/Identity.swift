@@ -91,6 +91,59 @@ public func checkUsable(_ identity: any ACEIdentity, now: Int) throws -> KelStat
     return state
 }
 
+/// The log steps of an identity, each built and verified in full and returned as the extended state (nothing is stored).
+/// Shared by `KelIdentityCore` and `ExternalRootIdentity`, whose root is supplied per operation and never held.
+package enum KelSteps {
+    /// `state.events + [event]` verified at `now`, or the error.
+    package static func appended(_ state: KelState, _ event: KelEvent, _ now: Int) throws -> KelState {
+        try ACEKel.verify(state.events + [event], now: now)
+    }
+
+    /// `icp` committing `nextDigest` (dated `inceptedAt`, default `ts`), then `dlg` of `signingPublicKey` at `ts`.
+    package static func incept(root: any ACEKeyProvider, nextDigest: Data, signingPublicKey: Data, ts: Int, inceptedAt: Int? = nil) throws -> KelState {
+        let icpTs = inceptedAt ?? ts
+        guard icpTs >= 0, icpTs <= ts else { throw ACEError(.invalidArgument, "the inception must not postdate the delegation") }
+        let icp = try ACEKel.createInception(root: root, nextDigest: nextDigest, ts: icpTs)
+        let st = try ACEKel.verify([icp], now: ts)
+        return try appended(st, try ACEKel.createDelegation(state: st, root: root, keyPublic: signingPublicKey, ts: ts), ts)
+    }
+
+    /// The verified log cut at the start of its current root epoch (its last `icp`/`rot`; later events, possibly a
+    /// thief's, are dropped) and the recovery time `max(now, ts of the epoch start)`.
+    package static func epochStart(_ kel: [KelEvent], now: Int) throws -> (state: KelState, ts: Int) {
+        let full = try ACEKel.verify(kel, now: now)
+        let start = full.events.lastIndex { $0["t"] == .string("icp") || $0["t"] == .string("rot") } ?? 0
+        let events = Array(full.events[...start])
+        let ts = max(now, events[start]["ts"]?.intValue ?? now)
+        return (try ACEKel.verify(events, now: ts), ts)
+    }
+
+    /// `rot` revealing `revealed` (the committed next root, else `invalid_argument`) and committing `nextDigest`, then
+    /// `dlg` of `signingPublicKey` signed by the revealed root (a `rot` revokes the signing delegation).
+    package static func rotate(_ state: KelState, revealed: any ACEKeyProvider, nextDigest: Data, signingPublicKey: Data,
+                               ts: Int) throws -> KelState {
+        try checkCommitted(revealed, state)
+        let st = try appended(state, try ACEKel.createRotation(state: state, newRoot: revealed, nextDigest: nextDigest, ts: ts), ts)
+        return try appended(st, try ACEKel.createDelegation(state: st, root: revealed, keyPublic: signingPublicKey, ts: ts), ts)
+    }
+
+    /// `dlg` of `keyPublic`, signed by the current root.
+    package static func delegate(_ state: KelState, root: any ACEKeyProvider, keyPublic: Data, ts: Int, notAfter: Int?) throws -> KelState {
+        try appended(state, try ACEKel.createDelegation(state: state, root: root, keyPublic: keyPublic, ts: ts, notAfter: notAfter), ts)
+    }
+
+    /// Committing any current or past root, each possibly exposed, is refused (pre-rotation).
+    package static func checkFreshNext(_ digest: Data, current: Data, events: [KelEvent]) throws {
+        var roots: Set<Data> = [keyDigest(publicKey: current)]
+        for ev in events where ev["t"] == "icp" || ev["t"] == "rot" {
+            roots.insert(keyDigest(publicKey: try ACEKel.keyBytes(ev["root"], "root").publicKey))
+        }
+        guard !roots.contains(digest) else {
+            throw ACEError(.invalidArgument, "the next root must differ from every current or past root")
+        }
+    }
+}
+
 /// The KEL state machine of an identity, generic over where its keys live. Every extension of the log is built and
 /// verified in full before any field changes (all-or-nothing).
 package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
@@ -125,10 +178,8 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
         let ts = try identityNow(now)
         let root = try makeKey(), signing = try makeKey()
         let (nextRoot, digest) = try newNextRoot(digestIn, current: root, events: [], makeKey: makeKey)
-        let icp = try ACEKel.createInception(root: root, nextDigest: digest, ts: ts)
-        let st = try ACEKel.verify([icp], now: ts)
-        let d1 = try ACEKel.createDelegation(state: st, root: root, keyPublic: signing.publicKey(), ts: ts)
-        return try KelIdentityCore(root: root, nextRoot: nextRoot, signing: signing, kel: [icp, d1], now: ts, makeKey: makeKey)
+        let st = try KelSteps.incept(root: root, nextDigest: digest, signingPublicKey: signing.publicKey(), ts: ts)
+        return try KelIdentityCore(root: root, nextRoot: nextRoot, signing: signing, kel: st.events, now: ts, makeKey: makeKey)
     }
 
     /// From a verified log and its committed next root (held outside the lost device), fork the log at the start of
@@ -138,16 +189,11 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
                                 makeKey: @escaping MakeKey) throws -> KelIdentityCore {
         let digestIn = try checkNextDigest(nextRootDigest)
         let nowTs = try identityNow(now)
-        let full = try ACEKel.verify(kel, now: nowTs)
-        let start = full.events.lastIndex { $0["t"] == .string("icp") || $0["t"] == .string("rot") } ?? 0
-        let events = Array(full.events[...start])
-        let ts = max(nowTs, events[start]["ts"]?.intValue ?? nowTs)
-        let state = try ACEKel.verify(events, now: ts)
+        let (state, ts) = try KelSteps.epochStart(kel, now: nowTs)
         try checkCommitted(nextRoot, state)
-        let (newNext, digest) = try newNextRoot(digestIn, current: nextRoot, events: events, makeKey: makeKey)
+        let (newNext, digest) = try newNextRoot(digestIn, current: nextRoot, events: state.events, makeKey: makeKey)
         let signing = try makeKey()
-        var st = try appended(state, try ACEKel.createRotation(state: state, newRoot: nextRoot, nextDigest: digest, ts: ts), ts)
-        st = try appended(st, try ACEKel.createDelegation(state: st, root: nextRoot, keyPublic: signing.publicKey(), ts: ts), ts)
+        let st = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: digest, signingPublicKey: signing.publicKey(), ts: ts)
         return try KelIdentityCore(root: nextRoot, nextRoot: newNext, signing: signing, kel: st.events, now: ts, makeKey: makeKey)
     }
 
@@ -161,13 +207,7 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
             let k = try makeKey()
             (next, digest) = (k, keyDigest(publicKey: k.publicKey()))
         }
-        var roots: Set<Data> = [keyDigest(publicKey: current.publicKey())]
-        for ev in events where ev["t"] == "icp" || ev["t"] == "rot" {
-            roots.insert(keyDigest(publicKey: try ACEKel.keyBytes(ev["root"], "root").publicKey))
-        }
-        guard !roots.contains(digest) else {
-            throw ACEError(.invalidArgument, "the next root must differ from every current or past root")
-        }
+        try KelSteps.checkFreshNext(digest, current: current.publicKey(), events: events)
         return (next, digest)
     }
 
@@ -197,11 +237,6 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
         return (seq, try key.sign(try message(seq), action: action))
     }
 
-    /// `state.events + [event]` verified at `now`, or the error; nothing changes here.
-    private static func appended(_ state: KelState, _ event: KelEvent, _ now: Int) throws -> KelState {
-        try ACEKel.verify(state.events + [event], now: now)
-    }
-
     /// rot, then dlg of the same signing key. `revealed` is a committed next root held outside the identity; only
     /// `SoftwareIdentity` passes one.
     package func rotate(now: Int?, nextRootDigest: Data?, revealed: Key? = nil) throws {
@@ -219,9 +254,7 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
             let digestIn = try checkNextDigest(nextRootDigest)
             let ts = try identityNow(now)
             let (newNext, digest) = try Self.newNextRoot(digestIn, current: next, events: c.state.events, makeKey: c.makeKey)
-            var st = try Self.appended(c.state, try ACEKel.createRotation(state: c.state, newRoot: next, nextDigest: digest, ts: ts), ts)
-            st = try Self.appended(st, try ACEKel.createDelegation(state: st, root: next, keyPublic: c.signing.publicKey(), ts: ts), ts)
-            c.state = st
+            c.state = try KelSteps.rotate(c.state, revealed: next, nextDigest: digest, signingPublicKey: c.signing.publicKey(), ts: ts)
             c.root = next
             c.nextRoot = newNext
         }
@@ -232,8 +265,7 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
         try withLock { c in
             let ts = try identityNow(now)
             let key = try c.makeKey()
-            let ev = try ACEKel.createDelegation(state: c.state, root: c.root, keyPublic: key.publicKey(), ts: ts, notAfter: notAfter)
-            c.state = try Self.appended(c.state, ev, ts)
+            c.state = try KelSteps.delegate(c.state, root: c.root, keyPublic: key.publicKey(), ts: ts, notAfter: notAfter)
             c.signing = key
         }
     }

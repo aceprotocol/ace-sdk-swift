@@ -76,7 +76,7 @@ import Testing
         let prekey = try StorePrekeyVault(store: MemoryStore()).rotate(now: now).prekey
         return try createPublishedAgent(identity: try makeIdentity(now: now), claims: DescriptorClaims(
             relays: ["https://relay.example"], prekey: prekey, profiles: [ProfileRef(id: "x:deep:1", digest: String(repeating: "a", count: 64))],
-            visibility: .public, ext: ["x:deep:1": nest(levels)]), now: now)
+            ext: ["x:deep:1": nest(levels)]), now: now)
     }
 
     /// A PublishedAgent's depth counts from its own root (as sdk-ts and the relay), not from `ext`.
@@ -212,7 +212,7 @@ import Testing
         struct HostBug: Error, CustomStringConvertible { var description: String { String(repeating: "x", count: 2000) } }
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .public, onMessage: { m in
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(contact: .open, listed: true, onMessage: { m in
             if m.content.type == "ace:text:1" { throw HostBug() }
         }))
         try await alice.network.connect(bob.aceId, profile: "ace:text:1", note: "hello")

@@ -300,7 +300,8 @@ package actor Inbox {
         // 2. admission
         let record = try network.admission.get(packet.from)
         guard let record else {
-            guard network.configuration.visibility == .public else { throw ACEError(.notPermitted, "stranger to a private agent") }
+            // 05 § Flow: strangers only while this identity's published card record is `open` (no record is `closed`).
+            guard try network.publishedContact() == .open else { throw ACEError(.notPermitted, "sender is not admitted") }
             return try await contactCandidate(packet, record: nil)
         }
         guard record.state != .blocked else { throw ACEError(.notPermitted, "blocked sender") }
@@ -321,8 +322,8 @@ package actor Inbox {
                 lastRefresh[packet.from] = nil  // a failed refresh does not suppress the next attempt
                 throw e
             } catch {
-                // A permanent failure (e.g. a private peer after a signing-key change, whose earlier permits no longer
-                // resolve its descriptor): the packet continues only as a contact candidate checked against the pin.
+                // A permanent failure (e.g. a peer after a signing-key change that has not republished its descriptor
+                // yet): the packet continues only as a contact candidate checked against the pin.
                 return try await contactCandidate(packet, record: record)
             }
             if packet.signature.seq > (state.signing?.seq ?? -1) { return try await contactCandidate(packet, record: record) }
@@ -528,7 +529,7 @@ package actor Inbox {
 
     /// The contact-candidate path: no pinned KEL, so only an `ace:contact:1` packet is processed, authenticated by its
     /// embedded `source` (1, 2, 5, 6, 7, 8, authenticate by `source`, 9, 10, ack). A stranger (`record` nil,
-    /// public agents only) may only send `request` and is never pinned; a peer already in the table (e.g. pending) may send
+    /// `open` agents only) may only send `request` and is never pinned; a peer already in the table (e.g. pending) may send
     /// any kind. Every failure is a silent drop.
     private func contactCandidate(_ packet: Packet, record: AdmissionRecord?) async throws -> ReceiveOutcome {
         let stranger = record == nil

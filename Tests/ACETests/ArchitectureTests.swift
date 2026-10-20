@@ -32,7 +32,7 @@ import Testing
     @Test func acceptRefreshesAnExpiredSourceWithTheRequesterPermit() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .private))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration())
         let first = try await bob.network.publish()
         clock.now = first.descriptor.expiresAt - 3601  // publish still reuses it (more than an hour left)
         try await bob.network.connect(alice.aceId, profile: "ace:text:1")

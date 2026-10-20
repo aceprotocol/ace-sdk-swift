@@ -119,13 +119,16 @@ public actor PeerStore {
 
     /// Pin (or extend the pin to) a KEL under the fork rules, without a descriptor. A held descriptor is bound to the KEL
     /// state it was verified under: when the pin advances it is dropped (refreshed on next use).
+    /// `then` runs with the resulting state still under the `peers` lock, before the pin is written, so state derived from
+    /// it is written atomically with it (throwing there leaves the pin as it was).
     @discardableResult
-    public func pin(kel: [KelEvent]) throws -> PeerAdoption {
+    public func pin(kel: [KelEvent], then: (@Sendable (KelState) throws -> Void)? = nil) throws -> PeerAdoption {
         try store.withLock("peers") {
             let now = try unixNow(clock)
             let candidate = try ACEKel.verify(kel, now: now)
             let old = try load(candidate.aceId)
             let (state, outcome) = try ACEKel.extend(pinned: old?.state, verified: candidate)
+            try then?(state)
             let agent = old?.state.lastHash == state.lastHash ? old?.agent : nil
             try write(state.aceId, state: state, agent: agent?.source, fetchedAt: max(now, old?.fetchedAt ?? 0))
             return PeerAdoption(state: state, outcome: outcome)
