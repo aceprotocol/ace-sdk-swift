@@ -631,6 +631,9 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     var handle: String?
     if let h = r["handle"] {
         guard let s = h.stringValue, isHandle(s) else { throw unauthorized("handle must match [a-z][a-z0-9_-]{2,31}") }
+        guard URLComponents(string: home)?.path.isEmpty ?? false else {
+            throw unauthorized("a handle needs a home without a path (it resolves at https://host)")
+        }
         handle = s
     }
     let card = try AgentCard(r["card"])
