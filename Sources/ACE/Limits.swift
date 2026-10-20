@@ -25,7 +25,8 @@ public enum ACELimits {
     public static let maxKelEvents = 256
     /// Longest `dlg` signing-key lifetime, `notAfter - ts` (366 days, 01 rule 4).
     public static let maxSigningKeyLifetime = 31_622_400
-    public static let maxDescriptorSeconds = 86_400
+    /// Longest descriptor lifetime (`expiresAt - issuedAt`, 7 days).
+    public static let maxDescriptorSeconds = 604_800
     public static let maxCredentialSeconds = 604_800
     public static let maxPermitSeconds = 2_592_000
     /// A receipt carries a fresh permit when the peer's permit has less than this left (15 days).
@@ -33,6 +34,10 @@ public enum ACELimits {
     /// Superseded prekeys a vault keeps.
     public static let maxPrekeys = 16
     public static let maxExtBytes = 4096
+    /// Canonical JSON of a card record (04 § Card record).
+    public static let maxCardRecordBytes = 16_384
+    /// Entries of a card record `pay`.
+    public static let maxPayAccounts = 8
     public static let maxNoteBytes = 512
     /// `limit` maximum of inbox and directory pages; the default inbox `limit`.
     public static let maxInboxPage = 100
@@ -58,6 +63,8 @@ public enum ACELimits {
     // SDK constants.
     /// The reference prekey rotation period.
     public static let prekeyRotationSeconds = 86_400
+    /// The reference descriptor lifetime (the default `lifetime`; at most `maxDescriptorSeconds`).
+    public static let defaultDescriptorSeconds = 86_400
     public static let kemSeedSize = 32
     public static let kemPublicKeySize = 1216
     public static let kemCiphertextSize = 1120

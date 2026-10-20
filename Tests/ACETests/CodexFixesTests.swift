@@ -43,7 +43,7 @@ private func queue(_ from: NetPeer, to peer: NetPeer, _ text: String) async thro
     return try await from.network.outbox.deliver(e.messageId, via: from.network)
 }
 
-private let commerceConfig = NetworkConfiguration(profiles: [.text, .commerce], acceptProfiles: [ProfileManifest.commerce.id], visibility: .public)
+private let commerceConfig = NetworkConfiguration(profiles: [.text, .commerce], acceptProfiles: [ProfileManifest.commerce.id], contact: .open, listed: true)
 
 /// A commerce seller on `store`, admitted by `buyer` (auto-accept); `open` starts (or restarts) its process.
 private struct Seller {
@@ -83,7 +83,7 @@ private func buyer(_ relay: FakeRelay, _ clock: TestClock) async throws -> NetPe
         let (alice, bob) = try await connectedText(relay, clock)
         let attacker = try TestAgent(now: clock.now)
         let forged = try createPublishedAgent(identity: bob.identity, claims: DescriptorClaims(
-            relays: [relay.url], prekey: attacker.agent.descriptor.prekey, profiles: [ProfileManifest.text.ref], visibility: .public),
+            relays: [relay.url], prekey: attacker.agent.descriptor.prekey, profiles: [ProfileManifest.text.ref]),
             now: clock.now + ACELimits.timestampWindowSeconds)
         try await alice.network.importAgent(forged.source)
         try bob.identity.delegate(now: clock.now, notAfter: nil)
@@ -131,7 +131,7 @@ private func buyer(_ relay: FakeRelay, _ clock: TestClock) async throws -> NetPe
         let store = MemoryStore()
         let identity = try makeIdentity(now: clock.now)
         let alice = try await NetworkClient.open(identity: identity, store: store, relay: try relay.client(clock: clock.fn),
-                                                 prekeys: StorePrekeyVault(store: store), configuration: NetworkConfiguration(visibility: .public),
+                                                 prekeys: StorePrekeyVault(store: store), configuration: NetworkConfiguration(contact: .open, listed: true),
                                                  foreignRelay: { url in
             try RelayClient(baseURL: URL(string: url)!, session: stubSession(), timeout: 5, maxResponseBytes: 1 << 20, clock: clock.fn, sleeper: { _ in })
         }, clock: clock.fn)
@@ -145,7 +145,7 @@ private func buyer(_ relay: FakeRelay, _ clock: TestClock) async throws -> NetPe
         // the old key names the attacker's relay, then the holder rotates and the pin advances
         let current = try #require(try await alice.peers.agent(bob.aceId))
         let forged = try createPublishedAgent(identity: bob.identity, claims: DescriptorClaims(
-            relays: ["https://\(evil)"], prekey: current.descriptor.prekey, profiles: [ProfileManifest.text.ref], visibility: .public),
+            relays: ["https://\(evil)"], prekey: current.descriptor.prekey, profiles: [ProfileManifest.text.ref]),
             now: clock.now + 1)
         try await alice.importAgent(forged.source)
         try bob.identity.delegate(now: clock.now, notAfter: nil)
@@ -248,7 +248,7 @@ private func buyer(_ relay: FakeRelay, _ clock: TestClock) async throws -> NetPe
         let store = MemoryStore()
         let identity = try makeIdentity(now: clock.now)
         let alice = try await NetworkClient.open(identity: identity, store: store, relay: try relay.client(clock: clock.fn),
-                                                 prekeys: StorePrekeyVault(store: store), configuration: NetworkConfiguration(visibility: .public),
+                                                 prekeys: StorePrekeyVault(store: store), configuration: NetworkConfiguration(contact: .open, listed: true),
                                                  foreignRelay: { url in
             try RelayClient(baseURL: URL(string: url)!, session: stubSession(), timeout: 5, maxResponseBytes: 1 << 20, clock: clock.fn, sleeper: { _ in })
         }, clock: clock.fn)
@@ -263,7 +263,7 @@ private func buyer(_ relay: FakeRelay, _ clock: TestClock) async throws -> NetPe
         try bob.identity.delegate(now: clock.now, notAfter: nil)
         let current = try createPublishedAgent(identity: bob.identity, claims: DescriptorClaims(
             relays: ["https://\(host)"], prekey: try #require(try await alice.peers.agent(bob.aceId)).descriptor.prekey,
-            profiles: [ProfileManifest.text.ref], visibility: .public), now: clock.now + 1)
+            profiles: [ProfileManifest.text.ref]), now: clock.now + 1)
         try await alice.importAgent(current.source)
         await #expect(throws: ACEError.self) { try await alice.agent(bob.aceId, refresh: true) }
         _ = try? await alice.send(to: bob.aceId, type: "ace:text:1", body: ["message": "hi"])

@@ -44,7 +44,7 @@ func genIdentity(_ dir: String, now: Int) throws {
     let identity = try SoftwareIdentity.generate(now: now)
     let prekey = try vault(dir).rotate(now: now).prekey
     let agent = try createPublishedAgent(identity: identity, claims: DescriptorClaims(
-        relays: [relayRoute], prekey: prekey, profiles: [ProfileManifest.text.ref], visibility: .public, card: AgentCard()),
+        relays: [relayRoute], prekey: prekey, profiles: [ProfileManifest.text.ref]),
         now: now, lifetime: 86_400)
     let export = try identity.exportPrivateKey().jsonData()
     FileManager.default.createFile(atPath: path(dir, "identity.json"), contents: export, attributes: [.posixPermissions: 0o600])

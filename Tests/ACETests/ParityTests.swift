@@ -67,13 +67,13 @@ import Testing
         await expectCodeAsync(.invalidArgument) { try await relay.send(packet, permit: other) }
     }
 
-    @Test func anonymousLookupsArePublic() async throws {
-        let hidden = try TestAgent(now: NOW, visibility: .private)
-        let relay = try makeRelay({ _, _ in .json(200, hidden.agent.source) }, clock: { NOW })
-        await expectCodeAsync(.relayProtocolError) { try await relay.descriptor(hidden.aceId) }
-        let open = try TestAgent(now: NOW)
-        let relay2 = try makeRelay({ _, _ in .json(200, open.agent.source) }, clock: { NOW })
-        #expect(try await relay2.descriptor(open.aceId).aceId == open.aceId)
+    /// `GET /v1/descriptor` serves any registered identity's descriptor (no visibility); one of another identity is
+    /// `relay_protocol_error`.
+    @Test func anonymousLookupsServeAnyDescriptor() async throws {
+        let open = try TestAgent(now: NOW), other = try TestAgent(now: NOW)
+        let relay = try makeRelay({ _, _ in .json(200, open.agent.source) }, clock: { NOW })
+        #expect(try await relay.descriptor(open.aceId).aceId == open.aceId)
+        await expectCodeAsync(.relayProtocolError) { try await relay.descriptor(other.aceId) }
     }
 
     @Test func profileRuleCodesArePermanentOutcomeCodes() {
@@ -110,17 +110,18 @@ import Testing
         #expect(try await alice.network.outbox.entries().isEmpty)
     }
 
-    /// `createInvitation` (permit + own descriptor) lets one peer reach a private agent; `importInvitation` pins the
+    /// `createInvitation` (permit + own descriptor) lets one peer reach a `closed` agent; `importInvitation` pins the
     /// inviter and holds the permit but never admits it.
-    @Test func invitationsReachAPrivateAgent() async throws {
+    @Test func invitationsReachAClosedAgent() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let carol = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .private))
+        let carol = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration())
         let bob = try await NetPeer.make(relay, clock: clock)
         let invitation = try await carol.network.createInvitation(peer: bob.aceId)
         #expect(Set(invitation.jsonValue.objectValue!.keys) == ["agent", "permit"])
         #expect(try carol.network.admission.get(bob.aceId)?.state == .admitted)
         let inviter = try await bob.network.importInvitation(invitation)
-        #expect(inviter.aceId == carol.aceId && inviter.descriptor.visibility == .private)
+        #expect(inviter.aceId == carol.aceId)
+        #expect(try await bob.network.lookupCard(carol.aceId).record.contact == .closed)
         #expect(try bob.network.admission.get(carol.aceId) == nil)  // never admits
         #expect(try bob.network.admission.heldPermit(carol.aceId)?["subject"]?.stringValue == bob.aceId)
         await expectCodeAsync(.invalidAuthorization) {  // a permit for someone else is refused

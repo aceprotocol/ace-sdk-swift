@@ -293,6 +293,27 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
         }
     }
 
+    // MARK: card records
+
+    @Test func cardRecordsValid() throws {
+        #expect(V["version"]!.i >= 10)
+        for c in V["cardRecords"]!["valid"]!.a {
+            let v = try verifyCardBundle(c["bundle"]!, now: c["now"]!.i)
+            let r = v.record
+            let got: JSONValue = [
+                "aceId": .string(v.aceId), "home": .string(r.home), "handle": r.handle.map { .string($0) } ?? .null,
+                "pay": r.pay.map { .array($0.map { .string($0) }) } ?? .null, "contact": .string(r.contact.rawValue), "listed": .bool(r.listed),
+            ]
+            #expect(got == c["expect"]!, "\(label(c))")
+        }
+    }
+
+    @Test func cardRecordsInvalid() {
+        for c in V["cardRecords"]!["invalid"]!.a {
+            #expect(codeOf { _ = try verifyCardBundle(c["bundle"]!, now: c["now"]!.i) } == expected(c), "\(label(c))")
+        }
+    }
+
     @Test func delegationPermitAndErc8004() throws {
         for c in V["delegation"]!["cases"]!.a {
             var got: String?
@@ -466,8 +487,9 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
                 return .json(200, ["ok": true] as JSONValue)
             }, clock: clock.fn)
             let network = try await NetworkClient.open(identity: try identity(c["receiver"]!.s), store: store, relay: relay, prekeys: vectorVault,
-                                                       configuration: NetworkConfiguration(visibility: c["public"] == true ? .public : .private),
+                                                       configuration: NetworkConfiguration(contact: c["contact"]!.s == "open" ? .open : .closed),
                                                        foreignRelay: { _ in relay }, clock: clock.fn, capacity: c["capacity"]!.i)
+            if c["contact"]!.s == "open" { try await network.publish() }  // its own card record is open
             for (_, source) in c["admitted"]!.o {
                 let agent = try await network.peers.adopt(source: source)
                 try network.admission.update(agent.aceId) { _ in AdmissionRecord(aceId: agent.aceId, state: .admitted, updatedAt: 0) }

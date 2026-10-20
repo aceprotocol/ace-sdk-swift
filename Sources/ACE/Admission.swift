@@ -3,7 +3,7 @@
 //  ACE SDK
 //
 //  The durable admission table (05): per peer `pending` / `admitted` / `blocked` and the newest permit we issued to it;
-//  the one held permit per issuer (issued to us: used to send to it and to resolve its descriptor), kept apart from
+//  the one held permit per issuer (issued to us: used to send to it), kept apart from
 //  admission; the block records registered at our relays; and the held incoming contact requests awaiting a local
 //  decision. Lock `admission`.
 //

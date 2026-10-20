@@ -39,6 +39,8 @@ public struct ACEError: Error, CustomStringConvertible, Sendable, Equatable {
         case blockedAddress = "blocked_address"
         case deliveryRejected = "delivery_rejected"
         case expired = "expired"
+        /// No rollback of descriptors and card records (04, 07).
+        case staleDescriptor = "stale_descriptor"
         // permanent: commerce profile rule codes (profiles/commerce.md § Check order)
         case transitionNotAllowed = "transition_not_allowed"
         case wrongRole = "wrong_role"

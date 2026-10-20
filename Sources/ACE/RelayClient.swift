@@ -2,14 +2,15 @@
 //  RelayClient.swift
 //  ACE SDK
 //
-//  HTTP client for the relay binding (07-relay).
+//  HTTP client for the relay binding (07-relay): opaque packets, descriptors, card records, blocks, inbox.
 //
 
 import Foundation
 
 /// Relay HTTP client (07 § Client rules). Authenticated calls sign the `X-ACE-*` headers (real timestamp, fresh nonce,
 /// this relay's canonical URL as the audience). A 409 replay retries once with a fresh nonce. Redirects are never followed. Every
-/// PublishedAgent the relay returns is verified (`verifyPublishedAgent`) before it is handed out.
+/// PublishedAgent and CardBundle the relay returns is verified (`verifyPublishedAgent`, `verifyCardBundle`) before it is
+/// handed out.
 ///
 /// Error mapping (first match): 1xx / 3xx / unexpected 2xx / ≥ 600 → `relay_protocol_error`; 408, 5xx →
 /// `relay_unavailable`; any 429 → `relay_unavailable` (honoring `Retry-After`); 403
@@ -19,7 +20,7 @@ public actor RelayClient {
     /// A response or SSE `data` as a whole: its deepest wrapper, an inbox page, holds packets at depth 3 (02 § JSON values).
     private static let responseDepth = ACELimits.maxJSONDepth + 3
 
-    /// A packet or PublishedAgent inside a response is within `MAX_JSON_DEPTH` on its own (02 § JSON values); otherwise the
+    /// A packet, PublishedAgent or CardBundle inside a response is within `MAX_JSON_DEPTH` on its own (02 § JSON values); otherwise the
     /// whole response is `relay_protocol_error`, never a dropped entry.
     private static func contained(_ value: JSONValue) throws {
         try checkJSONValue(value, code: .relayProtocolError)
@@ -254,33 +255,48 @@ public actor RelayClient {
         return agent
     }
 
-    /// `GET /v1/descriptor/{aceId}`: the public descriptor (`unknown_peer` otherwise). An anonymous lookup that returns a
-    /// private descriptor is `relay_protocol_error`.
+    /// `GET /v1/descriptor/{aceId}`: anonymous; the unexpired descriptor of any registered identity (`unknown_peer`
+    /// otherwise).
     public func descriptor(_ aceId: String) async throws -> VerifiedAgent {
         guard isACEId(aceId) else { throw ACEError(.invalidArgument, "invalid ACE ID") }
-        let a = try agent(try await call("GET", "/v1/descriptor/" + aceId), aceId)
-        guard a.descriptor.visibility == .public else { throw ACEError(.relayProtocolError, "anonymous lookup returned a private descriptor") }
-        return a
+        return try agent(try await call("GET", "/v1/descriptor/" + aceId), aceId)
     }
 
-    /// `POST /v1/descriptor/resolve {aceId, permit}` with a permit issued by `aceId`; also private descriptors.
-    public func resolve(_ aceId: String, permit: JSONValue) async throws -> VerifiedAgent {
+    /// `POST /v1/card`: publish this identity's CardBundle (verified first; its KEL must equal the registered KEL and the
+    /// handle is set once, else the relay refuses it).
+    public func publishCard(_ bundle: CardBundle) async throws {
+        _ = try verifyCardBundle(bundle, now: try unixNow(clock), allowLoopback: allowLoopbackRelays)
+        _ = try await call("POST", "/v1/card", body: try bundle.jsonData())
+    }
+
+    /// A served CardBundle, verified (its ACEError passes through, as in sdk-ts); a record of another identity than
+    /// `aceId` is `relay_protocol_error`.
+    private func cardBundle(_ value: JSONValue, _ aceId: String?) throws -> CardBundle {
+        try Self.contained(value)
+        let v = try verifyCardBundle(value, now: try unixNow(clock), allowLoopback: allowLoopbackRelays)
+        guard aceId == nil || v.aceId == aceId else { throw ACEError(.relayProtocolError, "card record identity mismatch") }
+        return v.bundle
+    }
+
+    /// `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity (`unknown_peer` otherwise).
+    public func card(_ aceId: String) async throws -> CardBundle {
         guard isACEId(aceId) else { throw ACEError(.invalidArgument, "invalid ACE ID") }
-        let body: JSONValue = ["aceId": .string(aceId), "permit": permit]
-        return try agent(try await call("POST", "/v1/descriptor/resolve", body: try body.jsonData()), aceId)
+        return try cardBundle(try await call("GET", "/v1/card/" + aceId), aceId)
     }
 
-    /// `GET /v1/handles/{handle}`; the result is public, holds the handle and names this relay as `relays[0]`.
-    public func handle(_ name: String) async throws -> VerifiedAgent {
+    /// `GET /v1/handles/{handle}`: the card record of the identity the handle is bound to at this relay. A record whose
+    /// `home` is not this relay or whose `handle` differs is `unknown_peer` (04 § Card record).
+    public func handle(_ name: String) async throws -> CardBundle {
         guard isHandle(name) else { throw ACEError(.invalidArgument, "invalid handle") }
-        let a = try agent(try await call("GET", "/v1/handles/" + name), nil)
-        guard a.descriptor.visibility == .public, a.descriptor.handle == name, a.descriptor.relays.first == baseURLString else {
-            throw ACEError(.relayProtocolError, "handle authority mismatch")
+        let bundle = try cardBundle(try await call("GET", "/v1/handles/" + name), nil)
+        guard bundle["card"]?["home"]?.stringValue == baseURLString, bundle["card"]?["handle"]?.stringValue == name else {
+            throw ACEError(.unknownPeer, "the record does not hold this handle at this relay")
         }
-        return a
+        return bundle
     }
 
-    /// `GET /v1/descriptors`: the public directory, optionally only agents listing `profile`.
+    /// `GET /v1/descriptors`: the public directory (identities whose card record is listed), optionally only agents
+    /// listing `profile`.
     public func directory(profile: String? = nil, cursor: String? = nil, limit: Int = ACELimits.defaultPageLimit) async throws -> DirectoryPage {
         guard (1...ACELimits.maxInboxPage).contains(limit) else { throw ACEError(.invalidArgument, "limit must be 1...\(ACELimits.maxInboxPage)") }
         var query = [("limit", String(limit))]
@@ -292,8 +308,8 @@ public actor RelayClient {
         for v in list {
             try Self.contained(v)
             guard let a = try? agent(v, nil) else { rejected += 1; continue }  // does not verify: dropped
-            // The directory lists public descriptors only, filtered by the exact profile ID when one was requested.
-            guard a.descriptor.visibility == .public, profile.map({ p in a.descriptor.profiles.contains { $0.id == p } }) ?? true else {
+            // Filtered by the exact profile ID when one was requested.
+            guard profile.map({ p in a.descriptor.profiles.contains { $0.id == p } }) ?? true else {
                 throw ACEError(.relayProtocolError, "directory entry does not match the query")
             }
             agents.append(a)

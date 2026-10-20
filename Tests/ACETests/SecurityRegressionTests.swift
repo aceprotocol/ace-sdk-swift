@@ -86,7 +86,7 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
     @Test func automaticAcceptNeverOverridesBlock() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(acceptProfiles: ["ace:text:1"], visibility: .public))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(acceptProfiles: ["ace:text:1"], contact: .open, listed: true))
         let aliceAgent = try await alice.network.publish()
         try await bob.network.block(alice.aceId)
         let permit = try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now)
@@ -109,7 +109,7 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
     @Test func acceptNeverClearsABlock() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .public))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(contact: .open, listed: true))
         let aliceAgent = try await alice.network.publish()
         let permit = try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now)
         try await bob.network.receivedContact(from: alice.aceId, body: ["kind": "request", "profile": "ace:text:1", "note": "",
@@ -131,7 +131,7 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
     @Test(arguments: [false, true]) func concurrentBlockAndAcceptNeverEndAdmitted(blockFirst: Bool) async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .public))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(contact: .open, listed: true))
         let aliceAgent = try await alice.network.publish()
         let permit = try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now)
         try await bob.network.receivedContact(from: alice.aceId, body: ["kind": "request", "profile": "ace:text:1", "note": "",
@@ -166,7 +166,7 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
         #expect(r.count == 2 && u.count == 1 && r[0] < u[0] && u[0] < r[1], "register \(r), unregister \(u)")
     }
 
-    /// A permit is presented only to relays its issuer named in a signed descriptor.
+    /// A refresh never presents a permit (descriptors are served to anyone; the resolve endpoint is gone).
     @Test func refreshWithoutPinPresentsNoPermit() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
@@ -184,8 +184,8 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
     @Test func handleHostIsMatchedExactly() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)
-        _ = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(visibility: .public, handle: "bobby"))
-        #expect(try await alice.network.lookup("@bobby@\(relay.host)").descriptor.handle == "bobby")
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(handle: "bobby", contact: .open, listed: true))
+        #expect(try await alice.network.lookup("@bobby@\(relay.host)").aceId == bob.aceId)
         let prefix = String(relay.host.dropLast(".test".count))
         await expectCodeAsync(.blockedAddress) { try await alice.network.lookup("@bobby@\(prefix)") }
     }

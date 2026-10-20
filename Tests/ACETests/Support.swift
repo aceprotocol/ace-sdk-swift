@@ -109,12 +109,12 @@ struct TestAgent {
     let vault: StorePrekeyVault
     let agent: VerifiedAgent
 
-    init(now: Int = NOW, profiles: [ProfileManifest] = [.text], visibility: Visibility = .public, relay: String = "https://relay.example") throws {
+    init(now: Int = NOW, profiles: [ProfileManifest] = [.text], relay: String = "https://relay.example") throws {
         identity = try makeIdentity(now: now)
         vault = StorePrekeyVault(store: MemoryStore())
         let prekey = try vault.rotate(now: now).prekey
         agent = try createPublishedAgent(identity: identity, claims: DescriptorClaims(
-            relays: [relay], prekey: prekey, profiles: profiles.map(\.ref), visibility: visibility), now: now)
+            relays: [relay], prekey: prekey, profiles: profiles.map(\.ref)), now: now)
     }
 
     var aceId: String { identity.getACEId() }
@@ -128,7 +128,7 @@ struct NetPeer {
     let network: NetworkClient
     let received: LockedValue<[ReceivedMessage]>
 
-    static func make(_ relay: FakeRelay, clock: TestClock, configuration: NetworkConfiguration = NetworkConfiguration(visibility: .public),
+    static func make(_ relay: FakeRelay, clock: TestClock, configuration: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true),
                      capacity: Int = ACELimits.defaultReplayCapacity,
                      rules: (String, MemoryStore) -> [any ProfileRules] = { _, _ in [] }) async throws -> NetPeer {
         let identity = try makeIdentity(now: clock.now)

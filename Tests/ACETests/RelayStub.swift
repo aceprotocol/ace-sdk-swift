@@ -137,6 +137,10 @@ final class FakeRelay: @unchecked Sendable {
     private let clock: @Sendable () -> Int
     private var kels: [String: KelState] = [:]
     private var agents: [String: VerifiedAgent] = [:]
+    /// Stored card bundles by ACE ID.
+    private var cards: [String: JSONValue] = [:]
+    /// Handle bindings (permanent, set once per identity).
+    private var handles: [String: String] = [:]
     private var queues: [String: [(id: String, packet: Data)]] = [:]
     private var blocks: [String: [String: (blocked: Bool, revision: Int)]] = [:]
     private var wakes: [String: (gateway: String, token: String)] = [:]
@@ -173,6 +177,21 @@ final class FakeRelay: @unchecked Sendable {
     func wake(_ aceId: String) -> (gateway: String, token: String)? { withLock { wakes[aceId] } }
     func registered(_ aceId: String) -> KelState? { withLock { kels[aceId] } }
     func sendCount(to aceId: String) -> Int { withLock { sends.filter { $0 == aceId }.count } }
+    /// The stored card bundle of `aceId`.
+    func card(_ aceId: String) -> JSONValue? { withLock { cards[aceId] } }
+    /// Store `bundle` as `aceId`'s card record as is (a relay that skips the 07 checks).
+    func setCard(_ aceId: String, _ bundle: JSONValue) { withLock { cards[aceId] = bundle } }
+    /// Bind `handle` to `aceId` as is.
+    func bindHandle(_ handle: String, to aceId: String) { withLock { handles[handle] = aceId } }
+    func handleOwner(_ handle: String) -> String? { withLock { handles[handle] } }
+
+    /// The unexpired descriptor of a registered identity.
+    private func live(_ aceId: String, now: Int) -> VerifiedAgent? {
+        guard kels[aceId] != nil, let a = agents[aceId], now < a.descriptor.expiresAt else { return nil }
+        return a
+    }
+
+    private func handleOf(_ aceId: String) -> String? { handles.first { $0.value == aceId }?.key }
 
     private func err(_ status: Int, _ code: String) -> StubResponse { .json(status, ["error": .string(code)] as JSONValue) }
     private let ok = StubResponse.json(200, ["ok": true] as JSONValue)
@@ -200,11 +219,26 @@ final class FakeRelay: @unchecked Sendable {
                 if let old = agents[a.aceId], old.descriptor.issuedAt >= a.descriptor.issuedAt, old.source != a.source { return err(409, "stale_descriptor") }
                 agents[a.aceId] = a
                 return ok
-            case ("POST", "/v1/descriptor/resolve"):
-                guard let id = body?["aceId"]?.stringValue, let a = agents[id], now < a.descriptor.expiresAt, let permit = body?["permit"],
-                      let p = try? verifyPermit(permit, issuer: kels[id] ?? a.state, subject: permit["subject"]?.stringValue ?? "", now: now),
-                      blocks[id]?[p.subject]?.blocked != true else { return err(404, "unknown_peer") }
-                return .json(200, a.source)
+            case ("POST", "/v1/card"):
+                guard let body, let v = try? verifyCardBundle(body, now: now) else { return err(401, "invalid_authorization") }
+                let r = v.record
+                guard let registered = kels[r.aceId] else { return err(403, "not_registered") }
+                guard registered.lastHash == v.state.lastHash else { return err(409, "kel_conflict") }
+                if let old = cards[r.aceId]?["card"], let oldAt = old["issuedAt"]?.wireInt,
+                   oldAt > r.issuedAt || (oldAt == r.issuedAt && (try? documentDigest(old)) != (try? documentDigest(r.value))) {
+                    return err(409, "stale_descriptor")
+                }
+                // 07: a handle is set once per identity and never reassigned; a record naming another home claims nothing here.
+                if r.home == url {
+                    if let bound = handleOf(r.aceId) {
+                        guard r.handle == bound else { return err(400, "invalid_argument") }
+                    } else if let h = r.handle {
+                        guard handles[h] == nil else { return err(409, "handle_taken") }
+                        handles[h] = r.aceId
+                    }
+                }
+                cards[r.aceId] = body
+                return ok
             case ("POST", "/v1/blocks"):
                 guard let peer = body?["peer"]?.stringValue, let b = body?["blocked"]?.boolValue, let rev = body?["revision"]?.wireInt,
                       let caller = authed(headers, .block(peer: peer, blocked: b, revision: rev), now: now) else { return err(401, "invalid_signature") }
@@ -232,7 +266,9 @@ final class FakeRelay: @unchecked Sendable {
                 if let permit = body?["permit"] {
                     guard (try? verifyPermit(permit, issuer: kels[packet.to]!, subject: packet.from, now: now)) != nil else { return err(403, "not_permitted") }
                 } else {
-                    guard agents[packet.to]?.descriptor.visibility == .public else { return err(403, "not_permitted") }
+                    guard cards[packet.to]?["card"]?["contact"]?.stringValue == "open", live(packet.to, now: now) != nil else {
+                        return err(403, "not_permitted")
+                    }
                 }
                 seq += 1
                 queues[packet.to, default: []].append(("\(seq)-0", bytes))
@@ -255,18 +291,24 @@ final class FakeRelay: @unchecked Sendable {
             default:
                 if method == "GET", path.hasPrefix("/v1/descriptor/") {
                     let id = String(path.dropFirst("/v1/descriptor/".count))
-                    guard let a = agents[id], a.descriptor.visibility == .public, now < a.descriptor.expiresAt else { return err(404, "unknown_peer") }
+                    guard let a = live(id, now: now) else { return err(404, "unknown_peer") }
                     return .json(200, a.source)
+                }
+                if method == "GET", path.hasPrefix("/v1/card/") {
+                    let id = String(path.dropFirst("/v1/card/".count))
+                    guard kels[id] != nil, let c = cards[id] else { return err(404, "unknown_peer") }
+                    return .json(200, c)
                 }
                 if method == "GET", path.hasPrefix("/v1/handles/") {
                     let h = String(path.dropFirst("/v1/handles/".count))
-                    guard let a = agents.values.first(where: { $0.descriptor.handle == h && $0.descriptor.visibility == .public }) else {
+                    guard let owner = handles[h], kels[owner] != nil, let c = cards[owner], c["card"]?["home"]?.stringValue == url else {
                         return err(404, "unknown_peer")
                     }
-                    return .json(200, a.source)
+                    return .json(200, c)
                 }
                 if method == "GET", path == "/v1/descriptors" {
-                    let list = agents.values.filter { $0.descriptor.visibility == .public }.sorted { $0.aceId < $1.aceId }
+                    let list = agents.values.filter { cards[$0.aceId]?["card"]?["listed"] == true && live($0.aceId, now: now) != nil }
+                        .sorted { $0.aceId < $1.aceId }
                     return .json(200, ["agents": .array(list.map(\.source)), "cursor": .null] as JSONValue)
                 }
                 return err(404, "not_found")
