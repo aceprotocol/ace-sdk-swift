@@ -226,16 +226,62 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         await late.close()
     }
 
-    @Test func corruptCardPinIsStorageFailed() async throws {
+    @Test func lookupCardFallsBackToTheBundleKelWhenNoLiveDescriptor() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(handle: "alice", pay: [SOL], contact: .open))
+        // Alice is offline past her descriptor's lifetime: the relay serves her card record but no descriptor.
+        clock.now += 8 * 86_400
+        await expectCodeAsync(.unknownPeer) { try await relay.client(clock: clock.fn).descriptor(alice.aceId) }
+        for target in [alice.aceId, "@alice@\(relay.host)"] {
+            let bob = try await peer(relay, clock)
+            let v = try await bob.network.lookupCard(target)
+            #expect(v.kelLive == false)
+            #expect(v.aceId == alice.aceId && v.record.handle == "alice" && v.record.pay == [SOL])
+            // The bundle's KEL is pinned, under the same rules as a descriptor's.
+            #expect(try await bob.network.peers.pinned(alice.aceId)?.lastHash == (try ACEKel.verify(alice.identity.getKel(), now: clock.now)).lastHash)
+            // The card pin still applies: a rollback is refused.
+            relay.setCard(alice.aceId, try card(alice, home: relay.url, handle: "alice", contact: .closed, now: v.record.issuedAt - 1))
+            await expectCodeAsync(.staleDescriptor) { try await bob.network.lookupCard(target) }
+            relay.setCard(alice.aceId, v.bundle)
+        }
+        // Any other descriptor failure (here an unreachable relay) still fails the lookup, pinning nothing.
+        let carol = try await peer(relay, clock)
+        relay.withLock { relay.down = ["/v1/descriptor/\(alice.aceId)"] }
+        do {
+            _ = try await carol.network.lookupCard(alice.aceId)
+            Issue.record("expected a failure")
+        } catch let e as ACEError {
+            #expect(e.code != .unknownPeer, "\(e)")
+        }
+        #expect(try await carol.network.peers.pinned(alice.aceId) == nil)
+    }
+
+    @Test func kelLiveIsTrueWithALiveDescriptor() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await peer(relay, clock, contact: .open, handle: "alice")
         let bob = try await peer(relay, clock)
-        _ = try await bob.network.lookupCard(alice.aceId)
-        // A damaged pin is a storage failure, never "no pin" (which would accept a rollback).
-        try bob.store.checkedWrite("network/handles/\(sha256Hex(Data(alice.aceId.utf8))).json", Data("not json".utf8))
-        await expectCodeAsync(.storageFailed) { try await bob.network.lookupCard(alice.aceId) }
-        try bob.store.checkedWrite("network/handles/\(sha256Hex(Data(alice.aceId.utf8))).json", Data("[]".utf8))
-        await expectCodeAsync(.storageFailed) { try await bob.network.lookupCard(alice.aceId) }
+        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == true)
+        let carol = try await peer(relay, clock)
+        #expect(try await carol.network.lookupCard("@alice@\(relay.host)").kelLive == true)
+    }
+
+    @Test func unparseablePinIsStorageFailed() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        let bob = try await peer(relay, clock)
+        _ = try await bob.network.lookupCard("@alice@\(relay.host)")
+        // A damaged pin is a storage failure, never "no pin" (which would accept a rollback or a rebinding).
+        let cardPin = "network/handles/\(sha256Hex(Data(alice.aceId.utf8))).json"
+        let ownerPin = "network/handle-owners/\(sha256Hex(Data("\(relay.url) alice".utf8))).json"
+        for key in [cardPin, ownerPin] {
+            let good = try #require(try bob.store.read(key))
+            for bad in ["not json", "[]", "null", "\"x\""] {
+                try bob.store.checkedWrite(key, Data(bad.utf8))
+                await expectCodeAsync(.storageFailed) { try await bob.network.lookupCard("@alice@\(relay.host)") }
+            }
+            try bob.store.checkedWrite(key, good)
+        }
+        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").aceId == alice.aceId)
     }
 
     @Test func aNewDlgReSignsTheCardAtUpkeep() async throws {

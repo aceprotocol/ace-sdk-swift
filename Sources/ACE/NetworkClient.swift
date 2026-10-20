@@ -322,22 +322,46 @@ public actor NetworkClient: PacketTransport {
     /// naming the same home with another or no handle is `invalid_authorization` (a new home re-pins). A handle's first
     /// resolution pins its ACE ID; a later resolution to another one is `invalid_authorization`. Without a KEL pin for the
     /// identity, its descriptor is looked up first and its KEL pinned, so the card is verified under the current KEL, never
-    /// one a relay chose.
+    /// one a relay chose. When the identity has no live descriptor (`unknown_peer`: offline past its lifetime), the card is
+    /// verified under the bundle's own KEL instead, that KEL is pinned as a descriptor's would be, and the result has
+    /// `kelLive` false (04 § Card record).
     public func lookupCard(_ target: String) async throws -> VerifiedCard {
         if isACEId(target) {
-            _ = try await pinKel(target) { try await self.agent(target) }
-            return try await checkCard(try await fetchCard(target))
+            let (kelLive, fetched) = try await pinCardKel(target, { try await self.agent(target) }, { try await self.fetchCard(target) })
+            let bundle: CardBundle
+            if let fetched { bundle = fetched } else { bundle = try await fetchCard(target) }
+            return try await checkCard(bundle, kelLive: kelLive)
         }
         let (bundle, url, handle) = try await cardByHandle(target)
         let id = bundle["card"]?["aceId"]?.stringValue ?? ""
-        _ = try await pinKel(id) { try await self.adoptFetched(try await self.onRoutes([url]) { try await $0.descriptor(id) }) }
-        return try await checkCard(bundle, resolved: (home: url, handle: handle))
+        let (kelLive, _) = try await pinCardKel(id, { try await self.adoptFetched(try await self.onRoutes([url]) { try await $0.descriptor(id) }) },
+                                                { bundle })
+        return try await checkCard(bundle, resolved: (home: url, handle: handle), kelLive: kelLive)
     }
 
     /// When `aceId` has no KEL pin, pin it through `fetch` (a descriptor lookup) and return what it fetched; else nil.
     private func pinKel(_ aceId: String, _ fetch: () async throws -> VerifiedAgent) async throws -> VerifiedAgent? {
         guard isACEId(aceId), try await peers.pinned(aceId) == nil else { return nil }
         return try await fetch()
+    }
+
+    /// `pinKel` for a card lookup. Only when the descriptor lookup finds none (`unknown_peer`) does the card's own bundle
+    /// (`card`) pin the KEL: the bundle is verified, its KEL adopted under the fork rules, and the bundle returned with
+    /// false. Every other failure propagates.
+    private func pinCardKel(_ aceId: String, _ fetch: () async throws -> VerifiedAgent,
+                            _ card: () async throws -> CardBundle) async throws -> (Bool, CardBundle?) {
+        do {
+            _ = try await pinKel(aceId, fetch)
+            return (true, nil)
+        } catch let e as ACEError where e.code == .unknownPeer {}
+        let bundle = try await card()
+        let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays,
+                                     pinned: try await peers.pinned(aceId))
+        guard v.aceId == aceId else { throw ACEError(.invalidAuthorization, "the card record names another identity") }
+        let pinned = try await peers.pin(kel: v.state.events)
+        // As for a descriptor: another path advanced the pin past the state the card verified under.
+        guard pinned.state.lastHash == v.state.lastHash else { throw ACEError(.stalePeerBinding, "the pin advanced past the card record") }
+        return (false, bundle)
     }
 
     private static func cardPinKey(_ aceId: String) -> String { "network/handles/\(sha256Hex(Data(aceId.utf8))).json" }
@@ -358,7 +382,7 @@ public actor NetworkClient: PacketTransport {
     /// Verify a fetched card record against the identity's KEL pin and its card pin `{home, handle?, issuedAt, digest}`
     /// (written on first sight, only after full verification): no rollback first, then the set-once handle per home. A
     /// record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
-    private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil) async throws -> VerifiedCard {
+    private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil, kelLive: Bool = true) async throws -> VerifiedCard {
         let id = bundle["card"]?["aceId"]?.stringValue ?? ""
         let pinned = isACEId(id) ? try await peers.pinned(id) : nil
         let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays, pinned: pinned)
@@ -377,7 +401,9 @@ public actor NetworkClient: PacketTransport {
                 try store.checkedWrite(ownerKey, try pin.jsonData())
             }
         }
-        return v
+        var out = v
+        out.kelLive = kelLive
+        return out
     }
 
     /// The card pin checks and update of `checkCard`, under the `network-handles` lock.

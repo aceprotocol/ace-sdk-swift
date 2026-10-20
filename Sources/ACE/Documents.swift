@@ -568,6 +568,10 @@ public struct VerifiedCard: Sendable, Equatable {
     public let record: CardRecord
     /// `{kel, card}` exactly as signed.
     public let bundle: CardBundle
+    /// Whether the KEL it verified under was confirmed by a live descriptor or an existing pin (`lookupCard`); false when
+    /// only the bundle's own KEL vouches for it, as from `verifyCardBundle` alone or a lookup of an identity with no live
+    /// descriptor (04 § Card record).
+    public internal(set) var kelLive = false
 
     public var aceId: String { record.aceId }
 }
