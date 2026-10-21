@@ -184,13 +184,22 @@ public actor PeerStore {
         let pinned = try load(aceId)?.state
         let agent = try verifyPublishedAgent(source, now: now, allowLoopback: allowLoopback, pinned: pinned,
                                              delegationPins: try delegationPins(for: source))
+        if let kept = try adoptOrUsable(agent) { return kept }
+        return try load(aceId)?.agent ?? agent
+    }
+
+    /// `adopt(_:live:)`, except that a refused older revision (`stale_peer_binding`) falls back to the held descriptor
+    /// while it is usable (unexpired and bound to the current pins), returned; nil when `agent` was adopted (04 § Caching).
+    /// Without a usable held descriptor the refusal stands.
+    @discardableResult
+    package func adoptOrUsable(_ agent: VerifiedAgent, live: Bool = false) throws -> VerifiedAgent? {
         do {
-            try adopt(agent)
+            try adopt(agent, live: live)
+            return nil
         } catch let e as ACEError where e.code == .stalePeerBinding {
-            guard let kept = try usableAgent(aceId) else { throw e }
+            guard let kept = try usableAgent(agent.aceId) else { throw e }
             return kept
         }
-        return try load(aceId)?.agent ?? agent
     }
 
     /// Adopt a verified agent's KEL and descriptor under lock `peers`. The KEL is reconciled with the pin (fork rules) and
@@ -221,7 +230,8 @@ public actor PeerStore {
                     throw ACEError(.stalePeerBinding, "descriptor revision rolled back")
                 }
                 if previous.descriptor.issuedAt == agent.descriptor.issuedAt {
-                    guard try previous.source["descriptor"]?.jsonData() == agent.source["descriptor"]?.jsonData() else {
+                    // identical claims: the signatures may differ (ML-DSA signing is randomized)
+                    guard try documentDigest(previous.source["descriptor"] ?? .null) == documentDigest(agent.source["descriptor"] ?? .null) else {
                         throw ACEError(.stalePeerBinding, "conflicting descriptor revision")
                     }
                     kept = previous.source

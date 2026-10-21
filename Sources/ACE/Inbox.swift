@@ -369,7 +369,8 @@ package actor Inbox {
             if content.type == CoreTypes.contact {
                 let pins = try await network.peers.delegationPins(for: content.body["source"] ?? .null)
                 let checked = try checkContact(packet, content.body, record: record, pinned: state, delegationPins: pins, now: now)
-                try await network.peers.adopt(checked)  // an admitted peer's newer KEL may be pinned
+                // an admitted peer's newer KEL may be pinned; an older source falls back to the held descriptor (04 § Caching)
+                try await network.peers.adoptOrUsable(checked)
                 source = checked
             }
             // 10. busy-thread check, then the profile rules (08 § Sender state and busy threads)
@@ -563,7 +564,7 @@ package actor Inbox {
         } catch let e as ACEError where e.category == .permanent {
             return .dropped(e.code)
         }
-        if !stranger { try await network.peers.adopt(source) }
+        if !stranger { try await network.peers.adoptOrUsable(source) }
         try await network.receivedContact(from: packet.from, body: content.body, source: source)
         try commitSeen(packet.messageId, from: packet.from, timestamp: packet.timestamp, now: now)
         return .delivered(ReceivedMessage(from: packet.from, to: packet.to, messageId: packet.messageId, timestamp: packet.timestamp, content: content))

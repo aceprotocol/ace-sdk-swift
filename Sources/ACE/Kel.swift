@@ -191,32 +191,37 @@ public enum ACEKel {
     /// admission): verification is a pure function of the log and `now`, and only the future bound
     /// `ts <= now + TIMESTAMP_WINDOW_SECONDS` depends on `now`, so a hit re-checks that bound alone and costs no signature
     /// verification. A log extending a cached one (a pin plus new events) re-checks the whole structure but verifies only
-    /// the new events' signatures.
+    /// the new events' signatures. Only a log usable at `now` is cached: an unusable one can authenticate nothing, so
+    /// caching it would only let a sender fill the cache.
     public static func verify(_ events: [KelEvent], now: Int) throws -> KelState {
-        let keys = prefixKeys(events)
+        let prefixes = prefixKeys(events)
         var resume: KelState?
-        if let keys {
+        if let keys = prefixes?.keys {
             if let hit = VerifiedKelCache.shared.get(keys[keys.count - 1]), hit.lastTs <= now + ACELimits.timestampWindowSeconds { return hit.state }
             for k in keys.dropLast().reversed() {
                 if let hit = VerifiedKelCache.shared.get(k) { resume = hit.state; break }
             }
         }
         let state = try verifyUncached(events, now: now, resume: resume)
-        if let keys { VerifiedKelCache.shared.put(keys[keys.count - 1], state: state, lastTs: events.last.flatMap { wireInt($0["ts"]) } ?? 0) }
+        if let (keys, bytes) = prefixes, isUsable(state, now: now) {
+            VerifiedKelCache.shared.put(keys[keys.count - 1], state: state, lastTs: events.last.flatMap { wireInt($0["ts"]) } ?? 0, bytes: bytes)
+        }
         return state
     }
 
     /// Chained content keys: `keys[i]` is the SHA-256 over `keys[i-1]` and the canonical JSON of event `i` (its `sig`
-    /// included), so it identifies the exact prefix `events[0...i]`. Nil for an empty or oversized log.
-    private static func prefixKeys(_ events: [KelEvent]) -> [String]? {
+    /// included), so it identifies the exact prefix `events[0...i]`; `bytes` is the size of that canonical JSON. Nil for
+    /// an empty or oversized log.
+    static func prefixKeys(_ events: [KelEvent]) -> (keys: [String], bytes: Int)? {
         guard (1...ACELimits.maxKelEvents).contains(events.count) else { return nil }
-        var keys: [String] = []
+        var keys: [String] = [], bytes = 0
         keys.reserveCapacity(events.count)
         for ev in events {
             guard let d = try? JSONValue.object(ev).jsonData() else { return nil }
             keys.append(sha256Hex(Data((keys.last ?? "").utf8) + d))
+            bytes += d.count
         }
-        return keys
+        return (keys, bytes)
     }
 
     /// `resume`: a verified state of a prefix of `events` (same content, signatures included); its signatures are not
@@ -318,25 +323,38 @@ public enum ACEKel {
     }
 }
 
-/// A bounded, process-wide memo of verified KELs (see `ACEKel.verify`).
-private final class VerifiedKelCache: @unchecked Sendable {
-    static let shared = VerifiedKelCache()
-    private static let capacity = 256
+/// A bounded, process-wide memo of verified KELs (see `ACEKel.verify`): at most `capacity` logs and `budget` bytes of
+/// their canonical JSON, the oldest evicted first.
+package final class VerifiedKelCache: @unchecked Sendable {
+    static let shared = VerifiedKelCache(capacity: 256, budget: 16 << 20)
+    private let capacity: Int, budget: Int
     private let lock = NSLock()
-    private var entries: [String: (state: KelState, lastTs: Int)] = [:]
+    private var entries: [String: (state: KelState, lastTs: Int, bytes: Int)] = [:]
     private var order: [String] = []
+    private var total = 0
+
+    package init(capacity: Int, budget: Int) {
+        self.capacity = capacity
+        self.budget = budget
+    }
+
+    /// The number of cached logs and their bytes.
+    package var usage: (count: Int, bytes: Int) { lock.withLock { (entries.count, total) } }
 
     func get(_ key: String) -> (state: KelState, lastTs: Int)? {
         lock.lock(); defer { lock.unlock() }
-        return entries[key]
+        return entries[key].map { ($0.state, $0.lastTs) }
     }
 
-    func put(_ key: String, state: KelState, lastTs: Int) {
+    /// A log larger than the whole budget is not cached.
+    package func put(_ key: String, state: KelState, lastTs: Int, bytes: Int) {
         lock.lock(); defer { lock.unlock() }
-        if entries[key] == nil {
-            order.append(key)
-            if order.count > Self.capacity { entries[order.removeFirst()] = nil }
+        guard bytes <= budget else { return }
+        if let old = entries[key] { total -= old.bytes } else { order.append(key) }
+        entries[key] = (state, lastTs, bytes)
+        total += bytes
+        while order.count > capacity || total > budget {
+            total -= entries.removeValue(forKey: order.removeFirst())?.bytes ?? 0
         }
-        entries[key] = (state, lastTs)
     }
 }

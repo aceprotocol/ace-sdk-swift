@@ -277,6 +277,17 @@ public func checkStrangerSource(_ source: JSONValue) throws {
     }
 }
 
+/// The closed shape of a delegation entry, part of a descriptor's shape (04 § Verification step 1, before any KEL or
+/// signature work): `{kel: array, credential: {issuer: ACE ID, subject: string, issuedAt, expiresAt: wire integers,
+/// signature: operational signature shape}}`. The entry's rules (04 § Delegations) are checked in step 4.
+private func isDelegationEntryShape(_ entry: JSONValue) -> Bool {
+    guard let e = entry.objectValue, hasMembers(e, ["kel", "credential"]), e["kel"]?.arrayValue != nil,
+          let c = e["credential"]?.objectValue, hasMembers(c, ["issuer", "subject", "issuedAt", "expiresAt", "signature"]),
+          let issuer = c["issuer"]?.stringValue, isACEId(issuer), c["subject"]?.stringValue != nil,
+          c["issuedAt"]?.wireInt != nil, c["expiresAt"]?.wireInt != nil, SignatureEnvelope(operational: c["signature"]) != nil else { return false }
+    return true
+}
+
 /// The verifier's pins for the delegation issuers `source` names, read through `pin` (01 § Pinning).
 package func delegationPins(_ source: JSONValue, pin: (String) throws -> KelState?) throws -> [String: KelState] {
     var pins: [String: KelState] = [:]
@@ -468,7 +479,8 @@ private func carriedKel(_ kel: JSONValue?, aceId: String, pinned: KelState?, now
     guard state.aceId == aceId else { throw unauthorized("kel does not derive aceId") }
     if let pinned {
         state = try ACEKel.extend(pinned: pinned, events: state.events, now: now).state
-        guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "pinned identity has no live signing delegation") }
+        // 01 § Operational signatures rule 5: the signer, after reconciliation with the pin, is usable at `now`.
+        guard ACEKel.isUsable(state, now: now) else { throw ACEError(.stalePeerBinding, "pinned identity has no live signing delegation") }
     }
     return state
 }
@@ -514,7 +526,7 @@ package func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: 
     if let raw = d["delegations"] {
         guard let items = raw.arrayValue, (1...4).contains(items.count) else { throw unauthorized("delegations must hold 1-4 entries") }
         let issuers = items.map { $0["credential"]?["issuer"]?.stringValue ?? "" }
-        guard Set(issuers).count == issuers.count, items.allSatisfy({ $0.objectValue.map { hasMembers($0, ["kel", "credential"]) } ?? false }) else {
+        guard Set(issuers).count == issuers.count, items.allSatisfy(isDelegationEntryShape) else {
             throw unauthorized("delegations must be {kel, credential} with distinct issuers")
         }
         delegationItems = items
@@ -633,7 +645,7 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     }
     guard let r = o["card"]?.objectValue,
           hasMembers(r, ["aceId", "issuedAt", "home", "card", "contact", "listed", "signature"], optional: ["handle", "pay"]),
-          let aceId = r["aceId"]?.stringValue, isACEId(aceId) else {
+          let aceId = r["aceId"]?.stringValue, isACEId(aceId), let signature = SignatureEnvelope(operational: r["signature"]) else {
         throw unauthorized("invalid card record shape")
     }
     guard let recordSize = try? JSONValue.object(r).jsonData().count, recordSize <= ACELimits.maxCardRecordBytes else {
@@ -666,7 +678,6 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     guard let listed = r["listed"]?.boolValue else { throw unauthorized("listed must be a boolean") }
     let state = try carriedKel(o["kel"], aceId: aceId, pinned: pinned, now: now)
     try verifyDocument(r, state: state, action: "card-record", now: now)
-    guard let signature = SignatureEnvelope(operational: r["signature"]) else { throw unauthorized("card-record signature is malformed") }
     let record = CardRecord(aceId: aceId, issuedAt: issuedAt, home: home, handle: handle, card: card, pay: pay, contact: contact,
                             listed: listed, signature: signature, value: .object(r))
     return VerifiedCard(state: state, record: record, bundle: value)

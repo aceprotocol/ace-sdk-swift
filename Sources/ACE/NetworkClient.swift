@@ -323,7 +323,8 @@ public actor NetworkClient: PacketTransport {
         let id = Self.aceId(of: bundle)
         // The descriptor first: it pins or advances the KEL (live), so the card verifies under the current KEL.
         let agent = try await fetchAgent(id, routes: [url])
-        return (agent, try await checkCard(bundle, resolved: (home: url, handle: handle)))
+        // The pin's own `kelLive`: a relay replaying an older revision confirms nothing (as `lookupCard`).
+        return (agent, try await checkCard(bundle, resolved: (home: url, handle: handle), kelLive: try await peers.kelLive(id)))
     }
 
     /// The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
@@ -416,7 +417,7 @@ public actor NetworkClient: PacketTransport {
     /// Verify a fetched card record against the identity's KEL pin and its card pin `{home, handle?, handles, issuedAt, digest}`
     /// (written on first sight, only after full verification): no rollback first, then the set-once handle per home. A
     /// record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
-    private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil, kelLive: Bool = true) async throws -> VerifiedCard {
+    private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil, kelLive: Bool) async throws -> VerifiedCard {
         let id = Self.aceId(of: bundle)
         let pinned = isACEId(id) ? try await peers.pinned(id) : nil
         let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays, pinned: pinned)
@@ -522,13 +523,7 @@ public actor NetworkClient: PacketTransport {
     /// Pin a fetched descriptor. An older revision refused under the same KEL never stands in for the cached one: that
     /// one is returned only while usable (unexpired and bound to the current pins), else `stale_peer_binding`.
     private func adoptFetched(_ agent: VerifiedAgent) async throws -> VerifiedAgent {
-        do {
-            try await peers.adopt(agent, live: true)
-        } catch let e as ACEError where e.code == .stalePeerBinding {
-            guard let kept = try await peers.usableAgent(agent.aceId) else { throw e }
-            return kept
-        }
-        return agent
+        try await peers.adoptOrUsable(agent, live: true) ?? agent
     }
 
     // MARK: Invitations (05 § Invitations)
@@ -755,8 +750,8 @@ public actor NetworkClient: PacketTransport {
         if try admission.get(request.from)?.state == .blocked { throw ACEError(.notPermitted, "blocked peer") }
         let agent: VerifiedAgent
         if let fresh {
-            try await peers.adopt(fresh)
-            agent = fresh
+            // A source older than the held descriptor never replaces it: the held one is answered while usable (04 § Caching).
+            agent = try await peers.adoptOrUsable(fresh) ?? fresh
         } else {
             agent = try await refreshExpiredSource(request, now: now)
         }
@@ -887,7 +882,7 @@ public actor NetworkClient: PacketTransport {
             // Only a peer held as pending for this profile (unexpired), or already admitted (the answer to a permit refresh,
             // which only replaces the held permit); nothing is pinned otherwise.
             guard let r = try admission.get(from), r.acceptsReply(profile: profile) else { return }
-            try await peers.adopt(source)
+            try await peers.adoptOrUsable(source)
             let expected = r.state
             if let permit = body["permit"] { try await holdTheirPermit(permit, from: from) { $0?.state == expected } }
             try admission.update(from) { r in
