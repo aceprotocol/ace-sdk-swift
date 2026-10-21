@@ -64,9 +64,8 @@ public actor RelayClient {
     public nonisolated let allowLoopbackRelays: Bool
     /// The blocked-address policy (07 § Client rules) runs before every connection: set for relays named by peers.
     private let checksAddresses: Bool
+    /// The host's session (never invalidated by the client); unused when `checksAddresses`.
     let session: URLSession
-    /// `session` was made by this client (`foreign`), which invalidates it on deinit; a host's session is never touched.
-    let ownsSession: Bool
     /// `listen`'s own session (see `init`); created on first use.
     private var streamSession: URLSession?
     private let timeout: TimeInterval
@@ -126,18 +125,10 @@ public actor RelayClient {
         guard isRelayRoute(normalized, allowLoopback: allowLoopbackRelays) else {
             throw ACEError(.invalidArgument, "a peer's relay must be a canonical https relay URL")
         }
-        let config = URLSessionConfiguration.ephemeral
-        config.httpCookieStorage = nil
-        config.httpShouldSetCookies = false
-        config.urlCredentialStorage = nil
-        config.urlCache = nil
-        // URLRequest.timeoutInterval is an idle timeout; the resource timeout is the whole-request deadline (sdk-ts
-        // pinned-https, sdk-py `_net`), which URLSession otherwise leaves at 7 days.
-        config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = timeout
-        return try RelayClient(baseURL: URL(string: normalized)!, session: URLSession(configuration: config), timeout: timeout,
+        // Every request goes through `PinnedRelayTransport` (its own connection and whole-request deadline): no URLSession.
+        return try RelayClient(baseURL: URL(string: normalized)!, session: .shared, timeout: timeout,
                                maxResponseBytes: ACELimits.maxPageBytes, clock: clock, sleeper: taskSleeper, store: nil,
-                               allowLoopbackRelays: allowLoopbackRelays, checksAddresses: true, ownsSession: true)
+                               allowLoopbackRelays: allowLoopbackRelays, checksAddresses: true)
     }
 
     /// The production backoff sleeper: `Task.sleep`, which a cancelled task interrupts.
@@ -146,7 +137,7 @@ public actor RelayClient {
     init(
         baseURL: URL, session: URLSession, timeout: TimeInterval, maxResponseBytes: Int,
         clock: @escaping @Sendable () -> Int, sleeper: @escaping @Sendable (Double) async throws -> Void,
-        store: (any ACEStore)? = nil, allowLoopbackRelays: Bool = false, checksAddresses: Bool = false, ownsSession: Bool = false
+        store: (any ACEStore)? = nil, allowLoopbackRelays: Bool = false, checksAddresses: Bool = false
     ) throws {
         let normalized = try normalizeRelayURL(baseURL.absoluteString)
         guard isRelayRoute(normalized, allowLoopback: allowLoopbackRelays), let url = URL(string: normalized) else {
@@ -163,7 +154,6 @@ public actor RelayClient {
         self.registrationStore = store
         self.allowLoopbackRelays = allowLoopbackRelays
         self.checksAddresses = checksAddresses
-        self.ownsSession = ownsSession
     }
 
     /// The next strictly increasing registration-ordering timestamp, at least `floor` (persisted when a store is set).
@@ -186,10 +176,9 @@ public actor RelayClient {
         }
     }
 
-    /// Every session this client made is invalidated (a URLSession lives until invalidated).
+    /// The session this client made is invalidated (a URLSession lives until invalidated).
     deinit {
         streamSession?.finishTasksAndInvalidate()
-        if ownsSession { session.finishTasksAndInvalidate() }
     }
 
     /// The session `listen` connects with (see `init`).
@@ -684,10 +673,13 @@ final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable {
 /// single 409 `replay` retry happens before this mapping.
 ///
 /// `relayCode` is the body's `error` string (at most 64 characters) and the message is
-/// `relay HTTP <status>[ <relayCode>][: <message, at most 500 characters>]` (sdk-py `_map_relay_response`).
+/// `relay HTTP <status>[ <relayCode>][: <message, at most 500 characters>]` (sdk-py `_map_relay_response`). Both relay
+/// strings are untrusted: control characters are removed before they enter the error (no forged log lines).
 func relayError(status: Int, retryAfter: String?, body: Data) -> ACEError {
     let obj = (try? JSONParser.parse(body))?.objectValue
-    func prefix(_ s: String, _ n: Int) -> String { String(String.UnicodeScalarView(s.unicodeScalars.prefix(n))) }
+    func prefix(_ s: String, _ n: Int) -> String {
+        String(String.UnicodeScalarView(s.unicodeScalars.lazy.filter { !isControlScalar($0) }.prefix(n)))
+    }
     let relayCode = obj?["error"]?.stringValue.map { prefix($0, 64) }
     let detail = relayCode == nil ? nil : obj?["message"]?.stringValue.map { prefix($0, 500) }
     var message = "relay HTTP \(status)"

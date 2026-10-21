@@ -113,7 +113,7 @@ private func readPinned(_ bytes: RelayResponseBytes) async throws -> Data {
         }
         #expect(server.connections.value.isEmpty)
         await expectCodeAsync(.blockedAddress) {
-            _ = try await PinnedRelayTransport.open(pinnedRequest(port: port), allowLoopback: false,
+            _ = try await PinnedRelayTransport.open(pinnedRequest(port: port, tls: true), allowLoopback: false,
                 timeout: 1, streaming: false, resolver: { _ in ["127.0.0.1"] })
         }
     }

@@ -15,8 +15,10 @@ import Darwin
 ///   with no group or other permission bits (`storage_failed` otherwise). Directories the store creates, intermediate
 ///   ones above the root included, are 0700.
 /// - Reads refuse symlinks and files larger than 64 MiB.
-/// - Writes go to `<dir>/.tmp-<16 hex>` (`O_CREAT|O_EXCL|O_NOFOLLOW`), are fsynced, renamed
-///   over the key and the directory is fsynced.
+/// - Writes go to `<dir>/.tmp-<16 hex>` (`O_CREAT|O_EXCL|O_NOFOLLOW`), are synced, renamed
+///   over the key and the directory is synced. A sync is `F_FULLFSYNC` (macOS `fsync` does not flush the drive's
+///   cache), falling back to `fsync` on a filesystem that does not support it.
+/// - `list(prefix:)` takes `""`, a key, or a key followed by `/` (`invalid_argument` otherwise, `locks/` included).
 /// - Locks use POSIX flock over permanent files on a local filesystem. The kernel releases
 ///   them on process exit. Never unlink or replace lock files; network mounts are unsupported.
 public final class FileStore: ACEStore, @unchecked Sendable {
@@ -135,7 +137,7 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         do {
             defer { close(fd) }
             try writeAll(fd, value, key: key)
-            guard fsync(fd) == 0 else { throw posixError("fsync", key) }
+            guard fullSync(fd) == 0 else { throw posixError("fsync", key) }
         }
         guard rename(tmp, p) == 0 else { throw posixError("rename", key) }
         ok = true
@@ -152,6 +154,8 @@ public final class FileStore: ACEStore, @unchecked Sendable {
     }
 
     public func list(prefix: String) throws -> [String] {
+        // Validated like a key, so a prefix never walks outside the store (`../`) or into `locks/`.
+        if !prefix.isEmpty { try validateDataKey(prefix.hasSuffix("/") ? String(prefix.dropLast()) : prefix) }
         var out: [String] = []
         // Walk only the directory that can contain the prefix.
         let slash = prefix.lastIndex(of: "/")
@@ -265,6 +269,11 @@ public final class FileStore: ACEStore, @unchecked Sendable {
         let fd = open(dir, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { throw posixError("open", dir) }
         defer { close(fd) }
-        guard fsync(fd) == 0 else { throw posixError("fsync", dir) }
+        guard fullSync(fd) == 0 else { throw posixError("fsync", dir) }
     }
+}
+
+/// `F_FULLFSYNC` (flushes the drive's write cache too), else `fsync`.
+func fullSync(_ fd: Int32) -> Int32 {
+    fcntl(fd, F_FULLFSYNC) == 0 ? 0 : fsync(fd)
 }

@@ -153,15 +153,11 @@ import Testing
 
     // MARK: Foreign relay clients
 
-    /// A foreign relay's session has a whole-request deadline (`timeoutIntervalForResource = timeout`, as sdk-ts and
-    /// sdk-py), not URLSession's 7-day default, and the client owns (and so invalidates) it.
-    @Test func foreignRelayRequestsHaveATotalDeadline() async throws {
+    /// A foreign relay client makes no URLSession: every request goes through `PinnedRelayTransport`, whose deadline
+    /// covers the whole request.
+    @Test func foreignRelayClientMakesNoSession() async throws {
         let relay = try RelayClient.foreign("https://relay.example", timeout: 7)
-        let config = await relay.session.configuration
-        #expect(config.timeoutIntervalForResource == 7 && config.timeoutIntervalForRequest == 7)
-        #expect(await relay.ownsSession)
-        let hosted = try RelayClient(baseURL: URL(string: "https://relay.example")!, session: stubSession())
-        #expect(await !hosted.ownsSession)
+        #expect(await relay.session === URLSession.shared)
     }
 
     // MARK: FileStore permissions

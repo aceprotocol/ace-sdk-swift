@@ -215,4 +215,52 @@ import Testing
         await alice.network.close()
         await bob.network.close()
     }
+
+    // MARK: Relay client, transport and store
+
+    /// C4: the relay's `error` and `message` lose their control characters before they enter an `ACEError`.
+    @Test func relayErrorStringsLoseControlCharacters() {
+        let body = Data(#"{"error":"not_\u0000regis\ntered","message":"denied\r\n2026-10-21 INFO forged line\u001b[31m\u007f"}"#.utf8)
+        let e = relayError(status: 403, retryAfter: nil, body: body)
+        #expect(e.relayCode == "not_registered")
+        #expect(e.message == "relay HTTP 403 not_registered: denied2026-10-21 INFO forged line[31m")
+        #expect(!hasControlCharacter(e.message) && !hasControlCharacter(e.relayCode ?? ""))
+    }
+
+    /// `PinnedRelayTransport.open` refuses plain `http` unless loopback relays are allowed, before resolving anything.
+    @Test func pinnedTransportRequiresHttpsWithoutTheLoopbackFlag() async throws {
+        let resolved = LockedValue(false)
+        let request = URLRequest(url: URL(string: "http://relay.example/v1/health")!)
+        await expectCodeAsync(.invalidArgument) {
+            try await PinnedRelayTransport.open(request, allowLoopback: false, timeout: 1, streaming: false) { _ in
+                resolved.value = true
+                return ["127.0.0.1"]
+            }
+        }
+        #expect(!resolved.value)
+    }
+
+    /// C11: `FileStore.list` validates its prefix like a key: nothing outside the store, nothing under `locks/`.
+    @Test func fileStoreListValidatesThePrefix() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ace-list-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try FileStore(directory: dir)
+        try store.write("inbox/journal/1.json", Data("{}".utf8))
+        _ = try store.lock("receive", timeout: 0)
+        for bad in ["../", "../../etc/", "locks/", "locks", "inbox//", "/inbox/", "inbox/../"] {
+            expectCode(.invalidArgument, bad) { try store.list(prefix: bad) }
+        }
+        #expect(try store.list(prefix: "") == ["inbox/journal/1.json"])
+        #expect(try store.list(prefix: "inbox/") == ["inbox/journal/1.json"])
+        #expect(try store.list(prefix: "inbox/jour") == ["inbox/journal/1.json"])
+    }
+
+    /// Writes and directory syncs use `F_FULLFSYNC` (with an `fsync` fallback).
+    @Test func fullSyncFlushesAFile() throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("ace-sync-\(UUID().uuidString)").path
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        defer { close(fd); unlink(path) }
+        #expect(fd >= 0 && fullSync(fd) == 0)
+        #expect(fullSync(-1) != 0)
+    }
 }

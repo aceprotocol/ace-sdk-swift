@@ -54,7 +54,8 @@ enum PinnedRelayTransport {
                      streaming: Bool, resolver: @escaping Resolver = resolveAddresses) async throws
         -> (RelayResponseBytes, HTTPURLResponse) {
         guard timeout.isFinite, timeout > 0 else { throw ACEError(.invalidArgument, "invalid relay timeout") }
-        guard let url = request.url, ["http", "https"].contains(url.scheme), let rawHost = url.host(percentEncoded: false),
+        // Plain `http` only with the development flag (loopback relays); everything else is `https`.
+        guard let url = request.url, url.scheme == "https" || (allowLoopback && url.scheme == "http"), let rawHost = url.host(percentEncoded: false),
               let portNumber = UInt16(exactly: url.port ?? (url.scheme == "https" ? 443 : 80)),
               let port = NWEndpoint.Port(rawValue: portNumber) else {
             throw ACEError(.invalidArgument, "invalid relay request URL")
