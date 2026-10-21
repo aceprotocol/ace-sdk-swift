@@ -163,4 +163,56 @@ import Testing
         await alice.network.close()
         await bob.network.close()
     }
+
+    // MARK: Inbox (06 § Receive pipeline)
+
+    /// Two admitted peers: `alice` connects, `bob` accepts.
+    private static func pair(_ relay: FakeRelay, _ clock: TestClock) async throws -> (alice: NetPeer, bob: NetPeer) {
+        let alice = try await NetPeer.make(relay, clock: clock), bob = try await NetPeer.make(relay, clock: clock)
+        try await alice.network.connect(bob.aceId, profile: ProfileManifest.text.id)
+        _ = try await bob.network.pull()
+        try await bob.network.accept(alice.aceId)
+        _ = try await alice.network.pull()
+        return (alice, bob)
+    }
+
+    /// C3: a message already delivered whose `delivered` receipt keeps failing is acknowledged after MAX_FETCH_ATTEMPTS
+    /// without a quarantine record.
+    @Test func deliveredPacketWhoseReceiptKeepsFailingIsAckedWithoutQuarantine() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await Self.pair(relay, clock)
+        _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "hi"])
+        relay.withLock { relay.down.insert("/v1/send") }  // every receipt send fails transiently
+        var outcomes: [ReceiveOutcome] = []
+        for _ in 0..<ACELimits.maxFetchAttempts { outcomes += try await bob.network.pull() }
+        #expect(outcomes.dropLast().allSatisfy { !$0.isFinal } && outcomes.last?.isFinal == true, "\(outcomes)")
+        #expect(bob.received.value.count == 1)
+        #expect(try bob.store.list(prefix: "inbox/quarantine/").isEmpty)
+        #expect(relay.queued(bob.aceId).isEmpty)  // acknowledged
+        await alice.network.close()
+        await bob.network.close()
+    }
+
+    /// C8: a pin refresh is attempted at most once per sender per PIN_REFRESH_INTERVAL_SECONDS, a failed one included.
+    @Test func failedPinRefreshStillSuppressesTheNextForTheInterval() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await Self.pair(relay, clock)
+        try alice.identity.delegate(now: clock.now, notAfter: nil)  // packets now name a newer delegation than bob's pin
+        _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "hi"])
+        let path = "/v1/descriptor/\(alice.aceId)"
+        relay.withLock { relay.down.insert(path) }
+        func lookups() -> Int { relay.withLock { relay.requests.filter { $0 == "GET \(path)" }.count } }
+        #expect(try await bob.network.pull() == [.retry(.relayUnavailable)])
+        #expect(lookups() == 1)
+        #expect(try await bob.network.pull() == [.retry(.relayUnavailable)])
+        #expect(lookups() == 1)  // suppressed, not asked again
+        clock.now += ACELimits.pinRefreshIntervalSeconds
+        relay.withLock { relay.down.remove(path) }
+        _ = try await alice.network.publish(force: true)
+        let outcomes = try await bob.network.pull()
+        #expect(lookups() == 2)
+        if case .delivered = outcomes.first {} else { Issue.record("expected delivered, got \(outcomes)") }
+        await alice.network.close()
+        await bob.network.close()
+    }
 }

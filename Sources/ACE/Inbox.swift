@@ -52,6 +52,11 @@ private struct Reject: Error {
     let code: String
 }
 
+/// The `delivered` receipt of a packet already processed (delivered or a duplicate) failed transiently: a retry.
+private struct ReceiptUnsent: Error {
+    let error: ACEError
+}
+
 
 /// The Inbox of one identity, owned by its `NetworkClient`. Every pass through the pipeline (`receive`, a `pull` page,
 /// a `follow` entry) runs alone, in arrival order: the actor would otherwise interleave two passes at their suspension
@@ -206,9 +211,11 @@ package actor Inbox {
     /// counted in `inbox/attempts/<fingerprint>.json` (a suppressed pin refresh included: a forged packet naming a newer
     /// delegation must not block the inbox); at `MAX_FETCH_ATTEMPTS` the packet is quarantined and dropped. `hold` (the
     /// host has no capacity) is not a failure of the packet and does not count. Any final outcome removes the counter.
-    /// The quarantine keeps the failure and the packet header only (`quarantine`).
+    /// The quarantine keeps the failure and the packet header only (`quarantine`). A packet already processed whose
+    /// `delivered` receipt kept failing is dropped without a quarantine record: the message was handled, and the sender's
+    /// retry is deduplicated and receipted.
     private func fetched(_ packet: Data) async -> ReceiveOutcome {
-        let (outcome, reason) = await evaluated(packet)
+        let (outcome, reason, processed) = await evaluated(packet)
         let fp = sha256Hex(packet), key = Self.attemptsPrefix + fp + ".json"
         if outcome.isFinal {
             try? store.checkedDelete(key)
@@ -220,7 +227,7 @@ package actor Inbox {
             try? store.checkedWrite(key, try! JSONValue.object(["attempts": .number(Double(attempts))]).jsonData())
             return outcome
         }
-        try? quarantine(packet, fingerprint: fp, code: code, reason: reason)
+        if !processed { try? quarantine(packet, fingerprint: fp, code: code, reason: reason) }
         try? store.checkedDelete(key)
         return .dropped(code)
     }
@@ -277,16 +284,19 @@ package actor Inbox {
 
     private func evaluate(_ data: Data) async -> ReceiveOutcome { await evaluated(data).outcome }
 
-    /// The outcome and, for a failure, its error message.
-    private func evaluated(_ data: Data) async -> (outcome: ReceiveOutcome, reason: String) {
+    /// The outcome and, for a failure, its error message; `processed`: a retry only because the `delivered` receipt of a
+    /// packet already processed was not sent.
+    private func evaluated(_ data: Data) async -> (outcome: ReceiveOutcome, reason: String, processed: Bool) {
         do {
-            return (try await pipeline(data), "")
+            return (try await pipeline(data), "", false)
         } catch let r as Reject {
-            return (.rejected(r.code), "\(r)")
+            return (.rejected(r.code), "\(r)", false)
+        } catch let u as ReceiptUnsent {
+            return (.retry(u.error.code), u.error.message, true)
         } catch let e as ACEError {
-            return (e.category == .permanent ? .dropped(e.code) : .retry(e.code), e.message)
+            return (e.category == .permanent ? .dropped(e.code) : .retry(e.code), e.message, false)
         } catch {
-            return (.retry(.storageFailed), "\(error)")
+            return (.retry(.storageFailed), "\(error)", false)
         }
     }
 
@@ -315,11 +325,10 @@ package actor Inbox {
                 throw ACEError(.relayUnavailable, "pin refresh suppressed")
             }
             lastRefresh = lastRefresh.filter { t - $0.value < ACELimits.pinRefreshIntervalSeconds }
-            lastRefresh[packet.from] = t
+            lastRefresh[packet.from] = t  // every attempt counts, a failed one too (06 step 3: at most once per interval)
             do {
                 state = try await network.agent(packet.from, refresh: true).state
             } catch let e as ACEError where e.category != .permanent {
-                lastRefresh[packet.from] = nil  // a failed refresh does not suppress the next attempt
                 throw e
             } catch {
                 // A permanent failure (e.g. a peer after a signing-key change that has not republished its descriptor
@@ -352,11 +361,11 @@ package actor Inbox {
             let pending = Self.pendingKey(packet.from, packet.messageId)
             if !core, try store.checkedRead(pending) != nil {
                 guard try await recover(pending) else { return .hold }
-                try await sendReceipt(to: packet.from, messageId: packet.messageId, outcome: "delivered")
+                try await receiptDelivered(to: packet.from, messageId: packet.messageId)
                 return .duplicate
             }
             if seen.contains(packet.messageId, from: packet.from) {
-                if !core { try await sendReceipt(to: packet.from, messageId: packet.messageId, outcome: "delivered") }
+                if !core { try await receiptDelivered(to: packet.from, messageId: packet.messageId) }
                 return .duplicate
             }
             // beyond the horizon: dropped, never receipted; the sender's next retry carries a fresh timestamp (06 § Deduplication)
@@ -396,7 +405,7 @@ package actor Inbox {
                 guard try await handOver(message, key: pending) else { return .hold }
             }
             // 11. receipt, then acknowledgement (by the caller)
-            if !core { try await sendReceipt(to: packet.from, messageId: packet.messageId, outcome: "delivered") }
+            if !core { try await receiptDelivered(to: packet.from, messageId: packet.messageId) }
             return .delivered(message)
         } catch let r as Reject {
             if core { return .dropped(ACEError.Code(rawValue: r.code) ?? .invalidBody) }
@@ -475,6 +484,15 @@ package actor Inbox {
             return
         }
         if let renewal { try network.admission.noteIssued(peer, permit: renewal) }
+    }
+
+    /// The `delivered` receipt of a packet already processed; a transient failure is `ReceiptUnsent` (see `fetched`).
+    private func receiptDelivered(to peer: String, messageId: String) async throws {
+        do {
+            try await sendReceipt(to: peer, messageId: messageId, outcome: "delivered")
+        } catch let e as ACEError where e.category != .permanent {
+            throw ReceiptUnsent(error: e)
+        }
     }
 
     // MARK: Core rules
