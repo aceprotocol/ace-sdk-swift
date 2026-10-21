@@ -263,4 +263,61 @@ import Testing
         #expect(fd >= 0 && fullSync(fd) == 0)
         #expect(fullSync(-1) != 0)
     }
+
+    /// C1 (already in sdk-swift, kept as a regression): relay URLs follow 02 § HTTPS URLs, ASCII hosts only (the SP11
+    /// negatives included).
+    @Test func relayURLHostGrammar() {
+        for bad in ["https://[::1]", "https://a..b", "https://-a.example", "https://a-.example", "https://example.com.",
+                    "https://exämple.com", "https://xn--exmple-cua.com\u{0}"] {
+            #expect(!isRelayRoute(bad), "\(bad)")
+        }
+        #expect(isRelayRoute("https://relay.example") && isRelayRoute("https://relay.example:8443/base"))
+    }
+
+    /// 04 step 2: a `kel` that is not an array is a KEL structure failure (`invalid_kel`), not a shape one.
+    @Test func nonArrayKelIsInvalidKel() throws {
+        let a = try TestAgent()
+        expectCode(.invalidKel) { try verifyPublishedAgent(["kel": ["t": "icp"], "descriptor": a.agent.source["descriptor"]!], now: NOW) }
+        let bundle = try createCardRecord(identity: a.identity, home: "https://relay.example", contact: .open, listed: true, now: NOW)
+        expectCode(.invalidKel) { try verifyCardBundle(["kel": "x", "card": bundle["card"]!], now: NOW) }
+    }
+
+    // MARK: SP12 — records are never older than their delegation
+
+    /// A recovery that delegates the same key at the same `seq`: a record signed on the abandoned branch, presented with
+    /// the new log, is `stale_peer_binding`.
+    @Test func recordSignedOnAForkedAwayBranchIsRefused() throws {
+        let root = (0..<3).map { try! SoftwareKey(seed: Data(repeating: UInt8(0x40 + $0), count: 32)) }
+        let digest = { (n: Int) in keyDigest(publicKey: root[n].publicKey()) }
+        let first = SoftwareKey.generate(), signing = SoftwareKey.generate()
+        var old = try KelSteps.incept(root: root[0], nextDigest: digest(1), signingPublicKey: first.publicKey(), ts: NOW)
+        old = try KelSteps.delegate(old, root: root[0], keyPublic: signing.publicKey(), ts: NOW + 10, notAfter: nil)  // seq 2
+        let oldId = try ExternalRootIdentity(export: ExternalRootIdentityExport(signingKey: "", kel: old.events), signingKey: signing, now: NOW + 20)
+        let card = try createCardRecord(identity: oldId, home: "https://relay.example", contact: .open, listed: true, now: NOW + 20)
+        let vault = StorePrekeyVault(store: MemoryStore())
+        let agent = try createPublishedAgent(identity: oldId, claims: DescriptorClaims(relays: ["https://relay.example"],
+                                                                                       prekey: try vault.rotate(now: NOW).prekey), now: NOW + 20)
+        let recovered = try ExternalRootIdentity.recover(kel: old.events, revealing: root[1], nextRootDigest: digest(2), signingKey: signing, now: NOW + 100)
+        let kel = ExportJSON.kelValue(try recovered.getKel())
+        #expect(try recovered.getSigningSeq() == 2)  // the same key at the same seq
+        expectCode(.stalePeerBinding) { try verifyCardBundle(["kel": kel, "card": card["card"]!], now: NOW + 200) }
+        expectCode(.stalePeerBinding) { try verifyPublishedAgent(["kel": kel, "descriptor": agent.source["descriptor"]!], now: NOW + 200) }
+        // re-signed under the new log, they verify
+        _ = try verifyCardBundle(try createCardRecord(identity: recovered, home: "https://relay.example", contact: .open, listed: true, now: NOW + 200),
+                                 now: NOW + 200)
+    }
+
+    /// A signer whose clock is behind its last KEL event still produces valid records, dated at that event.
+    @Test func recordsAreDatedNoEarlierThanTheLastKelEvent() throws {
+        let id = try makeIdentity()
+        try id.delegate(now: NOW + 100, notAfter: nil)
+        let card = try createCardRecord(identity: id, home: "https://relay.example", contact: .open, listed: true, now: NOW)
+        #expect(card["card"]?["issuedAt"]?.wireInt == NOW + 100)
+        let vault = StorePrekeyVault(store: MemoryStore())
+        let agent = try createPublishedAgent(identity: id, claims: DescriptorClaims(relays: ["https://relay.example"],
+                                                                                    prekey: try vault.rotate(now: NOW).prekey), now: NOW)
+        #expect(agent.descriptor.issuedAt == NOW + 100)
+        _ = try verifyCardBundle(card, now: NOW)
+        _ = try verifyPublishedAgent(agent.source, now: NOW)
+    }
 }

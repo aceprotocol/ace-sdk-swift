@@ -39,6 +39,22 @@ package func verifyDocument(_ o: [String: JSONValue], state: KelState, action: S
     }
 }
 
+/// The `issuedAt` of a descriptor or card record signed at `now`: never before the last event of the signer's log, so
+/// the record is never older than the `dlg` that delegated its key (a clock behind that event still signs a valid record).
+private func recordTime(_ identity: any ACEIdentity, now: Int?) throws -> Int {
+    let at = try identityNow(now)
+    return max(at, try identity.getKel().last.flatMap { wireInt($0["ts"]) } ?? at)
+}
+
+/// A descriptor or card record is signed no earlier than the `dlg` its `signature.seq` names (04 § Verification step 3):
+/// an earlier `issuedAt` is `stale_peer_binding`. A recovery that forks the log can delegate the same key at the same
+/// `seq`; a record signed on the abandoned branch is older than the new `dlg` and never verifies under the new log.
+private func checkSignedAfterDelegation(_ o: [String: JSONValue], state: KelState) throws {
+    guard let seq = o["signature"]?["seq"]?.wireInt, seq == state.signing?.seq, state.events.indices.contains(seq),
+          let issuedAt = o["issuedAt"]?.wireInt, let dlgTs = wireInt(state.events[seq]["ts"]) else { return }
+    guard issuedAt >= dlgTs else { throw ACEError(.stalePeerBinding, "signed before its signing delegation") }
+}
+
 /// `issuedAt <= now + 300`, `issuedAt < expiresAt`, `now < expiresAt` (unless `!requireLive`), `expiresAt - issuedAt <=
 /// maximum`. Returns `(issuedAt, expiresAt)`.
 @discardableResult
@@ -278,11 +294,10 @@ public func checkStrangerSource(_ source: JSONValue) throws {
 }
 
 /// The closed shape of a delegation entry, part of a descriptor's shape (04 § Verification step 1, before any KEL or
-/// signature work): `{kel: array, credential: {issuer: ACE ID, subject: string, issuedAt, expiresAt: wire integers,
+/// signature work): `{kel, credential: {issuer: ACE ID, subject: string, issuedAt, expiresAt: wire integers,
 /// signature: operational signature shape}}`. The entry's rules (04 § Delegations) are checked in step 4.
 private func isDelegationEntryShape(_ entry: JSONValue) -> Bool {
-    guard let e = entry.objectValue, hasMembers(e, ["kel", "credential"]), e["kel"]?.arrayValue != nil,
-          let c = e["credential"]?.objectValue, hasMembers(c, ["issuer", "subject", "issuedAt", "expiresAt", "signature"]),
+    guard let e = entry.objectValue, hasMembers(e, ["kel", "credential"]), let c = e["credential"]?.objectValue, hasMembers(c, ["issuer", "subject", "issuedAt", "expiresAt", "signature"]),
           let issuer = c["issuer"]?.stringValue, isACEId(issuer), c["subject"]?.stringValue != nil,
           c["issuedAt"]?.wireInt != nil, c["expiresAt"]?.wireInt != nil, SignatureEnvelope(operational: c["signature"]) != nil else { return false }
     return true
@@ -398,12 +413,12 @@ public struct DescriptorClaims: Sendable {
     }
 }
 
-/// Sign a descriptor (action `agent-descriptor`) valid `lifetime` seconds (86,400 by default, at most
+/// Sign a descriptor (action `agent-descriptor`, `issuedAt = max(now, ts of the last KEL event)`) valid `lifetime` seconds (86,400 by default, at most
 /// `ACELimits.maxDescriptorSeconds`) and return the verified `PublishedAgent {kel, descriptor}`. Any invalid claim is
 /// `invalid_authorization` (the result is verified before return).
 public func createPublishedAgent(identity: any ACEIdentity, claims: DescriptorClaims, now: Int? = nil,
                                  lifetime: Int = ACELimits.defaultDescriptorSeconds, allowLoopback: Bool = false) throws -> VerifiedAgent {
-    let at = try identityNow(now)
+    let at = try recordTime(identity, now: now)
     guard (1...ACELimits.maxDescriptorSeconds).contains(lifetime) else {
         throw ACEError(.invalidArgument, "lifetime must be 1...\(ACELimits.maxDescriptorSeconds) seconds")
     }
@@ -453,6 +468,7 @@ package func verifyDescriptorSignature(_ source: JSONValue, state: KelState, now
     guard let d = source["descriptor"]?.objectValue, d["aceId"]?.stringValue == state.aceId else {
         throw unauthorized("descriptor must name the KEL's aceId")
     }
+    try checkSignedAfterDelegation(d, state: state)
     try verifyDocument(d, state: state, action: "agent-descriptor", now: now)
 }
 
@@ -473,7 +489,8 @@ public func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: B
 /// The KEL a signed document carries, verified (at `max(now, kelNow)`) and usable at `now`, deriving `aceId`, then
 /// reconciled with `pinned` when given (fork rules) and usable again: the state the document's signature verifies under.
 private func carriedKel(_ kel: JSONValue?, aceId: String, pinned: KelState?, now: Int, kelNow: Int? = nil) throws -> KelState {
-    guard let events = kel?.arrayValue else { throw unauthorized("kel must be an array") }
+    // the KEL's structure is step 2 (`invalid_kel`), not the document's shape
+    guard let events = kel?.arrayValue else { throw ACEError(.invalidKel, "kel must be an array") }
     var state = try ACEKel.verify(events.map { $0.objectValue ?? [:] }, now: max(now, kelNow ?? now))
     guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "identity has no live signing delegation") }
     guard state.aceId == aceId else { throw unauthorized("kel does not derive aceId") }
@@ -617,12 +634,13 @@ package func cardClaims(home: String, handle: String?, card: AgentCard, pay: [St
     return claims
 }
 
-/// Create and sign this identity's CardBundle `{kel, card}` (action `card-record` at `issuedAt = now`), verified before it
+/// Create and sign this identity's CardBundle `{kel, card}` (action `card-record` at `issuedAt = max(now, ts of the last
+/// KEL event)`), verified before it
 /// is returned (`invalid_authorization` for any invalid claim).
 public func createCardRecord(identity: any ACEIdentity, home: String, handle: String? = nil, card: AgentCard = AgentCard(),
                              pay: [String]? = nil, contact: Contact, listed: Bool, now: Int? = nil,
                              allowLoopback: Bool = false) throws -> CardBundle {
-    let at = try identityNow(now)
+    let at = try recordTime(identity, now: now)
     var claims = cardClaims(home: home, handle: handle, card: card, pay: pay, contact: contact, listed: listed)
     claims["aceId"] = .string(identity.getACEId())
     claims["issuedAt"] = .number(Double(at))
@@ -677,6 +695,7 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     guard let contact = r["contact"]?.stringValue.flatMap(Contact.init(rawValue:)) else { throw unauthorized("contact must be open or closed") }
     guard let listed = r["listed"]?.boolValue else { throw unauthorized("listed must be a boolean") }
     let state = try carriedKel(o["kel"], aceId: aceId, pinned: pinned, now: now)
+    try checkSignedAfterDelegation(r, state: state)
     try verifyDocument(r, state: state, action: "card-record", now: now)
     let record = CardRecord(aceId: aceId, issuedAt: issuedAt, home: home, handle: handle, card: card, pay: pay, contact: contact,
                             listed: listed, signature: signature, value: .object(r))
