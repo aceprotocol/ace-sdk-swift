@@ -32,6 +32,8 @@ public actor PeerStore {
         /// The last descriptor bound to an earlier state of the pin (nil while `agent` is held): routes only.
         let stale: VerifiedAgent?
         let fetchedAt: Int
+        /// A live descriptor served by a relay vouched for `state` (see `adopt(_:live:)`).
+        let kelLive: Bool
     }
 
     public init(store: any ACEStore, clock: @escaping @Sendable () -> Int = systemClock) {
@@ -52,7 +54,8 @@ public actor PeerStore {
         let pin: Pin
         do {
             guard let o = JSONValue(stored: raw)?.objectValue, o["version"] == 1, o["aceId"]?.stringValue == aceId,
-                  let at = o["fetchedAt"]?.wireInt, let list = o["kel"]?.arrayValue, let source = o["agent"] else {
+                  let at = o["fetchedAt"]?.wireInt, let list = o["kel"]?.arrayValue, let source = o["agent"],
+                  o["kelLive"].map({ $0.boolValue != nil }) ?? true else {
                 throw ACEError(.storageFailed, "\(key) is malformed")
             }
             let events = try list.map { e -> KelEvent in
@@ -78,7 +81,8 @@ public actor PeerStore {
                 guard bound.aceId == aceId else { throw ACEError(.storageFailed, "\(key) does not match its aceId") }
                 stale = try Self.reverify(old, issuedAt: issued, state: bound)
             }
-            pin = Pin(state: state, agent: agent, stale: stale, fetchedAt: at)
+            // A row written before `kelLive` existed was pinned through a descriptor: live.
+            pin = Pin(state: state, agent: agent, stale: stale, fetchedAt: at, kelLive: o["kelLive"]?.boolValue ?? true)
         } catch let e as ACEError {
             throw ACEError(.storageFailed, "\(key): \(e.message)")
         }
@@ -98,6 +102,12 @@ public actor PeerStore {
     public func pinned(_ aceId: String) throws -> KelState? {
         try Self.checkId(aceId)
         return try load(aceId)?.state
+    }
+
+    /// Whether a live descriptor served by a relay vouched for the pinned KEL (`adopt(_:live:)`); false without a pin.
+    public func kelLive(_ aceId: String) throws -> Bool {
+        try Self.checkId(aceId)
+        return try load(aceId)?.kelLive ?? false
     }
 
     /// The newest adopted descriptor (possibly expired: check `descriptor.expiresAt`), or nil. Its `state` is the pinned
@@ -144,24 +154,21 @@ public actor PeerStore {
 
     /// Pin (or extend the pin to) a KEL under the fork rules, without a descriptor. A held descriptor is bound to the KEL
     /// state it was verified under: when the pin advances it is no longer `agent` or `usableAgent` (refreshed on next use)
-    /// and is kept as stale, its relays only routes (`heldRelays`).
-    /// `then` runs with the resulting state and outcome still under the `peers` lock, before the pin is written, so state
-    /// derived from it is written atomically with it (throwing there leaves the pin as it was).
+    /// and is kept as stale, its relays only routes (`heldRelays`). A KEL alone vouches for nothing: a pin it moves is not
+    /// `kelLive`; an unchanged one keeps its flag.
     @discardableResult
-    public func pin(kel: [KelEvent], then: (@Sendable (PeerAdoption) throws -> Void)? = nil) throws -> PeerAdoption {
+    public func pin(kel: [KelEvent]) throws -> PeerAdoption {
         try store.withLock("peers") {
             let now = try unixNow(clock)
             let candidate = try ACEKel.verify(kel, now: now)
             let old = try load(candidate.aceId)
             let (state, outcome) = try ACEKel.extend(pinned: old?.state, verified: candidate)
-            let adoption = PeerAdoption(state: state, outcome: outcome)
-            try then?(adoption)
             // An advanced pin unbinds the held descriptor: it is kept as stale (its relays still routes), never used.
             let same = old?.state.lastHash == state.lastHash
             let stale = same ? old?.stale : old?.agent ?? old?.stale
             try write(state.aceId, state: state, agent: same ? old?.agent?.source : nil, stale: stale,
-                      fetchedAt: max(now, old?.fetchedAt ?? 0))
-            return adoption
+                      fetchedAt: max(now, old?.fetchedAt ?? 0), kelLive: same && old?.kelLive == true)
+            return PeerAdoption(state: state, outcome: outcome)
         }
     }
 
@@ -191,9 +198,11 @@ public actor PeerStore {
     /// `stale_peer_binding` (no prekey substitution by a replaced signing key). A descriptor under an advanced pin replaces
     /// the held one unconditionally; under the same pin, an older `issuedAt`, or the same `issuedAt` with other content, is
     /// `stale_peer_binding`. Each delegation whose issuer is pinned must verify under that pin
-    /// (`invalid_authorization`).
+    /// (`invalid_authorization`). `live`: a relay served the descriptor, so it vouches for the KEL it is bound to and the
+    /// pin becomes `kelLive`. Anything else (an imported or contact source, which a holder of a superseded key can sign)
+    /// confirms nothing: a pin it moves is not live, an unchanged one keeps its flag (04 § Card record).
     @discardableResult
-    public func adopt(_ agent: VerifiedAgent) throws -> PeerAdoption {
+    public func adopt(_ agent: VerifiedAgent, live: Bool = false) throws -> PeerAdoption {
         try store.withLock("peers") {
             let now = try unixNow(clock)
             let old = try load(agent.aceId)
@@ -218,15 +227,19 @@ public actor PeerStore {
                     kept = previous.source
                 }
             }
-            try write(agent.aceId, state: state, agent: kept, fetchedAt: max(now, agent.descriptor.issuedAt, old?.fetchedAt ?? 0))
+            let same = old?.state.lastHash == state.lastHash
+            let kelLive = (live && state.lastHash == agent.state.lastHash) || (same && old?.kelLive == true)
+            try write(agent.aceId, state: state, agent: kept, fetchedAt: max(now, agent.descriptor.issuedAt, old?.fetchedAt ?? 0),
+                      kelLive: kelLive)
             return PeerAdoption(state: state, outcome: outcome)
         }
     }
 
     /// `stale`: kept with the KEL state it was bound to.
-    private func write(_ aceId: String, state: KelState, agent: JSONValue?, stale: VerifiedAgent? = nil, fetchedAt: Int) throws {
+    private func write(_ aceId: String, state: KelState, agent: JSONValue?, stale: VerifiedAgent? = nil, fetchedAt: Int,
+                       kelLive: Bool) throws {
         var row: [String: JSONValue] = ["version": 1, "aceId": .string(aceId), "fetchedAt": .number(Double(fetchedAt)),
-                                        "kel": ExportJSON.kelValue(state.events), "agent": agent ?? .null]
+                                        "kel": ExportJSON.kelValue(state.events), "agent": agent ?? .null, "kelLive": .bool(kelLive)]
         if let stale { row["stale"] = ["kel": ExportJSON.kelValue(stale.state.events), "descriptor": stale.source["descriptor"] ?? .null] }
         try store.checkedWrite(Self.key(aceId), try JSONValue.object(row).jsonData())
     }

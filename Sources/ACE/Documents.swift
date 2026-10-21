@@ -459,6 +459,20 @@ public func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: B
     try verifyPublishedAgent(source, now: now, allowLoopback: allowLoopback, pinned: pinned, kelNow: nil, delegationPins: delegationPins)
 }
 
+/// The KEL a signed document carries, verified (at `max(now, kelNow)`) and usable at `now`, deriving `aceId`, then
+/// reconciled with `pinned` when given (fork rules) and usable again: the state the document's signature verifies under.
+private func carriedKel(_ kel: JSONValue?, aceId: String, pinned: KelState?, now: Int, kelNow: Int? = nil) throws -> KelState {
+    guard let events = kel?.arrayValue else { throw unauthorized("kel must be an array") }
+    var state = try ACEKel.verify(events.map { $0.objectValue ?? [:] }, now: max(now, kelNow ?? now))
+    guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "identity has no live signing delegation") }
+    guard state.aceId == aceId else { throw unauthorized("kel does not derive aceId") }
+    if let pinned {
+        state = try ACEKel.extend(pinned: pinned, events: state.events, now: now).state
+        guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "pinned identity has no live signing delegation") }
+    }
+    return state
+}
+
 /// `kelNow`: verify the carried KEL at `max(now, kelNow)` (a stored descriptor re-verified at its `issuedAt` beside a pin that
 /// grew later); everything else at `now`.
 package func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: Bool, pinned: KelState?, kelNow: Int?,
@@ -512,14 +526,7 @@ package func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: 
         }
         erc8004 = try items.map(validateErc8004Entry)
     }
-    guard let events = o["kel"]?.arrayValue else { throw unauthorized("kel must be an array") }
-    var state = try ACEKel.verify(events.map { $0.objectValue ?? [:] }, now: max(now, kelNow ?? now))
-    guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "kel is not usable") }
-    guard state.aceId == aceId else { throw unauthorized("descriptor aceId is not the KEL's") }
-    if let pinned {
-        state = try ACEKel.extend(pinned: pinned, events: state.events, now: now).state
-        guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "pinned identity has no live signing delegation") }
-    }
+    let state = try carriedKel(o["kel"], aceId: aceId, pinned: pinned, now: now, kelNow: kelNow)
     try verifyDescriptorSignature(source, state: state, now: now)
     var delegations: [VerifiedDelegation] = []
     for item in delegationItems {
@@ -657,14 +664,7 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     }
     guard let contact = r["contact"]?.stringValue.flatMap(Contact.init(rawValue:)) else { throw unauthorized("contact must be open or closed") }
     guard let listed = r["listed"]?.boolValue else { throw unauthorized("listed must be a boolean") }
-    guard let events = o["kel"]?.arrayValue else { throw unauthorized("kel must be an array") }
-    var state = try ACEKel.verify(events.map { $0.objectValue ?? [:] }, now: now)
-    guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "identity has no live signing delegation") }
-    guard state.aceId == aceId else { throw unauthorized("kel does not derive aceId") }
-    if let pinned {
-        state = try ACEKel.extend(pinned: pinned, events: state.events, now: now).state
-        guard ACEKel.isUsable(state, now: now) else { throw ACEError(.invalidKel, "pinned identity has no live signing delegation") }
-    }
+    let state = try carriedKel(o["kel"], aceId: aceId, pinned: pinned, now: now)
     try verifyDocument(r, state: state, action: "card-record", now: now)
     guard let signature = SignatureEnvelope(operational: r["signature"]) else { throw unauthorized("card-record signature is malformed") }
     let record = CardRecord(aceId: aceId, issuedAt: issuedAt, home: home, handle: handle, card: card, pay: pay, contact: contact,

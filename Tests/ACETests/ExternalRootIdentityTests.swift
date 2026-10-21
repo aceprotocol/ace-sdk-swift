@@ -122,7 +122,7 @@ import Testing
         expectCode(.invalidArgument, "not committed") {
             try id.rotate(revealing: Self.root(3), nextRootDigest: Self.digest(4), now: NOW + 3)
         }
-        expectCode(.invalidArgument, "root-less delegate") { try id.delegate(now: NOW + 3, notAfter: nil) }
+        #expect(!((id as Any) is any ACEManagedIdentity))  // root-less: it cannot delegate on its own
         #expect(try checkUsable(id, now: NOW + 3).signing?.publicKey == signing.publicKey())
     }
 

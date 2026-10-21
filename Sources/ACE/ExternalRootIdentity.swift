@@ -41,7 +41,8 @@ public struct ExternalRootIdentityExport: Sendable, Equatable {
 /// A person identity: root key(n) is held outside (the caller supplies it per operation), the signing key is injected.
 /// KEL convention: inception root key(0) commits digest(key(1)); the k-th `rot` reveals key(k) and commits
 /// digest(key(k+1)); the current root is key(`rotationCount`).
-public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @unchecked Sendable {
+/// Not an `ACEManagedIdentity`: it holds no root, so it cannot delegate on its own (a new signing key comes with `recover`).
+public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     private let lock = NSLock()
     private var state: KelState
     private let signing: any ACEKeyProvider
@@ -142,14 +143,8 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
     }
     package var heldState: KelState { withLock { state } }
 
-    // MARK: ACEManagedIdentity
-
+    /// The verified log state.
     public func getState() -> KelState { withLock { state } }
-
-    /// Always `invalid_argument`: the root is held outside this identity; a new signing key comes with `recover`.
-    public func delegate(now: Int?, notAfter: Int?) throws {
-        throw ACEError(.invalidArgument, "an external-root identity delegates only with its root: recover on the new device")
-    }
 }
 
 /// `print`, `dump` and string interpolation never show the signing key reference.

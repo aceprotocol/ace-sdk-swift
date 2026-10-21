@@ -327,6 +327,10 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
                                                foreignRelay: { _ in try relayB.client(clock: clock.fn) }, clock: clock.fn)
         #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
         _ = try await bob.importAgent(twoRoutes.source)  // shared out of band; it expires before bob looks again
+        // Self-signed, not served by a relay: it does not confirm the pin.
+        #expect(try await bob.peers.kelLive(alice.aceId) == false)
+        // Nor does a card lookup take that cached, still usable descriptor for a live one: it asks the relays.
+        #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
         clock.now += 8 * 86_400
         // Relay B is unreachable and the home relay answers unknown_peer: the lookup fails instead of reporting not live.
         relayB.withLock { relayB.down = [path] }
@@ -413,13 +417,31 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
             await expectCodeAsync(.storageFailed) { try await bob.network.lookupCard("@alice@\(relay.host)") }
             try bob.store.checkedWrite(key, good)
         }
-        // The record of how a KEL pin was confirmed, without its flag.
+        // A peer pin whose `kelLive` is not a boolean.
         clock.now += 8 * 86_400
         let carol = try await peer(relay, clock)
         #expect(try await carol.network.lookupCard(alice.aceId).kelLive == false)
-        try carol.store.checkedWrite("network/kel-provenance/\(sha256Hex(Data(alice.aceId.utf8))).json",
-                                     try JSONValue.object(["aceId": .string(alice.aceId)]).jsonData())
+        let peerPin = "peers/\(sha256Hex(Data(alice.aceId.utf8))).json"
+        let raw = try #require(try carol.store.read(peerPin))
+        var row = try #require(JSONValue(stored: raw)?.objectValue)
+        row["kelLive"] = "no"
+        try carol.store.checkedWrite(peerPin, try JSONValue.object(row).jsonData())
         await expectCodeAsync(.storageFailed) { try await carol.network.lookupCard(alice.aceId) }
+    }
+
+    @Test func aRelayServedDescriptorFromAnyLookupConfirmsAFallbackPinnedKel() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        clock.now += 8 * 86_400
+        let bob = try await peer(relay, clock)
+        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == false)
+        // Alice is back: bob's plain descriptor lookup fetches it from her relay and confirms the pin, so the next card
+        // lookup needs no descriptor request of its own (one would fail here).
+        try await alice.network.publish()
+        try await bob.network.agent(alice.aceId)
+        #expect(try await bob.network.peers.kelLive(alice.aceId) == true)
+        relay.dropAgent(alice.aceId)
+        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == true)
     }
 
     @Test func kelLiveIsTrueWithALiveDescriptor() async throws {
