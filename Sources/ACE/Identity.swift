@@ -52,9 +52,9 @@ package func checkNextDigest(_ nextRootDigest: Data?) throws -> Data? {
     return try checkNextDigest(d) as Data
 }
 
-/// `now` (wire-integer Unix seconds) or the system clock; anything else is `invalid_argument`.
-package func identityNow(_ now: Int?) throws -> Int {
-    guard let now else { return systemClock() }
+/// `now` (wire-integer Unix seconds) or a `clock` reading (the system clock); anything else is `invalid_argument`.
+package func identityNow(_ now: Int?, clock: () -> Int = systemClock) throws -> Int {
+    guard let now else { return try unixNow(clock) }
     guard isWireInt(now) else { throw ACEError(.invalidArgument, "now must be an integer in [0, 2^53-1]") }
     return now
 }
@@ -110,7 +110,7 @@ package enum KelSteps {
         guard icpTs >= 0, icpTs <= ts else { throw ACEError(.invalidArgument, "the inception must not postdate the delegation") }
         let icp = try ACEKel.createInception(root: root, nextDigest: nextDigest, ts: icpTs)
         let st = try ACEKel.verify([icp], now: ts)
-        return try appended(st, try ACEKel.createDelegation(state: st, root: root, keyPublic: signingPublicKey, ts: ts), ts)
+        return try delegate(st, root: root, keyPublic: signingPublicKey, ts: ts, notAfter: nil)
     }
 
     /// The verified log cut at the start of its current root epoch (its last `icp`/`rot`; later events, possibly a
@@ -129,22 +129,28 @@ package enum KelSteps {
                                ts: Int) throws -> KelState {
         try checkCommitted(revealed, state)
         let st = try appended(state, try ACEKel.createRotation(state: state, newRoot: revealed, nextDigest: nextDigest, ts: ts), ts)
-        return try appended(st, try ACEKel.createDelegation(state: st, root: revealed, keyPublic: signingPublicKey, ts: ts), ts)
+        return try delegate(st, root: revealed, keyPublic: signingPublicKey, ts: ts, notAfter: nil)
     }
 
-    /// `dlg` of `keyPublic`, signed by the current root.
+    /// `dlg` of `keyPublic`, signed by the current root. A signing key that is the current root, or the committed next
+    /// root, is refused (`invalid_argument`): its signatures would expose a root key (01 § Rotation and recovery).
     package static func delegate(_ state: KelState, root: any ACEKeyProvider, keyPublic: Data, ts: Int, notAfter: Int?) throws -> KelState {
-        try appended(state, try ACEKel.createDelegation(state: state, root: root, keyPublic: keyPublic, ts: ts, notAfter: notAfter), ts)
+        guard keyPublic != state.rootPublicKey, !state.commits(to: keyPublic) else {
+            throw ACEError(.invalidArgument, "the signing key must be neither the current nor the committed next root")
+        }
+        return try appended(state, try ACEKel.createDelegation(state: state, root: root, keyPublic: keyPublic, ts: ts, notAfter: notAfter), ts)
     }
 
-    /// Committing any current or past root, each possibly exposed, is refused (pre-rotation).
+    /// Committing any key the log reveals (a current or past root, or a delegated signing key), each possibly exposed, is
+    /// refused (pre-rotation, 01 § Rotation and recovery).
     package static func checkFreshNext(_ digest: Data, current: Data, events: [KelEvent]) throws {
-        var roots: Set<Data> = [keyDigest(publicKey: current)]
-        for ev in events where ev["t"] == "icp" || ev["t"] == "rot" {
-            roots.insert(keyDigest(publicKey: try ACEKel.keyBytes(ev["root"], "root").publicKey))
+        var revealed: Set<Data> = [keyDigest(publicKey: current)]
+        for ev in events {
+            let member = ev["t"] == "dlg" ? "key" : "root"
+            revealed.insert(keyDigest(publicKey: try ACEKel.keyBytes(ev[member], member).publicKey))
         }
-        guard !roots.contains(digest) else {
-            throw ACEError(.invalidArgument, "the next root must differ from every current or past root")
+        guard !revealed.contains(digest) else {
+            throw ACEError(.invalidArgument, "the next root must differ from every root and signing key the log reveals")
         }
     }
 }

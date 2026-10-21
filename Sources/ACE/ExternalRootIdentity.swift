@@ -5,6 +5,7 @@
 //  An ACEIdentity whose root is supplied by the caller for each operation that needs it (in SoulPass, derived from a
 //  passkey PRF and never stored) and whose signing key is an injected provider (a Secure Enclave key in production, a
 //  SoftwareKey in tests). The identity holds the log and the signing key only: no root, no next root, public or private.
+//  Its export never holds key material in clear: only a Secure Enclave key's device-bound reference.
 //  The log steps are `KelSteps`, shared with `KelIdentityCore`.
 //
 //  Root keys: this type never retains a root it is handed. `SoftwareKey` cannot zero its seed (`Data` and CryptoKit's
@@ -14,7 +15,7 @@
 import Foundation
 
 /// The persisted part of an `ExternalRootIdentity`: the signing key reference (Base64 Secure Enclave
-/// `dataRepresentation`, device-bound; or Base64 seed of a `SoftwareKey`, tests only) and the log. Never a root.
+/// `dataRepresentation`, device-bound) and the log. Never a root, never a seed.
 public struct ExternalRootIdentityExport: Sendable, Equatable {
     public let signingKey: String
     public let kel: [KelEvent]
@@ -46,22 +47,12 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     private let lock = NSLock()
     private var state: KelState
     private let signing: any ACEKeyProvider
-    private let signingReference: String
 
     private init(state: KelState, signing: any ACEKeyProvider) throws {
         guard let s = state.signing else { throw ACEError(.invalidKel, "kel has no signing delegation") }
         guard s.publicKey == signing.publicKey() else { throw ACEError(.invalidArgument, "signing key does not match the kel") }
         self.state = state
         self.signing = signing
-        self.signingReference = try Self.reference(of: signing)
-    }
-
-    /// The persistable reference of a signing key: a Secure Enclave key's `dataRepresentation` or a `SoftwareKey`'s
-    /// seed (Base64); any other provider is `invalid_argument`.
-    private static func reference(of key: any ACEKeyProvider) throws -> String {
-        if let se = key as? SecureEnclaveKey { return ACEBase64.encode(se.dataRepresentation) }
-        if let sw = key as? SoftwareKey { return ACEBase64.encode(sw.seed) }
-        throw ACEError(.invalidArgument, "signingKey must be a SecureEnclaveKey or a SoftwareKey")
     }
 
     /// `icp` by `root` (key(0)) committing `nextRootDigest` (digest(key(1))) dated `inceptedAt`, then `dlg` of
@@ -112,9 +103,13 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     /// The number of `rot` events in the log: the index n of the current root key(n).
     public var rotationCount: Int { withLock { state.events.filter { $0["t"] == .string("rot") }.count } }
 
-    /// The signing key reference and the log (the host persists them). Never a root.
-    public func exportKeyReferences() -> ExternalRootIdentityExport {
-        withLock { ExternalRootIdentityExport(signingKey: signingReference, kel: state.events) }
+    /// The signing key reference and the log (the host persists them). Never a root. Only a Secure Enclave signing key
+    /// has a reference; any other key (a `SoftwareKey` would export its seed in clear) is `invalid_argument`.
+    public func exportKeyReferences() throws -> ExternalRootIdentityExport {
+        guard let se = signing as? SecureEnclaveKey else {
+            throw ACEError(.invalidArgument, "only a Secure Enclave signing key can be exported (as its device-bound reference)")
+        }
+        return withLock { ExternalRootIdentityExport(signingKey: ACEBase64.encode(se.dataRepresentation), kel: state.events) }
     }
 
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {

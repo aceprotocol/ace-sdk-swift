@@ -55,11 +55,10 @@ import Testing
     @Test func rootIsNotRetainedAfterInceptRotate() throws {
         let (id, _) = try Self.incept()
         func check(_ label: String) throws {
-            let export = id.exportKeyReferences()
+            // What the host persists besides the signing key reference: the log.
+            let export = ExternalRootIdentityExport(signingKey: "", kel: try id.getKel())
             let data = try export.jsonData()
-            let o = try JSONValue(json: data).objectValue!
-            #expect(Set(o.keys) == ["signingKey", "kel"], "\(label)")
-            let text = String(decoding: data, as: UTF8.self)
+            let text = String(decoding: data, as: UTF8.self) + String(describing: Mirror(reflecting: id).children.map(\.value))
             for n in 0...3 {
                 // Roots appear in the KEL only once revealed (icp / rot carry them by design); seeds never appear.
                 #expect(!text.contains(ACEBase64.encode(Self.root(n).seed)), "\(label): seed \(n)")
@@ -73,18 +72,54 @@ import Testing
         try check("rotate")
     }
 
-    @Test func exportRoundTrips() throws {
+    /// The export never holds a seed: a software signing key is refused; the host rebuilds the identity from the log and a
+    /// key it holds itself.
+    @Test func exportRefusesASoftwareSigningKeyAndRestoresFromTheLog() throws {
         let (id, signing) = try Self.incept()
-        let export = id.exportKeyReferences()
-        #expect(export.signingKey == ACEBase64.encode(signing.seed))
-        let parsed = try ExternalRootIdentityExport(json: export.jsonData())
-        #expect(parsed == export)
+        expectCode(.invalidArgument, "software signing key") { try id.exportKeyReferences() }
+        let parsed = try ExternalRootIdentityExport(json: ExternalRootIdentityExport(signingKey: "ref", kel: try id.getKel()).jsonData())
         let restored = try ExternalRootIdentity(export: parsed, signingKey: try SoftwareKey(seed: signing.seed), now: NOW)
         #expect(try restored.getACEId() == id.getACEId() && restored.getKel() == id.getKel())
         expectCode(.invalidArgument, "wrong signing key") {
             try ExternalRootIdentity(export: parsed, signingKey: SoftwareKey.generate(), now: NOW)
         }
         expectCode(.invalidArgument, "not an object") { try ExternalRootIdentityExport(json: Data("[]".utf8)) }
+        guard testKeyProvider == "secure-enclave" else { return }
+        let se = try SecureEnclaveKey.generate()
+        let hw = try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Self.digest(1), signingKey: se, inceptedAt: 0, now: NOW)
+        let export = try hw.exportKeyReferences()
+        #expect(export.signingKey == ACEBase64.encode(se.dataRepresentation))
+        let back = try SecureEnclaveKey(dataRepresentation: try decodeB64(export.signingKey, code: .invalidArgument, what: "signingKey", maxBytes: 16384))
+        #expect(try ExternalRootIdentity(export: export, signingKey: back, now: NOW).getACEId() == hw.getACEId())
+    }
+
+    /// 01 § Rotation and recovery (SP3): the signer refuses a signing key that is the current root or the committed next
+    /// root, and a next root committing to a delegated signing key.
+    @Test func signerRefusesKeyReuseAcrossRolesInTheLog() throws {
+        let signing = SoftwareKey.generate()
+        expectCode(.invalidArgument, "signing key is the root") {
+            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: Self.digest(1), signingKey: Self.root(0), inceptedAt: 0, now: NOW)
+        }
+        expectCode(.invalidArgument, "signing key is the committed next root") {
+            try ExternalRootIdentity.incept(root: Self.root(0), nextRootDigest: keyDigest(publicKey: signing.publicKey()),
+                                            signingKey: signing, inceptedAt: 0, now: NOW)
+        }
+        let (id, held) = try Self.incept()
+        expectCode(.invalidArgument, "next commits to the delegated key") {
+            try id.rotate(revealing: Self.root(1), nextRootDigest: keyDigest(publicKey: held.publicKey()), now: NOW + 1)
+        }
+        expectCode(.invalidArgument, "recovered signing key is the revealed root") {
+            try ExternalRootIdentity.recover(kel: try id.getKel(), revealing: Self.root(1), nextRootDigest: Self.digest(2),
+                                             signingKey: Self.root(1), now: NOW + 1)
+        }
+        // A software identity: a next root committing to its (current or a past) signing key is refused.
+        let sw = try SoftwareIdentity.generate(now: NOW)
+        let first = sw.getSigningPublicKey()
+        try sw.delegate(now: NOW + 1)
+        for key in [first, sw.getSigningPublicKey()] {
+            expectCode(.invalidArgument, "software next = signing key") { try sw.rotate(now: NOW + 2, nextRootDigest: keyDigest(publicKey: key)) }
+        }
+        try sw.rotate(now: NOW + 2)
     }
 
     @Test func recoverWithTheCommittedNextRootRotatesAndDelegates() throws {
