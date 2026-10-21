@@ -56,12 +56,13 @@ factory; never build a client for such a URL with `RelayClient(baseURL:)`, which
 ## Security
 
 - **Peer relays (07 § Client rules, blocked addresses).** `RelayClient.foreign` accepts `https` only, follows no
-  redirects, keeps no cookies or credentials, and resolves the relay's host and refuses any blocked address before every
-  request and every listen reconnect. It cannot pin the connection to the checked address: URLSession resolves the name
-  again when it connects, so a DNS answer that changes in between (rebinding) is not caught, and the 07 requirement to
-  connect only to a validated address is not fully met. A host that needs full conformance passes its own `foreignRelay`
-  to `NetworkClient.open`, for example a client whose session goes through an egress proxy enforcing the blocked-address
-  policy.
+  redirects, keeps no cookies or credentials, and checks every DNS answer before each request and listen reconnect.
+  Network.framework connects directly to a validated numeric address while TLS verifies the original hostname and
+  uses it as SNI. HTTP retains the original authority. There is no second DNS lookup or cross-request connection
+  reuse. Connections prefer no proxy; a system-configured proxy is used only when a direct connection fails, and it is
+  still asked for the validated numeric address. Headers and request lifetimes are bounded; streaming reads apply an
+  idle timeout and backpressure.
+  Loopback HTTP is available only through the explicit development flag `allowLoopbackRelays`.
 - **Keys.** Prefer `SecureEnclaveIdentity` and `StorePrekeyVault(protection: .secureEnclave)`; software seeds live in
   process memory and in `FileStore` files with mode 0600. Printing an identity or an export never shows key material.
 - **Secure Enclave keys are device-bound, not user-presence bound.** The keys cannot leave the device, but any process

@@ -114,17 +114,12 @@ public actor RelayClient {
                       clock: clock, sleeper: RelayClient.taskSleeper, store: store, allowLoopbackRelays: allowLoopbackRelays)
     }
 
-    /// The default client for a relay named in a peer's descriptor (untrusted input, 07 § Client rules): `https` only
-    /// (`http` to a loopback host only with `allowLoopbackRelays`), an ephemeral session without cookies, cache or
-    /// credentials whose `timeout` bounds each whole request (not just idle time), no redirects, and the blocked-address policy before every request and every listen connection: the
-    /// host is resolved and any answer `isBlockedAddress` refuses is `blocked_address` (loopback answers pass only with
-    /// `allowLoopbackRelays`).
-    ///
-    /// Not fully conformant: 07 § Client rules requires connecting only to a validated address. This client resolves and
-    /// re-checks before every request and every reconnect, but URLSession resolves the name again when it connects and
-    /// cannot be pinned to the checked address, so a DNS answer that changes in between (rebinding) is not caught. A host
-    /// that needs full conformance passes its own `foreignRelay` to `NetworkClient.open`, for example one whose session
-    /// goes through an egress proxy that enforces the blocked-address policy.
+    /// The default client for a relay named in a peer's descriptor (untrusted input, 07 § Client rules).
+    /// Each request resolves the host once, rejects any blocked answer, and connects to a vetted numeric IP.
+    /// TLS still verifies the original hostname and sends it as SNI; HTTP uses the original authority.
+    /// Connections have bounded headers/body reads and no redirects, cookies, cache or credentials; a system proxy is
+    /// used only when a direct connection fails, and it still targets the vetted address.
+    /// `http` and loopback addresses require the explicit development flag `allowLoopbackRelays`.
     public static func foreign(_ url: String, allowLoopbackRelays: Bool = false, timeout: TimeInterval = 10,
                                clock: @escaping @Sendable () -> Int = systemClock) throws -> RelayClient {
         let normalized = try normalizeRelayURL(url)
@@ -157,7 +152,7 @@ public actor RelayClient {
         guard isRelayRoute(normalized, allowLoopback: allowLoopbackRelays), let url = URL(string: normalized) else {
             throw ACEError(.invalidArgument, "baseURL must be a canonical relay URL (https; loopback http only in development)")
         }
-        guard timeout > 0, maxResponseBytes > 0 else { throw ACEError(.invalidArgument, "timeout and maxResponseBytes must be positive") }
+        guard timeout.isFinite, timeout > 0, maxResponseBytes > 0 else { throw ACEError(.invalidArgument, "timeout and maxResponseBytes must be positive") }
         self.baseURL = url
         self.baseURLString = normalized
         self.session = session
@@ -169,19 +164,6 @@ public actor RelayClient {
         self.allowLoopbackRelays = allowLoopbackRelays
         self.checksAddresses = checksAddresses
         self.ownsSession = ownsSession
-    }
-
-    /// 07 § Client rules, blocked addresses: every address the host resolves to must pass `isBlockedAddress` (loopback
-    /// only with `allowLoopbackRelays`); `blocked_address` otherwise, `relay_unavailable` when it does not resolve.
-    private func checkAddresses() async throws {
-        guard checksAddresses else { return }
-        let host = baseURL.host(percentEncoded: false) ?? ""
-        let allowLoopback = allowLoopbackRelays
-        let addresses = try await resolveAddresses(host.hasPrefix("[") ? String(host.dropFirst().dropLast()) : host)
-        guard !addresses.isEmpty else { throw ACEError(.relayUnavailable, "\(host) does not resolve") }
-        for a in addresses where isBlockedAddress(a) && !(allowLoopback && isLoopbackAddress(a)) {
-            throw ACEError(.blockedAddress, "\(host) resolves to a blocked address")
-        }
     }
 
     /// The next strictly increasing registration-ordering timestamp, at least `floor` (persisted when a store is set).
@@ -448,24 +430,21 @@ public actor RelayClient {
                              onProgress: () -> Void) async throws -> Bool {
         var q: [(String, String)] = []
         if cursor != "-" { q.append(("since", cursor)) }
-        var bytes: URLSession.AsyncBytes?
+        var bytes: RelayResponseBytes?
         var http: HTTPURLResponse?
-        let session = listenSession()
-        try await checkAddresses()  // re-checked on every reconnect
         for attempt in 0..<2 {
             var request = try makeRequest("GET", "/v1/listen", query: q, body: nil)
             // URLSession's request timeout is an idle timeout: a silent stream is dropped.
             request.timeoutInterval = max(timeout, Self.idleTimeoutSeconds)
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
             try addAuth(&request, identity, .listen(since: cursor))
-            let response: URLResponse
-            let b: URLSession.AsyncBytes
+            let h: HTTPURLResponse
+            let b: RelayResponseBytes
             do {
-                (b, response) = try await session.bytes(for: request, delegate: noRedirect)
+                (b, h) = try await responseBytes(request, streaming: true)
             } catch {
                 throw transportError(error, "listen connect failed")
             }
-            guard let h = response as? HTTPURLResponse else { throw ACEError(.relayProtocolError, "not an HTTP response") }
             if h.statusCode == 200 {
                 bytes = b
                 http = h
@@ -480,21 +459,19 @@ public actor RelayClient {
             throw error
         }
         guard let bytes, let http else { throw ACEError(.relayProtocolError, "listen connect failed") }
+        defer { bytes.cancel() }
         guard mediaType(http) == "text/event-stream" else {
-            bytes.task.cancel()
             throw ACEError(.relayProtocolError, "listen response is not text/event-stream")
         }
         do { try onOpen?() } catch { throw OnOpenFailure(error: error) }
         var parser = SSEParser(maxLine: ACELimits.maxSendBodyBytes)
         // Cancel the data task itself on task cancellation, so a stream that only carries
         // heartbeats (or nothing) is torn down at once; every exit path cancels it too.
-        let dataTask = bytes.task
-        defer { dataTask.cancel() }
         do {
             return try await withTaskCancellationHandler {
                 try await readEvents(bytes, &parser, cursor: &cursor, out, onProgress: onProgress)
             } onCancel: {
-                dataTask.cancel()
+                bytes.cancel()
             }
         } catch let e as ACEError {
             throw e
@@ -506,7 +483,7 @@ public actor RelayClient {
     /// Feed the stream to `parser`; returns at `drain` or end of stream, with whether the
     /// connection made progress (a `catchup`, `message` or `drain` frame, each of which calls
     /// `onProgress`; `connected`, other types and comments do not).
-    private func readEvents(_ bytes: URLSession.AsyncBytes, _ parser: inout SSEParser, cursor: inout String,
+    private func readEvents(_ bytes: RelayResponseBytes, _ parser: inout SSEParser, cursor: inout String,
                             _ out: AsyncThrowingStream<Event, Error>.Continuation, onProgress: () -> Void) async throws -> Bool {
         var sawEvent = false
         for try await byte in bytes {
@@ -573,7 +550,6 @@ public actor RelayClient {
                       auth: (any ACEIdentity, RelayAuthRequest)? = nil) async throws -> JSONValue {
         var attempt = 0
         while true {
-            try await checkAddresses()
             var request = try makeRequest(method, path, query: query, body: body)
             if let auth { try addAuth(&request, auth.0, auth.1) }
             let (http, data) = try await perform(request)
@@ -596,10 +572,23 @@ public actor RelayClient {
         }
     }
 
+    private func responseBytes(_ request: URLRequest, streaming: Bool) async throws -> (RelayResponseBytes, HTTPURLResponse) {
+        if checksAddresses {
+            return try await PinnedRelayTransport.open(request, allowLoopback: allowLoopbackRelays,
+                                                       timeout: timeout, streaming: streaming)
+        }
+        let source = streaming ? listenSession() : session
+        let (bytes, response) = try await source.bytes(for: request, delegate: noRedirect)
+        guard let http = response as? HTTPURLResponse else {
+            bytes.task.cancel()
+            throw ACEError(.relayProtocolError, "not an HTTP response")
+        }
+        return (RelayResponseBytes(bytes), http)
+    }
+
     private func perform(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
         do {
-            let (bytes, response) = try await session.bytes(for: request, delegate: noRedirect)
-            guard let http = response as? HTTPURLResponse else { throw ACEError(.relayProtocolError, "not an HTTP response") }
+            let (bytes, http) = try await responseBytes(request, streaming: false)
             return (http, try await readBounded(bytes))
         } catch let e as ACEError {
             throw e
@@ -610,13 +599,15 @@ public actor RelayClient {
 
     /// Map a URLSession failure: cancellation stays cancellation, anything else is `relay_unavailable`.
     private func transportError(_ error: Error, _ what: String) -> Error {
+        if let error = error as? ACEError { return error }
         if error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled) {
             return CancellationError()
         }
         return ACEError(.relayUnavailable, "\(what): \(error.localizedDescription)")
     }
 
-    private func readBounded(_ bytes: URLSession.AsyncBytes) async throws -> Data {
+    private func readBounded(_ bytes: RelayResponseBytes) async throws -> Data {
+        defer { bytes.cancel() }
         var data = Data()
         do {
             for try await b in bytes {

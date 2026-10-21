@@ -398,15 +398,22 @@ public actor NetworkClient: PacketTransport {
     }
 
     private nonisolated static func validCardPin(_ p: JSONValue) -> Bool {
-        p["issuedAt"]?.wireInt != nil && p["digest"]?.stringValue != nil && p["home"]?.stringValue != nil
-            && (p["handle"] == nil || p["handle"]?.stringValue != nil)
+        guard p["issuedAt"]?.wireInt != nil, let digest = p["digest"]?.stringValue, isSHA256Hex(digest),
+              let home = p["home"]?.stringValue, isRelayRoute(home, allowLoopback: true),
+              p["handle"].map({ $0.stringValue.map(isHandle) == true && URLComponents(string: home)?.percentEncodedPath.isEmpty == true }) ?? true else { return false }
+        guard let raw = p["handles"] else { return true }  // legacy single-home pin
+        guard let handles = raw.objectValue,
+              handles.allSatisfy({ isRelayRoute($0.key, allowLoopback: true) && URLComponents(string: $0.key)?.percentEncodedPath.isEmpty == true
+                  && $0.value.stringValue.map(isHandle) == true }) else { return false }
+        // New records retain the legacy fields for older readers; disagreement is corruption, never a forgotten pin.
+        return handles[home]?.stringValue == p["handle"]?.stringValue
     }
 
     private nonisolated static func validOwnerPin(_ p: JSONValue) -> Bool {
         p["aceId"]?.stringValue != nil && p["home"]?.stringValue != nil && p["handle"]?.stringValue != nil
     }
 
-    /// Verify a fetched card record against the identity's KEL pin and its card pin `{home, handle?, issuedAt, digest}`
+    /// Verify a fetched card record against the identity's KEL pin and its card pin `{home, handle?, handles, issuedAt, digest}`
     /// (written on first sight, only after full verification): no rollback first, then the set-once handle per home. A
     /// record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
     private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil, kelLive: Bool = true) async throws -> VerifiedCard {
@@ -435,19 +442,21 @@ public actor NetworkClient: PacketTransport {
     private nonisolated func advanceCardPin(_ r: CardRecord, digest: String, key: String) throws {
         let pin = try readPin(key, Self.validCardPin)
         let pinHome = pin?["home"]?.stringValue, pinHandle = pin?["handle"]?.stringValue
+        var handles = pin?["handles"]?.objectValue ?? [:]
+        if let pinHome, let pinHandle { handles[pinHome] = .string(pinHandle) }
         if let pinAt = pin?["issuedAt"]?.wireInt {
             if r.issuedAt < pinAt { throw ACEError(.staleDescriptor, "an older card record than one already verified") }
             if r.issuedAt == pinAt {
                 guard digest == pin?["digest"]?.stringValue else { throw ACEError(.staleDescriptor, "another card record with the same issuedAt") }
-                return
             }
         }
-        if let pinHandle, pinHome == r.home, pinHandle != r.handle {
+        if let expected = handles[r.home]?.stringValue, expected != r.handle {
             throw ACEError(.invalidAuthorization, "the card record does not carry the handle this identity set")
         }
-        // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
-        // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
-        var next: [String: JSONValue] = ["issuedAt": .number(Double(r.issuedAt)), "digest": .string(digest)]
+        if let handle = r.handle { handles[r.home] = .string(handle) }
+        // Preserve every home's binding in the same atomic record. Import the legacy binding before moving homes;
+        // keep its fields too so existing readers retain their last-home behavior.
+        var next: [String: JSONValue] = ["issuedAt": .number(Double(r.issuedAt)), "digest": .string(digest), "handles": .object(handles)]
         if let pinHandle, let pinHome, r.handle == nil || pinHome == r.home {
             next["home"] = .string(pinHome)
             next["handle"] = .string(pinHandle)
@@ -647,14 +656,16 @@ public actor NetworkClient: PacketTransport {
 
     /// Follow the home relay's listen stream: each entry is processed and acknowledged before its outcome is yielded.
     /// Ends at an entry without a final disposition (pull again later), on cancellation, or with `relay_unavailable`.
+    /// At most 64 outcomes wait for the consumer; a full buffer pauses processing without dropping an outcome.
     public nonisolated func follow() -> AsyncThrowingStream<ReceiveOutcome, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(64)) { continuation in
             let task = Task {
                 do {
                     let inbox = try await self.receiving()
                     for try await event in self.relay.listen(self.identity) {
+                        try Task.checkCancellation()
                         let outcome = try await inbox.followed(event)
-                        continuation.yield(outcome)
+                        try await continuation.yieldWaiting(outcome)
                         guard outcome.isFinal else { break }
                     }
                     continuation.finish()
@@ -691,6 +702,7 @@ public actor NetworkClient: PacketTransport {
         let source = try await publish()
         let now = try now()
         try admission.update(peer) { r in
+            guard r?.state != .blocked else { throw ACEError(.notPermitted, "the peer is blocked; unblock it first") }
             var r = r ?? AdmissionRecord(aceId: peer, state: .pending, updatedAt: now)
             if r.state != .admitted {
                 r.state = .pending
@@ -765,11 +777,11 @@ public actor NetworkClient: PacketTransport {
             r.profile = profile
             return r
         }
-        guard clearsBlock, try admission.get(peer)?.state == .blocked else {
+        guard clearsBlock else {
             try admission.update(peer, admitted)
             return
         }
-        await registerBlock(try admission.decideBlock(peer, blocked: false, admitted))
+        if let record = try admission.updateClearingBlock(peer, admitted) { await registerBlock(record) }
     }
 
     /// The held request (24 h) outlived its source descriptor: pin the source's KEL (05 § Flow step 3), then refresh the

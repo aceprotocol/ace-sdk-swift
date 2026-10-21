@@ -418,11 +418,12 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         #expect(try await bob.network.requests().map(\.from) == [alice.aceId])
         try await bob.network.block(alice.aceId)
         await expectCodeAsync(.invalidArgument) { try await bob.network.accept(alice.aceId) }  // block() drops the held request
-        // even with a request held again (written beside the block), accept refuses
-        try bob.network.admission.putRequest(ContactRequest(from: alice.aceId, profile: "ace:text:1", note: "",
-                                                            source: try await alice.network.publish().source,
-                                                            permit: try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now),
-                                                            receivedAt: clock.now))
+        // An old residual request beside a block is still refused; current putRequest cannot recreate one.
+        let residual = ContactRequest(from: alice.aceId, profile: "ace:text:1", note: "",
+                                      source: try await alice.network.publish().source,
+                                      permit: try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now),
+                                      receivedAt: clock.now)
+        try bob.store.write("requests/\(sha256Hex(Data(residual.from.utf8))).json", try residual.jsonValue.jsonData())
         await expectCodeAsync(.notPermitted) { try await bob.network.accept(alice.aceId) }
         #expect(try bob.network.admission.get(alice.aceId)?.state == .blocked)
         #expect(relay.blocked(by: bob.aceId, alice.aceId) == true)

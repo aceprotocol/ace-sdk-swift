@@ -238,6 +238,20 @@ public struct AdmissionTable: Sendable {
         }
     }
 
+    /// Explicit admission may lift the current block. Decide whether its relay revision must advance in the same
+    /// critical section as the row update: another store client cannot insert a block between the two decisions.
+    package func updateClearingBlock(_ peer: String, _ body: (AdmissionRecord?) throws -> AdmissionRecord?) throws -> BlockRecord? {
+        try store.withLock("admission") {
+            let wasBlocked = try live(peer)?.state == .blocked
+            try updateLocked(peer, body)
+            guard wasBlocked else { return nil }
+            let revision = (try blockRecord(peer)?.revision ?? 0) + 1
+            let record = BlockRecord(peer: peer, blocked: false, revision: revision, unsyncedRevision: revision)
+            try writeBlock(record)
+            return record
+        }
+    }
+
     /// The relays accepted (or already hold a higher revision than) `revision`: clear `unsyncedRevision`, unless a newer
     /// decision replaced it meanwhile.
     package func blockSynced(_ peer: String, revision: Int) throws {
@@ -291,6 +305,7 @@ public struct AdmissionTable: Sendable {
     /// Hold `r` (dated `receivedAt`): one slot per sender (replaced), expired ones dropped, the oldest evicted when full.
     func putRequest(_ r: ContactRequest) throws {
         try store.withLock("admission") {
+            guard try live(r.from)?.state != .blocked else { return }
             var held = try requests(now: r.receivedAt).filter { $0.from != r.from }
             while held.count >= ACELimits.maxPendingContactRequests {
                 try store.checkedDelete(Self.requestKey(held.removeFirst().from))

@@ -152,7 +152,10 @@ public struct ProfileManifest: Sendable {
     /// True when `value` matches the (checked) schema. String lengths are in Unicode code points.
     package static func matches(_ schema: JSONValue, _ value: JSONValue) -> Bool {
         let s = schema.objectValue!
-        if let choices = s["enum"]?.arrayValue, !choices.contains(value) { return false }
+        if let choices = s["enum"]?.arrayValue {
+            // Swift String equality folds canonically equivalent Unicode; the wire schema compares canonical bytes.
+            guard let canonical = try? value.jsonData(), choices.contains(where: { (try? $0.jsonData()) == canonical }) else { return false }
+        }
         switch s["type"]!.stringValue! {
         case "object":
             guard let v = value.objectValue else { return false }

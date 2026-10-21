@@ -162,6 +162,7 @@ public final class ReplayDetector: @unchecked Sendable {
     private var live: [LiveKey: Int] = [:]
     private var global = MinHeap<GEntry>()
     private var perSender: [String: MinHeap<SEntry>] = [:]
+    private var senderHeapSize = 0
     private var counts: [String: Int] = [:]
     private let lock = NSLock()
 
@@ -282,6 +283,7 @@ public final class ReplayDetector: @unchecked Sendable {
         live[LiveKey(sender: s, id: id)] = ts
         global.push(GEntry(ts: ts, sender: s, id: id))
         perSender[s, default: MinHeap()].push(SEntry(ts: ts, id: id))
+        senderHeapSize += 1
         counts[s, default: 0] += 1
     }
 
@@ -292,6 +294,7 @@ public final class ReplayDetector: @unchecked Sendable {
             counts[s] = c
         } else {
             counts[s] = nil
+            senderHeapSize -= perSender[s]?.items.count ?? 0
             perSender[s] = nil
         }
     }
@@ -308,6 +311,7 @@ public final class ReplayDetector: @unchecked Sendable {
         var changed = false
         while let top = h.first, live[LiveKey(sender: s, id: top.id)] != top.ts {
             h.pop()
+            senderHeapSize -= 1
             changed = true
         }
         if changed { perSender[s] = h }
@@ -315,6 +319,7 @@ public final class ReplayDetector: @unchecked Sendable {
     }
 
     private func setSH(_ s: String, _ h: Int) {
+        guard sh[s] != h else { return }
         sh[s] = h
         shHeap.push(HEntry(h: h, sender: s))
     }
@@ -356,15 +361,28 @@ public final class ReplayDetector: @unchecked Sendable {
 
     private func compact() {
         dropCoveredSH()
-        guard sh.count > capacity else { return }
-        let excess = sh.count - capacity / 2
-        let sorted = sh.map { HEntry(h: $0.value, sender: $0.key) }.sorted()
-        for e in sorted.prefix(excess) {
-            sh[e.sender] = nil
-            _horizon = max(_horizon, e.h)
+        if sh.count > capacity {
+            let excess = sh.count - capacity / 2
+            let sorted = sh.map { HEntry(h: $0.value, sender: $0.key) }.sorted()
+            for e in sorted.prefix(excess) {
+                sh[e.sender] = nil
+                _horizon = max(_horizon, e.h)
+            }
+            purgeGlobal()
+            dropCoveredSH()
+            shHeap = MinHeap(sh.map { HEntry(h: $0.value, sender: $0.key) })
         }
-        purgeGlobal()
-        dropCoveredSH()
-        shHeap = MinHeap(sh.map { HEntry(h: $0.value, sender: $0.key) })
+        // Lazy deletion must also bound the heaps, not only the live maps. An old live entry can otherwise keep
+        // arbitrarily many newer tombstones away from a heap's head. Rebuilding changes no replay decisions.
+        if shHeap.items.count - sh.count > max(sh.count, 16) {
+            shHeap = MinHeap(sh.map { HEntry(h: $0.value, sender: $0.key) })
+        }
+        if global.items.count - live.count > max(live.count, 16) || senderHeapSize - live.count > max(live.count, 16) {
+            global = MinHeap(live.map { GEntry(ts: $0.value, sender: $0.key.sender, id: $0.key.id) })
+            var grouped: [String: [SEntry]] = [:]
+            for (key, ts) in live { grouped[key.sender, default: []].append(SEntry(ts: ts, id: key.id)) }
+            perSender = grouped.mapValues { MinHeap($0) }
+            senderHeapSize = live.count
+        }
     }
 }

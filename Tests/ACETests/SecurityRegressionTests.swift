@@ -117,7 +117,8 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
         let held = try #require(try await bob.network.requests().first)
         try await bob.network.block(alice.aceId)
         #expect(try await bob.network.requests().isEmpty)
-        try bob.network.admission.putRequest(held)  // a residual request (e.g. stored by a racing receive)
+        // Simulate an old residual record directly: current putRequest refuses to recreate one for a blocked peer.
+        try bob.store.write("requests/\(sha256Hex(Data(held.from.utf8))).json", try held.jsonValue.jsonData())
         await expectCodeAsync(.notPermitted) { try await bob.network.accept(alice.aceId) }
         #expect(try bob.network.admission.get(alice.aceId)?.state == .blocked)
         #expect(relay.blocked(by: bob.aceId, alice.aceId) == true)
