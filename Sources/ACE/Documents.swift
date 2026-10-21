@@ -33,8 +33,7 @@ package func verifyDocument(_ o: [String: JSONValue], state: KelState, action: S
         throw unauthorized("\(action) signature must be {scheme: ml-dsa-65, seq, value}")
     }
     do {
-        try verifyOperational(sig, state: state, action: action, timestamp: issuedAt,
-                              payload: try JSONValue.object(o.filter { $0.key != "signature" }).jsonData(), now: now)
+        try verifyOperational(sig, state: state, action: action, timestamp: issuedAt, payload: try documentClaims(o), now: now)
     } catch let e as ACEError where e.code != .stalePeerBinding {
         throw unauthorized("\(action): \(e.message)")
     }
@@ -576,13 +575,27 @@ public struct VerifiedCard: Sendable, Equatable {
     public var aceId: String { record.aceId }
 }
 
-/// A CAIP-10 account ID (`namespace:reference:address`).
+/// A CAIP-10 account ID (`namespace:reference:address`): `isCAIP10` under the name sdk-ts (`isCaip10Account`) and sdk-py
+/// (`is_caip10_account`) export.
 public func isCaip10Account(_ value: String) -> Bool { isCAIP10(value) }
 
-/// The SHA-256 (hex) of a signed document's canonical claims (the document without `signature`).
+/// A signed document's canonical claims: the document without `signature`.
+private func documentClaims(_ o: [String: JSONValue]) throws -> Data {
+    try JSONValue.object(o.filter { $0.key != "signature" }).jsonData()
+}
+
+/// The SHA-256 (hex) of a signed document's canonical claims.
 package func documentDigest(_ document: JSONValue) throws -> String {
     guard let o = document.objectValue else { throw ACEError(.invalidArgument, "a document is an object") }
-    return sha256Hex(try JSONValue.object(o.filter { $0.key != "signature" }).jsonData())
+    return sha256Hex(try documentClaims(o))
+}
+
+/// The card record's settings: its claims less `aceId`, `issuedAt` and `signature`.
+package func cardClaims(home: String, handle: String?, card: AgentCard, pay: [String]?, contact: Contact, listed: Bool) -> [String: JSONValue] {
+    var claims: [String: JSONValue] = ["home": .string(home), "card": card.jsonValue, "contact": .string(contact.rawValue), "listed": .bool(listed)]
+    if let handle { claims["handle"] = .string(handle) }
+    if let pay { claims["pay"] = .array(pay.map { .string($0) }) }
+    return claims
 }
 
 /// Create and sign this identity's CardBundle `{kel, card}` (action `card-record` at `issuedAt = now`), verified before it
@@ -591,12 +604,9 @@ public func createCardRecord(identity: any ACEIdentity, home: String, handle: St
                              pay: [String]? = nil, contact: Contact, listed: Bool, now: Int? = nil,
                              allowLoopback: Bool = false) throws -> CardBundle {
     let at = try identityNow(now)
-    var claims: [String: JSONValue] = [
-        "aceId": .string(identity.getACEId()), "issuedAt": .number(Double(at)), "home": .string(home), "card": card.jsonValue,
-        "contact": .string(contact.rawValue), "listed": .bool(listed),
-    ]
-    if let handle { claims["handle"] = .string(handle) }
-    if let pay { claims["pay"] = .array(pay.map { .string($0) }) }
+    var claims = cardClaims(home: home, handle: handle, card: card, pay: pay, contact: contact, listed: listed)
+    claims["aceId"] = .string(identity.getACEId())
+    claims["issuedAt"] = .number(Double(at))
     let record = try signDocument(identity, action: "card-record", claims: claims)
     let bundle: JSONValue = ["kel": ExportJSON.kelValue(try identity.getKel()), "card": .object(record)]
     _ = try verifyCardBundle(bundle, now: at, allowLoopback: allowLoopback)
@@ -639,13 +649,11 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     let card = try AgentCard(r["card"])
     var pay: [String]?
     if let raw = r["pay"] {
-        guard let list = raw.arrayValue, (1...ACELimits.maxPayAccounts).contains(list.count), Set(list).count == list.count else {
+        guard let items = raw.arrayValue, case let list = items.compactMap(\.stringValue), list.count == items.count,
+              (1...ACELimits.maxPayAccounts).contains(list.count), Set(list).count == list.count, list.allSatisfy(isCAIP10) else {
             throw unauthorized("pay must hold 1-\(ACELimits.maxPayAccounts) distinct CAIP-10 accounts")
         }
-        pay = try list.map { item in
-            guard let s = item.stringValue, isCAIP10(s) else { throw unauthorized("pay must hold 1-\(ACELimits.maxPayAccounts) distinct CAIP-10 accounts") }
-            return s
-        }
+        pay = list
     }
     guard let contact = r["contact"]?.stringValue.flatMap(Contact.init(rawValue:)) else { throw unauthorized("contact must be open or closed") }
     guard let listed = r["listed"]?.boolValue else { throw unauthorized("listed must be a boolean") }

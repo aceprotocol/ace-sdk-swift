@@ -42,9 +42,14 @@ package protocol HeldKelIdentity: ACEIdentity {
     var heldState: KelState { get }
 }
 
-package func checkNextDigest(_ nextRootDigest: Data?) throws -> Data? {
-    if let d = nextRootDigest, d.count != 32 { throw ACEError(.invalidArgument, "nextRootDigest must be 32 bytes") }
+package func checkNextDigest(_ nextRootDigest: Data) throws -> Data {
+    guard nextRootDigest.count == 32 else { throw ACEError(.invalidArgument, "nextRootDigest must be 32 bytes") }
     return nextRootDigest
+}
+
+package func checkNextDigest(_ nextRootDigest: Data?) throws -> Data? {
+    guard let d = nextRootDigest else { return nil }
+    return try checkNextDigest(d) as Data
 }
 
 /// `now` (wire-integer Unix seconds) or the system clock; anything else is `invalid_argument`.

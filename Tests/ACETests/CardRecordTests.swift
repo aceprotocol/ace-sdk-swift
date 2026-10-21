@@ -337,6 +337,65 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         await bob.close()
     }
 
+    @Test func aHandleLookupReusesTheCardRecordItResolvedThrough() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        let bob = try await peer(relay, clock)
+        let start = relay.requestCount
+        let found = try await bob.network.lookupWithCard("@alice@\(relay.host)")
+        #expect(found.card?.record.contact == .open)
+        #expect(found.card?.kelLive == true)
+        try await bob.network.connect("@alice@\(relay.host)", profile: ProfileManifest.text.id)
+        let paths = relay.withLock { Array(relay.requests[start...]) }
+        #expect(paths.filter { $0.hasPrefix("GET /v1/card/") }.isEmpty)
+        #expect(paths.filter { $0.hasPrefix("GET /v1/handles/") }.count == 2)
+        // By ACE ID, the card record is looked up after the descriptor.
+        #expect(try await bob.network.lookupWithCard(alice.aceId).card?.record.handle == "alice")
+    }
+
+    @Test func aRelayServingAnUnverifiableDocumentIsRelayProtocolErrorNeverAVerdictOnThePeer() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
+        let card = try #require(relay.card(alice.aceId))
+        relay.setCard(alice.aceId, withRecord(card, ["listed": true]))  // the signature no longer verifies
+        let client = try relay.client(clock: clock.fn)
+        await expectCodeAsync(.relayProtocolError) { try await client.card(alice.aceId) }
+        await expectCodeAsync(.relayProtocolError) { try await client.handle("alice") }
+        // A tampered descriptor too, with the verifier's reason kept.
+        let source = try #require(relay.publishedAgent(alice.aceId)).source
+        var d = try #require(source["descriptor"]?.objectValue)
+        d["expiresAt"] = .number(Double(clock.now + 3600))
+        let tampered: JSONValue = ["kel": source["kel"]!, "descriptor": .object(d)]
+        let stub = try makeRelay({ _, _ in .json(200, tampered) }, clock: clock.fn)
+        do {
+            _ = try await stub.descriptor(alice.aceId)
+            Issue.record("expected relay_protocol_error")
+        } catch let e as ACEError {
+            #expect(e.code == .relayProtocolError && e.message.hasPrefix("relay served an invalid descriptor: "), "\(e)")
+        }
+    }
+
+    @Test func acceptingARequestWhoseSourceExpiredPinsItsKelAsNotConfirmedLiveUntilADescriptorConfirmsIt() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let alice = try await peer(relay, clock, contact: .open)
+        let bob = try await peer(relay, clock)
+        clock.now = try await bob.network.publish().descriptor.expiresAt - 3601
+        try await bob.network.connect(alice.aceId, profile: ProfileManifest.text.id)
+        _ = try await alice.network.pull()
+        #expect(try await alice.network.requests().map(\.from) == [bob.aceId])
+        // Bob goes offline past his descriptor's lifetime: the held request outlives its source.
+        clock.now += 7200
+        relay.dropAgent(bob.aceId)
+        await expectCodeAsync(.unknownPeer) { try await alice.network.accept(bob.aceId) }
+        #expect(try await alice.network.peers.pinned(bob.aceId) != nil)
+        #expect(try await alice.network.lookupCard(bob.aceId).kelLive == false)
+        // Bob republishes: the next card lookup sees a live descriptor and confirms the pin, durably.
+        try await bob.network.publish()
+        #expect(try await alice.network.lookupCard(bob.aceId).kelLive == true)
+        relay.dropAgent(bob.aceId)
+        #expect(try await alice.network.lookupCard(bob.aceId).kelLive == true)
+    }
+
     @Test func pinMissingRequiredFieldsIsStorageFailed() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await peer(relay, clock, contact: .open, handle: "alice")

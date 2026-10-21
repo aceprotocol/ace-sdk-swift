@@ -358,4 +358,108 @@ private final class GateTransport: PacketTransport, @unchecked Sendable {
         let ok = try createPublishedAgent(identity: alice.identity, claims: fresh, now: now - 1)
         #expect(try await peers.adopt(source: ok.source).descriptor.delegations.map(\.issuer) == [dave.getACEId()])
     }
+
+    /// Bob, on `relay`, reaching any other relay as `relayB`.
+    private func routedPeer(_ relay: FakeRelay, _ relayB: FakeRelay, _ clock: TestClock) async throws -> NetworkClient {
+        let store = MemoryStore()
+        return try await NetworkClient.open(identity: try makeIdentity(now: clock.now), store: store, relay: try relay.client(clock: clock.fn),
+                                            prekeys: StorePrekeyVault(store: store), receive: false,
+                                            foreignRelay: { _ in try relayB.client(clock: clock.fn) }, clock: clock.fn)
+    }
+
+    /// Every route is tried: one replaying an older descriptor (`stale_peer_binding`, a permanent code) never blocks a
+    /// lookup the next route serves.
+    @Test func aRouteReplayingAnOlderDescriptorDoesNotBlockTheNext() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn), relayB = FakeRelay(clock: clock.fn)
+        let alice = try await NetPeer.make(relay, clock: clock)
+        let prekey = try #require(relay.publishedAgent(alice.aceId)).descriptor.prekey
+        func descriptor(_ relays: [String], lifetime: Int = ACELimits.defaultDescriptorSeconds) throws -> VerifiedAgent {
+            clock.now += 1
+            return try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+                relays: relays, prekey: prekey, profiles: [ProfileManifest.text.ref]), now: clock.now, lifetime: lifetime)
+        }
+        // Relay B keeps serving an older revision; the home relay serves the newest.
+        let old = try descriptor([relayB.url, relay.url])
+        try await relayB.client(clock: clock.fn).register(alice.identity)
+        try await relayB.client(clock: clock.fn).publish(old)
+        let held = try descriptor([relayB.url, relay.url], lifetime: 60)
+        let newest = try descriptor([relay.url])
+        try await relay.client(clock: clock.fn).publish(newest)
+        let bob = try await routedPeer(relay, relayB, clock)
+        try await bob.importAgent(held.source)
+        clock.now += 120  // the held one expired: refreshed from its routes, relay B first
+        #expect(try await bob.lookup(alice.aceId).source == newest.source)
+        await bob.close()
+    }
+
+    /// A cached descriptor no longer bound to the current pins (here a delegation issuer's pin advanced past the key that
+    /// signed its entry) is refreshed from its relays and the home relay; a bound one from its relays alone.
+    @Test func aStaleCachedDescriptorIsRefreshedFromItsRelaysAndTheHomeRelay() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn), relayB = FakeRelay(clock: clock.fn)
+        let alice = try await NetPeer.make(relay, clock: clock)  // the home relay holds an older revision only
+        let dave = try makeIdentity(now: clock.now)
+        let prekey = try #require(relay.publishedAgent(alice.aceId)).descriptor.prekey
+        clock.now += 1
+        let delegated = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+            relays: [relayB.url], prekey: prekey, profiles: [ProfileManifest.text.ref],
+            delegations: [try createDelegation(issuer: dave, subject: alice.aceId, now: clock.now)]), now: clock.now)
+        let bob = try await routedPeer(relay, relayB, clock)
+        try await bob.peers.pin(kel: try dave.getKel())
+        try await bob.importAgent(delegated.source)
+        clock.now += 1
+        try dave.delegate(now: clock.now, notAfter: nil)
+        try await bob.peers.pin(kel: try dave.getKel())
+        #expect(try await bob.peers.agent(alice.aceId) == nil)  // stale
+        clock.now += 1
+        let current = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+            relays: [relayB.url], prekey: prekey, profiles: [ProfileManifest.text.ref]), now: clock.now)
+        try await relayB.client(clock: clock.fn).register(alice.identity)
+        try await relayB.client(clock: clock.fn).publish(current)
+        let homeAsked = relay.requestCount
+        #expect(try await bob.agent(alice.aceId).source == current.source)  // relay B, the cached route, first
+        // Bound now: a refresh asks its relays alone, never the home relay.
+        #expect(try await bob.agent(alice.aceId, refresh: true).source == current.source)
+        #expect(relay.withLock { relay.requests[homeAsked...].filter { $0.hasPrefix("GET /v1/descriptor/") } }.isEmpty)
+        relayB.withLock { relayB.down = ["/v1/descriptor/\(alice.aceId)"] }
+        await expectCodeAsync(.relayUnavailable) { try await bob.agent(alice.aceId, refresh: true) }
+        #expect(relay.withLock { relay.requests[homeAsked...].filter { $0.hasPrefix("GET /v1/descriptor/") } }.isEmpty)
+        await bob.close()
+    }
+
+    /// The pin advancing past a cached descriptor's KEL (a new `dlg`, a rotation) unbinds it: it is never used again (not
+    /// returned, its prekey never encrypted to), and the refresh asks its relays, then the home relay; the new descriptor
+    /// replaces it only once it verifies under the current pin.
+    @Test(arguments: ["dlg", "rotation"])
+    func aPinAdvancedPastTheCachedDescriptorRefreshesFromItsRelaysAndTheHomeRelay(_ advance: String) async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn), relayB = FakeRelay(clock: clock.fn)
+        let alice = try await NetPeer.make(relay, clock: clock)  // the home relay holds a descriptor under the old KEL only
+        let prekey = try #require(relay.publishedAgent(alice.aceId)).descriptor.prekey
+        clock.now += 1
+        let cached = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+            relays: [relayB.url], prekey: prekey, profiles: [ProfileManifest.text.ref]), now: clock.now)
+        let bob = try await routedPeer(relay, relayB, clock)
+        try await bob.importAgent(cached.source)
+        clock.now += 1
+        if advance == "dlg" { try alice.identity.delegate(now: clock.now, notAfter: nil) } else { try rotate(alice.identity, now: clock.now) }
+        try await bob.peers.pin(kel: try alice.identity.getKel())
+        // Unbound: never returned, its prekey never used, even unexpired.
+        #expect(try await bob.peers.agent(alice.aceId) == nil)
+        #expect(try await bob.peers.usableAgent(alice.aceId) == nil)
+        #expect(try await bob.peers.heldRelays(alice.aceId) == [relayB.url])
+        await expectCodeAsync(.stalePeerBinding) { try await bob.prekey(for: alice.aceId, refresh: false) }  // relay B has none: home's is stale
+        // Kept across reopening.
+        let reopened = PeerStore(store: bob.store, clock: clock.fn)
+        #expect(try await reopened.heldRelays(alice.aceId) == [relayB.url])
+        // Relay B serves the descriptor under the new KEL: asked first, it replaces the stale one.
+        clock.now += 1
+        let fresh = try StorePrekeyVault(store: MemoryStore()).rotate(now: clock.now).prekey
+        let current = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+            relays: [relayB.url], prekey: fresh, profiles: [ProfileManifest.text.ref]), now: clock.now)
+        try await relayB.client(clock: clock.fn).register(alice.identity)
+        try await relayB.client(clock: clock.fn).publish(current)
+        #expect(try await bob.prekey(for: alice.aceId, refresh: false) == fresh)
+        #expect(try await bob.agent(alice.aceId).source == current.source)
+        #expect(relayB.withLock { relayB.requests.filter { $0.hasPrefix("GET /v1/descriptor/") }.count } == 2)
+        await bob.close()
+    }
 }

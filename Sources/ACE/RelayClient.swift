@@ -246,13 +246,25 @@ public actor RelayClient {
         _ = try await call("POST", "/v1/descriptor", body: try agent.source.jsonData())
     }
 
-    private func agent(_ source: JSONValue, _ aceId: String?) throws -> VerifiedAgent {
-        try Self.contained(source)
-        guard let agent = try? verifyPublishedAgent(source, now: try unixNow(clock), allowLoopback: allowLoopbackRelays),
-              aceId == nil || agent.aceId == aceId else {
-            throw ACEError(.relayProtocolError, "relay served an invalid or foreign descriptor")
+    /// A relay response verified by `verify`, of identity `aceId` when given (`idOf`). Any failure is
+    /// `relay_protocol_error`: a conformant relay refused the document on input, so serving it is the relay's fault, never
+    /// a verdict on the peer (a permanent code would let one bad route end a lookup the next route serves).
+    private func verified<T>(_ value: JSONValue, _ what: String, _ aceId: String?, idOf: (T) -> String,
+                             _ verify: (JSONValue, Int) throws -> T) throws -> T {
+        try Self.contained(value)  // never a skipped entry
+        let now = try unixNow(clock)
+        let doc: T
+        do {
+            doc = try verify(value, now)
+        } catch {
+            throw ACEError(.relayProtocolError, "relay served an invalid \(what)" + ((error as? ACEError).map { ": \($0.message)" } ?? ""))
         }
-        return agent
+        guard aceId == nil || idOf(doc) == aceId else { throw ACEError(.relayProtocolError, "\(what) identity mismatch") }
+        return doc
+    }
+
+    private func agent(_ source: JSONValue, _ aceId: String?) throws -> VerifiedAgent {
+        try verified(source, "descriptor", aceId, idOf: \.aceId) { try verifyPublishedAgent($0, now: $1, allowLoopback: allowLoopbackRelays) }
     }
 
     /// `GET /v1/descriptor/{aceId}`: anonymous; the unexpired descriptor of any registered identity (`unknown_peer`
@@ -269,13 +281,9 @@ public actor RelayClient {
         _ = try await call("POST", "/v1/card", body: try bundle.jsonData())
     }
 
-    /// A served CardBundle, verified (its ACEError passes through, as in sdk-ts); a record of another identity than
-    /// `aceId` is `relay_protocol_error`.
+    /// A served CardBundle, verified (`verified`: any failure is `relay_protocol_error`).
     private func cardBundle(_ value: JSONValue, _ aceId: String?) throws -> CardBundle {
-        try Self.contained(value)
-        let v = try verifyCardBundle(value, now: try unixNow(clock), allowLoopback: allowLoopbackRelays)
-        guard aceId == nil || v.aceId == aceId else { throw ACEError(.relayProtocolError, "card record identity mismatch") }
-        return v.bundle
+        try verified(value, "card record", aceId, idOf: \.aceId) { try verifyCardBundle($0, now: $1, allowLoopback: allowLoopbackRelays) }.bundle
     }
 
     /// `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity (`unknown_peer` otherwise).

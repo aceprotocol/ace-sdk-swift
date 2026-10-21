@@ -167,16 +167,15 @@ public actor NetworkClient: PacketTransport {
         url == relay.baseURLString ? relay : try foreignRelay(url)
     }
 
-    /// Try `body` on each route in order; a permanent error other than routing ends at once. `unknown_peer` only when every
-    /// route answered it; otherwise the first other failure (a transient one included), so an unreachable route never
-    /// reads as "not there".
+    /// Try `body` on each route in order until one serves. `unknown_peer` only when every route answered it; otherwise the
+    /// first other failure (a transient one included), so an unreachable route never reads as "not there". Every route is
+    /// tried even after a permanent failure: one route replaying an old document (`stale_peer_binding`) or serving a bad
+    /// one must not block a lookup the next route serves.
     private func onRoutes<T>(_ routes: [String], _ body: (RelayClient) async throws -> T) async throws -> T {
         var unknown: any Error = ACEError(.unknownPeer, "no route")
         var other: (any Error)?
         for url in routes {
-            do { return try await body(try client(url)) } catch let e as ACEError where e.category == .permanent && e.code != .unknownPeer {
-                throw e
-            } catch let e as ACEError where e.code == .unknownPeer {
+            do { return try await body(try client(url)) } catch let e as ACEError where e.code == .unknownPeer {
                 unknown = e
             } catch { other = other ?? error }
         }
@@ -240,12 +239,8 @@ public actor NetworkClient: PacketTransport {
     /// (a new `dlg` re-signs it), else posted again only with `force`.
     private func publishCard(force: Bool) async throws {
         let now = try now()
-        var settings: [String: JSONValue] = [
-            "home": .string(relay.baseURLString), "card": configuration.card.jsonValue, "contact": .string(configuration.contact.rawValue),
-            "listed": .bool(configuration.listed),
-        ]
-        if let handle = configuration.handle { settings["handle"] = .string(handle) }
-        if let pay = configuration.pay { settings["pay"] = .array(pay.map { .string($0) }) }
+        let settings = cardClaims(home: relay.baseURLString, handle: configuration.handle, card: configuration.card, pay: configuration.pay,
+                                  contact: configuration.contact, listed: configuration.listed)
         let lastHash = try checkUsable(identity, now: now).lastHash
         let digest = sha256Hex(try JSONValue.object(["settings": .object(settings), "lastHash": .string(lastHash)]).jsonData())
         let old = try selfCard()
@@ -310,14 +305,27 @@ public actor NetworkClient: PacketTransport {
     /// holds that handle at that relay (checked against the card pin, see `lookupCard`).
     @discardableResult
     public func lookup(_ target: String) async throws -> VerifiedAgent {
-        if isACEId(target) { return try await agent(target) }
+        try await resolve(target).agent
+    }
+
+    /// `lookup` plus the peer's verified card record (nil: it has none, `unknown_peer` at every route). By handle, the
+    /// card record the handle resolved through; by ACE ID, `lookupCard`.
+    public func lookupWithCard(_ target: String) async throws -> (agent: VerifiedAgent, card: VerifiedCard?) {
+        let found = try await resolve(target)
+        if found.card != nil { return found }
+        return (found.agent, try await cardOrNone(found.agent.aceId))
+    }
+
+    /// `lookup`, with the card record verified on the way when `target` is a handle.
+    private func resolve(_ target: String) async throws -> (agent: VerifiedAgent, card: VerifiedCard?) {
+        if isACEId(target) { return (try await agent(target), nil) }
         let (bundle, url, handle) = try await cardByHandle(target)
-        let id = bundle["card"]?["aceId"]?.stringValue ?? ""
-        let fetch = { try await self.adoptFetched(try await self.onRoutes([url]) { try await $0.descriptor(id) }) }
-        let pinned = try await pinKel(id, fetch)
-        _ = try await checkCard(bundle, resolved: (home: url, handle: handle))
-        if let pinned { return pinned }
-        return try await fetch()
+        let id = Self.aceId(of: bundle)
+        // The descriptor first: it pins or advances the KEL, so the card verifies under the current KEL.
+        let provenance = try kelProvenance(id)
+        let agent = try await fetchAgent(id, routes: [url])
+        try confirmLive(id, provenance)
+        return (agent, try await checkCard(bundle, resolved: (home: url, handle: handle)))
     }
 
     /// The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
@@ -339,16 +347,9 @@ public actor NetworkClient: PacketTransport {
             return try await checkCard(bundle, kelLive: kelLive)
         }
         let (bundle, url, handle) = try await cardByHandle(target)
-        let id = bundle["card"]?["aceId"]?.stringValue ?? ""
-        let (kelLive, _) = try await cardKel(id, { _ = try await self.adoptFetched(try await self.onRoutes([url]) { try await $0.descriptor(id) }) },
-                                             { bundle })
+        let id = Self.aceId(of: bundle)
+        let (kelLive, _) = try await cardKel(id, { _ = try await self.fetchAgent(id, routes: [url]) }, { bundle })
         return try await checkCard(bundle, resolved: (home: url, handle: handle), kelLive: kelLive)
-    }
-
-    /// When `aceId` has no KEL pin, pin it through `fetch` (a descriptor lookup) and return what it fetched; else nil.
-    private func pinKel(_ aceId: String, _ fetch: () async throws -> VerifiedAgent) async throws -> VerifiedAgent? {
-        guard isACEId(aceId), try await peers.pinned(aceId) == nil else { return nil }
-        return try await fetch()
     }
 
     /// How a peer's KEL pin was confirmed: `liveConfirmed` false when a card lookup pinned the bundle's own KEL because the
@@ -367,21 +368,36 @@ public actor NetworkClient: PacketTransport {
                          _ card: () async throws -> CardBundle) async throws -> (Bool, CardBundle?) {
         guard isACEId(aceId) else { return (true, nil) }
         let pinned = try await peers.pinned(aceId)
-        let key = Self.kelProvenanceKey(aceId)
-        let provenance = try readPin(key) { $0["aceId"]?.stringValue != nil && $0["liveConfirmed"]?.boolValue != nil }
-        let confirmed = provenance?["liveConfirmed"]?.boolValue ?? true
-        if pinned != nil, confirmed { return (true, nil) }
+        let provenance = try kelProvenance(aceId)
+        if pinned != nil, provenance != false { return (true, nil) }
         do {
             try await fetch()
         } catch let e as ACEError where e.code == .unknownPeer {
             if pinned != nil { return (false, nil) }
             return (false, try await pinBundleKel(aceId, try await card()))
         }
-        if !confirmed {
-            let data = try Self.provenance(aceId, live: true)
-            try store.withLock("peers") { try store.checkedWrite(key, data) }
-        }
+        try confirmLive(aceId, provenance)
         return (true, nil)
+    }
+
+    /// The recorded `liveConfirmed` of `aceId`'s KEL pin (nil: no record, pinned through a descriptor).
+    private nonisolated func kelProvenance(_ aceId: String) throws -> Bool? {
+        guard isACEId(aceId) else { return nil }
+        return try readPin(Self.kelProvenanceKey(aceId)) { $0["aceId"]?.stringValue != nil && $0["liveConfirmed"]?.boolValue != nil }?["liveConfirmed"]?.boolValue
+    }
+
+    /// Record `aceId`'s KEL pin as not confirmed live (pinned without a live descriptor). Runs inside `PeerStore.pin`'s
+    /// `then`, under the `peers` lock.
+    private nonisolated static func markUnconfirmed(_ aceId: String, in store: any ACEStore) throws {
+        try store.checkedWrite(kelProvenanceKey(aceId), try provenance(aceId, live: false))
+    }
+
+    /// After a live descriptor was reconciled with `aceId`'s pin: a pin recorded as not confirmed live (`provenance`
+    /// false) is now confirmed, under the `peers` lock.
+    private nonisolated func confirmLive(_ aceId: String, _ provenance: Bool?) throws {
+        guard provenance == false else { return }
+        let data = try Self.provenance(aceId, live: true)
+        try store.withLock("peers") { try store.checkedWrite(Self.kelProvenanceKey(aceId), data) }
     }
 
     /// Pin the verified KEL of `bundle` (no live descriptor), recorded as not confirmed live with the pin, atomically (under
@@ -390,12 +406,11 @@ public actor NetworkClient: PacketTransport {
         let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays,
                                      pinned: try await peers.pinned(aceId))
         guard v.aceId == aceId else { throw ACEError(.invalidAuthorization, "the card record names another identity") }
-        let store = self.store, key = Self.kelProvenanceKey(aceId), data = try Self.provenance(aceId, live: false)
-        let lastHash = v.state.lastHash
-        try await peers.pin(kel: v.state.events) { state in
+        let store = self.store, lastHash = v.state.lastHash
+        try await peers.pin(kel: v.state.events) { adoption in
             // As for a descriptor: another path advanced the pin past the state the card verified under.
-            guard state.lastHash == lastHash else { throw ACEError(.stalePeerBinding, "the pin advanced past the card record") }
-            try store.checkedWrite(key, data)
+            guard adoption.state.lastHash == lastHash else { throw ACEError(.stalePeerBinding, "the pin advanced past the card record") }
+            try Self.markUnconfirmed(aceId, in: store)
         }
         return bundle
     }
@@ -429,17 +444,15 @@ public actor NetworkClient: PacketTransport {
     /// (written on first sight, only after full verification): no rollback first, then the set-once handle per home. A
     /// record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
     private func checkCard(_ bundle: CardBundle, resolved: (home: String, handle: String)? = nil, kelLive: Bool = true) async throws -> VerifiedCard {
-        let id = bundle["card"]?["aceId"]?.stringValue ?? ""
+        let id = Self.aceId(of: bundle)
         let pinned = isACEId(id) ? try await peers.pinned(id) : nil
         let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays, pinned: pinned)
         let r = v.record, digest = try documentDigest(r.value), key = Self.cardPinKey(v.aceId)
         let ownerKey = resolved.map { Self.handleOwnerKey(home: $0.home, handle: $0.handle) }
         try store.withLock("network-handles") {
             let owner = try ownerKey.flatMap { try readPin($0, Self.validOwnerPin) }
-            if let owner {
-                guard owner["aceId"]?.stringValue == v.aceId else {
-                    throw ACEError(.invalidAuthorization, "the handle resolved to another identity than before", reason: .handleRebound)
-                }
+            if let owner, owner["aceId"]?.stringValue != v.aceId {
+                throw ACEError(.invalidAuthorization, "the handle resolved to another identity than before", reason: .handleRebound)
             }
             try advanceCardPin(r, digest: digest, key: key)
             if let ownerKey, let resolved, owner == nil {
@@ -481,18 +494,18 @@ public actor NetworkClient: PacketTransport {
 
     /// The peer's card record from the first route that serves it: its cached descriptor's relays, then the home relay.
     private func fetchCard(_ aceId: String) async throws -> CardBundle {
-        let cached = try await peers.agent(aceId)
-        var routes = cached?.descriptor.relays ?? []
-        if !routes.contains(relay.baseURLString) { routes.append(relay.baseURLString) }
-        var unknown: any Error = ACEError(.unknownPeer, "no route to the peer")
-        var other: (any Error)?
-        for url in routes {
-            do { return try await client(url).card(aceId) } catch let e as ACEError where e.code == .unknownPeer {
-                unknown = e
-            } catch { other = other ?? error }
-        }
-        throw other ?? unknown  // unknown_peer only when every route answered it
+        try await onRoutes(routes(of: try await peers.heldRelays(aceId))) { try await $0.card(aceId) }
     }
+
+    /// A peer's routes: its held descriptor's relays (`PeerStore.heldRelays`), then the home relay.
+    private func routes(of held: [String]?) -> [String] {
+        var routes: [String] = []
+        for url in (held ?? []) + [relay.baseURLString] where !routes.contains(url) { routes.append(url) }
+        return routes
+    }
+
+    /// The ACE ID a CardBundle's record names ("" when absent; verification rejects it).
+    private static func aceId(of bundle: CardBundle) -> String { bundle["card"]?["aceId"]?.stringValue ?? "" }
 
     /// `@name@relay-host`: the CardBundle the relay serves for that handle, the relay's URL and the handle.
     private func cardByHandle(_ target: String) async throws -> (bundle: CardBundle, url: String, handle: String) {
@@ -517,9 +530,18 @@ public actor NetworkClient: PacketTransport {
     public func agent(_ aceId: String, refresh: Bool = false) async throws -> VerifiedAgent {
         guard isACEId(aceId) else { throw ACEError(.invalidArgument, "invalid ACE ID") }
         if !refresh, let a = try await peers.usableAgent(aceId) { return a }
-        let cached = try await peers.agent(aceId)
-        let routes = cached?.descriptor.relays ?? [relay.baseURLString]
-        return try await adoptFetched(try await onRoutes(routes) { try await $0.descriptor(aceId) })
+        // A cached descriptor bound to the current pins (`peers.agent`: KEL and delegation issuers) names the routes; a stale
+        // one (the pin advanced past its KEL, or past a delegation issuer's key; possibly a compromised key) may name
+        // attacker relays: the home relay is asked too, as when nothing is cached. A stale one is never used itself: the
+        // refreshed descriptor must verify under the current pins to replace it.
+        if let bound = try await peers.agent(aceId) { return try await fetchAgent(aceId, routes: bound.descriptor.relays) }
+        return try await fetchAgent(aceId, routes: routes(of: try await peers.heldRelays(aceId)))
+    }
+
+    /// The descriptor of `aceId` from the first route that serves one that verifies and pins: a route replaying an older
+    /// revision (`stale_peer_binding`) is passed over like any other failing route.
+    private func fetchAgent(_ aceId: String, routes: [String]) async throws -> VerifiedAgent {
+        try await onRoutes(routes) { try await self.adoptFetched(try await $0.descriptor(aceId)) }
     }
 
     /// Pin a fetched descriptor. An older revision refused under the same KEL never stands in for the cached one: that
@@ -690,13 +712,15 @@ public actor NetworkClient: PacketTransport {
             throw ACEError(.invalidArgument, "\(profile) is not installed")
         }
         guard note.utf8.count <= ACELimits.maxNoteBytes else { throw ACEError(.invalidArgument, "note exceeds \(ACELimits.maxNoteBytes) bytes") }
-        let agent = try await lookup(target)
+        let (agent, card) = try await resolve(target)
         let peer = agent.aceId
         guard peer != me else { throw ACEError(.invalidArgument, "cannot connect to this identity") }
         guard agent.descriptor.profiles.contains(mine.ref) else { throw ACEError(.invalidArgument, "no common installed profile") }
         if try admission.get(peer)?.state == .blocked { throw ACEError(.notPermitted, "the peer is blocked; unblock it first") }
-        if try validTheirPermit(peer, agent.state) == nil, try await contactOf(peer) != .open {
-            throw ACEError(.notPermitted, "the peer takes contact requests only from peers it issued a permit")
+        if try validTheirPermit(peer, agent.state) == nil {
+            let contact: Contact
+            if let card { contact = card.record.contact } else { contact = try await cardOrNone(peer)?.record.contact ?? .closed }
+            guard contact == .open else { throw ACEError(.notPermitted, "the peer takes contact requests only from peers it issued a permit") }
         }
         let source = try await publish()
         let now = try now()
@@ -712,12 +736,12 @@ public actor NetworkClient: PacketTransport {
         try await sendContact("request", to: peer, profile: profile, note: note, source: source, agent: agent)
     }
 
-    /// The peer's card record `contact`; a peer without a card record is `closed`.
-    private func contactOf(_ aceId: String) async throws -> Contact {
+    /// The peer's verified card record; nil when it has none (`unknown_peer`: closed, unlisted).
+    private func cardOrNone(_ aceId: String) async throws -> VerifiedCard? {
         do {
-            return try await lookupCard(aceId).record.contact
+            return try await lookupCard(aceId)
         } catch let e as ACEError where e.code == .unknownPeer {
-            return .closed
+            return nil
         }
     }
 
@@ -784,17 +808,27 @@ public actor NetworkClient: PacketTransport {
 
     /// The held request (24 h) outlived its source descriptor: pin the source's KEL (05 § Flow step 3), then refresh the
     /// descriptor from the source's routes while the source is bound to the pin (04 § Caching), else through
-    /// `agent(_:refresh:)`.
+    /// `agent(_:refresh:)`. A KEL pinned (or advanced) from the source alone is not confirmed live, as a card bundle's own
+    /// KEL is not, until the refreshed descriptor confirms it (04 § Card record).
     private func refreshExpiredSource(_ request: ContactRequest, now: Int) async throws -> VerifiedAgent {
         let events = try (request.source["kel"]?.arrayValue ?? []).map { e -> KelEvent in
             guard let ev = e.objectValue else { throw ACEError(.invalidAuthorization, "the request's source kel is malformed") }
             return ev
         }
         let carried = try ACEKel.verify(events, now: now)
-        let pin = try await peers.pin(kel: events).state
-        guard pin.lastHash == carried.lastHash else { return try await agent(request.from, refresh: true) }
-        let routes = request.source["descriptor"]?["relays"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        return try await adoptFetched(try await onRoutes(routes) { try await $0.descriptor(request.from) })
+        let store = self.store
+        let pin = try await peers.pin(kel: events) { adoption in
+            if adoption.outcome != .unchanged { try Self.markUnconfirmed(adoption.state.aceId, in: store) }
+        }.state
+        let agent: VerifiedAgent
+        if pin.lastHash == carried.lastHash {
+            let routes = request.source["descriptor"]?["relays"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            agent = try await fetchAgent(request.from, routes: routes)
+        } else {
+            agent = try await self.agent(request.from, refresh: true)
+        }
+        try confirmLive(pin.aceId, try kelProvenance(pin.aceId))
+        return agent
     }
 
     /// Decline `aceId`'s pending contact request (replies `rejected`, best effort) and forget it.

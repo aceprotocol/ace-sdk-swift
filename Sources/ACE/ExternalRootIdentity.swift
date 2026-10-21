@@ -63,17 +63,12 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
         throw ACEError(.invalidArgument, "signingKey must be a SecureEnclaveKey or a SoftwareKey")
     }
 
-    private static func digest(_ d: Data) throws -> Data {
-        guard d.count == 32 else { throw ACEError(.invalidArgument, "nextRootDigest must be 32 bytes") }
-        return d
-    }
-
     /// `icp` by `root` (key(0)) committing `nextRootDigest` (digest(key(1))) dated `inceptedAt`, then `dlg` of
     /// `signingKey` at `now`. The ACE ID hashes the inception, so a fixed `inceptedAt` makes it a function of the root
     /// chain alone (the KEL bounds `ts` only from above, 01 § Verifier rules). `inceptedAt` after `now` is `invalid_argument`.
     public static func incept(root: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider, inceptedAt: Int,
                               now: Int? = nil) throws -> ExternalRootIdentity {
-        let d = try digest(nextRootDigest)
+        let d = try checkNextDigest(nextRootDigest)
         let ts = try identityNow(now)
         try KelSteps.checkFreshNext(d, current: root.publicKey(), events: [])
         let state = try KelSteps.incept(root: root, nextDigest: d, signingPublicKey: signingKey.publicKey(), ts: ts, inceptedAt: inceptedAt)
@@ -86,7 +81,7 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
     /// epoch, the previous device's included, is revoked.
     public static func recover(kel: [KelEvent], revealing nextRoot: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider,
                                now: Int? = nil) throws -> ExternalRootIdentity {
-        let d = try digest(nextRootDigest)
+        let d = try checkNextDigest(nextRootDigest)
         let (state, ts) = try KelSteps.epochStart(kel, now: try identityNow(now))
         try checkCommitted(nextRoot, state)
         try KelSteps.checkFreshNext(d, current: nextRoot.publicKey(), events: state.events)
@@ -104,7 +99,7 @@ public final class ExternalRootIdentity: ACEManagedIdentity, HeldKelIdentity, @u
     /// committing `nextRootDigest`, then `dlg` of the current signing key by the revealed root (a `rot` revokes the
     /// signing delegation). A new signing key comes with `recover` (a new device).
     public func rotate(revealing nextRoot: SoftwareKey, nextRootDigest: Data, now: Int? = nil) throws {
-        let d = try Self.digest(nextRootDigest)
+        let d = try checkNextDigest(nextRootDigest)
         try withLock {
             let ts = try identityNow(now)
             try checkCommitted(nextRoot, state)
