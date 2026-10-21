@@ -470,7 +470,7 @@ public actor NetworkClient: PacketTransport {
 
     /// The peer's card record from the first route that serves it: its cached descriptor's relays, then the home relay.
     private func fetchCard(_ aceId: String) async throws -> CardBundle {
-        try await onRoutes(routes(of: try await peers.heldRelays(aceId))) { try await $0.card(aceId) }
+        try await onRoutes(routes(of: try await peers.heldRelays(aceId))) { try await $0.card(aceId).bundle }
     }
 
     /// A peer's routes: its held descriptor's relays (`PeerStore.heldRelays`), then the home relay.
@@ -496,7 +496,7 @@ public actor NetworkClient: PacketTransport {
         let home = relay.baseURLString
         let rest = home.range(of: "://").map { home[$0.upperBound...] } ?? ""
         let url = rest[..<(rest.firstIndex(of: "/") ?? rest.endIndex)] == host ? home : "https://\(host)"
-        return (try await client(url).handle(String(parts[1])), url, String(parts[1]))
+        return (try await client(url).handle(String(parts[1])).bundle, url, String(parts[1]))
     }
 
     /// The peer's current descriptor (04 § Caching): the pinned one while it is unexpired, bound to the current pins and

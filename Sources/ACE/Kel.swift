@@ -39,6 +39,9 @@ public struct KelState: Sendable, Equatable, Hashable {
 
     /// The pre-rotation commitment: `next` is `hex(keyDigest(publicKey))`.
     package func commits(to publicKey: Data) -> Bool { hexEncode(keyDigest(publicKey: publicKey)) == next }
+
+    /// The number of `rot` events: the index n of the current root key(n) (key(0) incepts).
+    public var rotationCount: Int { events.filter { $0["t"] == .string("rot") }.count }
 }
 
 /// How `ACEKel.extend` treated a candidate log against the pinned one.

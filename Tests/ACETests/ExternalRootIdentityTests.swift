@@ -193,4 +193,25 @@ import Testing
         #expect(r.rotationCount == 4 && r.getACEId() == id.getACEId())
         _ = try ACEKel.verify(try r.getKel(), now: now + 1)
     }
+
+    /// The root-chain forms index the chain from the verified log: the same identity and log as the explicit-key forms,
+    /// and `aceId(roots:)` predicts `incept(roots:)` without a signing key.
+    @Test func rootChainFormsIndexTheChainFromTheLog() throws {
+        let roots: ExternalRootIdentity.RootChain = { Self.root($0) }
+        let id = try ExternalRootIdentity.incept(roots: roots, signingKey: SoftwareKey.generate(), inceptedAt: 0, now: NOW)
+        let (explicit, _) = try Self.incept()
+        #expect(id.getACEId() == explicit.getACEId())
+        #expect(try ExternalRootIdentity.aceId(roots: roots, inceptedAt: 0) == id.getACEId())
+        try id.rotate(roots: roots, now: NOW + 1)
+        try id.rotate(roots: roots, now: NOW + 2)
+        #expect(id.rotationCount == 2 && id.getState().rotationCount == 2)
+        // Recovery reveals key(3) and commits digest(key(4)): the next explicit step needs key(4).
+        let r = try ExternalRootIdentity.recover(kel: try id.getKel(), roots: roots, signingKey: SoftwareKey.generate(), now: NOW + 3)
+        #expect(r.rotationCount == 3 && r.getACEId() == id.getACEId())
+        try r.rotate(revealing: Self.root(4), nextRootDigest: Self.digest(5), now: NOW + 4)
+        // A chain that is not this identity's fails closed.
+        expectCode(.invalidArgument, "foreign chain") {
+            try ExternalRootIdentity.recover(kel: try id.getKel(), roots: { Self.root($0 + 10) }, signingKey: SoftwareKey.generate(), now: NOW + 3)
+        }
+    }
 }

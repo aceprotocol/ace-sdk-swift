@@ -73,8 +73,16 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     /// epoch, the previous device's included, is revoked.
     public static func recover(kel: [KelEvent], revealing nextRoot: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider,
                                now: Int? = nil) throws -> ExternalRootIdentity {
-        let d = try checkNextDigest(nextRootDigest)
+        try recover(kel: kel, next: { _ in (nextRoot, nextRootDigest) }, signingKey: signingKey, now: now)
+    }
+
+    /// `recover`, with the next root and the digest to commit chosen once the log verified: `next(k)` gets the index k of
+    /// the root to reveal (the epoch's `rotationCount` + 1).
+    private static func recover(kel: [KelEvent], next: (Int) throws -> (root: SoftwareKey, digest: Data), signingKey: any ACEKeyProvider,
+                                now: Int?) throws -> ExternalRootIdentity {
         let (state, ts, full) = try KelSteps.epochStart(kel, now: try identityNow(now))
+        let (nextRoot, nextRootDigest) = try next(state.rotationCount + 1)
+        let d = try checkNextDigest(nextRootDigest)
         try checkCommitted(nextRoot, state)
         // The whole verified log: a key revealed only on the dropped branch is exposed all the same.
         try KelSteps.checkFreshNext(d, current: nextRoot.publicKey(), events: full)
@@ -102,7 +110,7 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     }
 
     /// The number of `rot` events in the log: the index n of the current root key(n).
-    public var rotationCount: Int { withLock { state.events.filter { $0["t"] == .string("rot") }.count } }
+    public var rotationCount: Int { withLock { state.rotationCount } }
 
     /// The signing key reference and the log (the host persists them). Never a root. Only a Secure Enclave signing key
     /// has a reference; any other key (a `SoftwareKey` would export its seed in clear) is `invalid_argument`.
@@ -155,4 +163,38 @@ extension ExternalRootIdentityExport: CustomStringConvertible, CustomDebugString
     public var description: String { "ExternalRootIdentityExport(signingKey: <redacted>, kel: \(kel.count) events)" }
     public var debugDescription: String { description }
     public var customMirror: Mirror { Mirror(self, children: ["kelEvents": kel.count], displayStyle: .struct) }
+}
+
+// MARK: - Root chain
+
+/// For a host whose roots form a chain key(0), key(1), … it derives on demand (e.g. from one passkey PRF): `roots(k)`
+/// returns key(k), and ACE picks k from the log (the current root is key(`rotationCount`); a step reveals key(n + 1) and
+/// commits digest(key(n + 2))), so the host never indexes the chain itself. Each key is dropped after the call.
+extension ExternalRootIdentity {
+    public typealias RootChain = (Int) throws -> SoftwareKey
+
+    private static func digest(_ roots: RootChain, _ k: Int) throws -> Data { keyDigest(publicKey: try roots(k).publicKey()) }
+
+    /// The ACE ID `incept(roots:signingKey:inceptedAt:)` makes, without a signing key: the hash of the inception by key(0)
+    /// committing digest(key(1)) dated `inceptedAt`.
+    public static func aceId(roots: RootChain, inceptedAt: Int) throws -> String {
+        let icp = try ACEKel.createInception(root: roots(0), nextDigest: digest(roots, 1), ts: inceptedAt)
+        return ACEKel.computeACEId(inceptionBytes: try ACEKel.eventBytes(icp))
+    }
+
+    /// `incept` by key(0) committing digest(key(1)).
+    public static func incept(roots: RootChain, signingKey: any ACEKeyProvider, inceptedAt: Int, now: Int? = nil) throws -> ExternalRootIdentity {
+        try incept(root: roots(0), nextRootDigest: digest(roots, 1), signingKey: signingKey, inceptedAt: inceptedAt, now: now)
+    }
+
+    /// `recover` revealing key(n + 1) and committing digest(key(n + 2)), n read off the verified log.
+    public static func recover(kel: [KelEvent], roots: RootChain, signingKey: any ACEKeyProvider, now: Int? = nil) throws -> ExternalRootIdentity {
+        try recover(kel: kel, next: { k in (try roots(k), try digest(roots, k + 1)) }, signingKey: signingKey, now: now)
+    }
+
+    /// `rotate` revealing key(`rotationCount` + 1) and committing digest(key(`rotationCount` + 2)).
+    public func rotate(roots: RootChain, now: Int? = nil) throws {
+        let n = rotationCount
+        try rotate(revealing: roots(n + 1), nextRootDigest: Self.digest(roots, n + 2), now: now)
+    }
 }

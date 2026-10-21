@@ -252,26 +252,27 @@ public actor RelayClient {
         _ = try await call("POST", "/v1/card", body: try bundle.jsonData())
     }
 
-    /// A served CardBundle, verified (`verified`: any failure is `relay_protocol_error`).
-    private func cardBundle(_ value: JSONValue, _ aceId: String?) throws -> CardBundle {
-        try verified(value, "card record", aceId, idOf: \.aceId) { try verifyCardBundle($0, now: $1, allowLoopback: allowLoopbackRelays) }.bundle
+    /// A served CardBundle, verified under its own KEL (`verified`: any failure is `relay_protocol_error`).
+    private func verifiedCard(_ value: JSONValue, _ aceId: String?) throws -> VerifiedCard {
+        try verified(value, "card record", aceId, idOf: \.aceId) { try verifyCardBundle($0, now: $1, allowLoopback: allowLoopbackRelays) }
     }
 
-    /// `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity (`unknown_peer` otherwise).
-    public func card(_ aceId: String) async throws -> CardBundle {
+    /// `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity (`unknown_peer` otherwise),
+    /// verified under the bundle's own KEL (`kelLive` false: no descriptor confirmed it; `NetworkClient.lookupCard` does).
+    public func card(_ aceId: String) async throws -> VerifiedCard {
         guard isACEId(aceId) else { throw ACEError(.invalidArgument, "invalid ACE ID") }
-        return try cardBundle(try await call("GET", "/v1/card/" + aceId), aceId)
+        return try verifiedCard(try await call("GET", "/v1/card/" + aceId), aceId)
     }
 
-    /// `GET /v1/handles/{handle}`: the card record of the identity the handle is bound to at this relay. A record whose
-    /// `home` is not this relay or whose `handle` differs is `unknown_peer` (04 § Card record).
-    public func handle(_ name: String) async throws -> CardBundle {
+    /// `GET /v1/handles/{handle}`: the card record of the identity the handle is bound to at this relay, verified as
+    /// `card`. A record whose `home` is not this relay or whose `handle` differs is `unknown_peer` (04 § Card record).
+    public func handle(_ name: String) async throws -> VerifiedCard {
         guard isHandle(name) else { throw ACEError(.invalidArgument, "invalid handle") }
-        let bundle = try cardBundle(try await call("GET", "/v1/handles/" + name), nil)
-        guard bundle["card"]?["home"]?.stringValue == baseURLString, bundle["card"]?["handle"]?.stringValue == name else {
+        let card = try verifiedCard(try await call("GET", "/v1/handles/" + name), nil)
+        guard card.record.home == baseURLString, card.record.handle == name else {
             throw ACEError(.unknownPeer, "the record does not hold this handle at this relay")
         }
-        return bundle
+        return card
     }
 
     /// `GET /v1/descriptors`: the public directory (identities whose card record is listed), optionally only agents
@@ -708,7 +709,7 @@ func parseRetryAfter(_ value: String) -> Int? {
 
 /// At most 2048 characters and equal to its own normalization: the form part of a canonical relay URL (02 § Relay URL);
 /// `isRelayRoute` adds the scheme and host rules.
-package func isCanonicalRelayURL(_ value: String) -> Bool {
+public func isCanonicalRelayURL(_ value: String) -> Bool {
     value.utf8.count <= 2048 && (try? normalizeRelayURL(value)) == value
 }
 
@@ -717,7 +718,7 @@ package func isCanonicalRelayURL(_ value: String) -> Bool {
 /// fragment / whitespace or control characters, port without leading zeros, default
 /// port dropped, trailing `/` removed, the rest of the path verbatim. Failures are
 /// `invalid_argument`. The result is the inbox cursor key.
-func normalizeRelayURL(_ s: String) throws -> String {
+public func normalizeRelayURL(_ s: String) throws -> String {
     func bad(_ why: String) -> ACEError { ACEError(.invalidArgument, "relay URL \(why)") }
     let u = Array(s.utf8)
     guard !u.contains(where: { $0 <= 0x20 || $0 == 0x7F }) else { throw bad("must not contain whitespace or control characters") }

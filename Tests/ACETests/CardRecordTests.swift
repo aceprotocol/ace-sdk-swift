@@ -145,7 +145,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         await expectRelayCode("invalid_argument") { try await client.publishCard(try card(alice, home: relay.url, now: clock.now + 2)) }
         await expectRelayCode("handle_taken") { try await client.publishCard(try card(mallory, home: relay.url, handle: "alice", now: clock.now + 3)) }
         try await client.publishCard(try card(alice, home: relay.url, handle: "alice", now: clock.now + 4))
-        #expect(try await client.handle("alice")["card"]?["aceId"]?.stringValue == alice.aceId)
+        #expect(try await client.handle("alice").aceId == alice.aceId)
     }
 
     @Test func aHandleLookupIsCheckedAgainstTheHandlePinToo() async throws {
@@ -166,7 +166,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         let mallory = try await peer(relay, clock)
         let client = try relay.client(clock: clock.fn)
         try await client.publishCard(try card(alice, home: "https://relay-b.test", now: clock.now + 1))
-        #expect(try await client.card(alice.aceId)["card"]?["home"]?.stringValue == "https://relay-b.test")
+        #expect(try await client.card(alice.aceId).record.home == "https://relay-b.test")
         #expect(relay.handleOwner("alice") == alice.aceId)
         await expectCodeAsync(.unknownPeer) { try await client.handle("alice") }
         await expectRelayCode("handle_taken") { try await client.publishCard(try card(mallory, home: relay.url, handle: "alice", now: clock.now + 2)) }
