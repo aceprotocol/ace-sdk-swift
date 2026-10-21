@@ -80,6 +80,17 @@ import Testing
         expectCode(.invalidArgument) { try SoftwareIdentity.recover(kel: try a.getKel(), nextRoot: SoftwareKey.generate(), now: NOW + 2) }
     }
 
+    /// SP3(a): a key revealed only after the epoch start (dropped from the recovered log) is exposed all the same.
+    @Test func recoveryRefusesANextRootRevealedAfterTheEpochStart() throws {
+        let next = SoftwareKey.generate()
+        let a = try SoftwareIdentity.generate(nextRootDigest: keyDigest(publicKey: next.publicKey()), now: NOW)
+        try a.delegate(now: NOW + 1, notAfter: nil)  // its key is cut from the recovered log, yet revealed
+        let dropped = a.getSigningPublicKey()
+        expectCode(.invalidArgument) {
+            try SoftwareIdentity.recover(kel: try a.getKel(), nextRoot: next, now: NOW + 2, nextRootDigest: keyDigest(publicKey: dropped))
+        }
+    }
+
     @Test func secureEnclaveExportJSONRoundTrip() throws {
         let e = SecureEnclaveIdentityExport(rootKey: "cg==", signingKey: "cw==", kel: [["t": "icp"]])
         let back = try SecureEnclaveIdentityExport(json: try e.jsonData())

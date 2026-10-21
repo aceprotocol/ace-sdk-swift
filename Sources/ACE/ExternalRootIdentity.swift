@@ -74,9 +74,10 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     public static func recover(kel: [KelEvent], revealing nextRoot: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider,
                                now: Int? = nil) throws -> ExternalRootIdentity {
         let d = try checkNextDigest(nextRootDigest)
-        let (state, ts) = try KelSteps.epochStart(kel, now: try identityNow(now))
+        let (state, ts, full) = try KelSteps.epochStart(kel, now: try identityNow(now))
         try checkCommitted(nextRoot, state)
-        try KelSteps.checkFreshNext(d, current: nextRoot.publicKey(), events: state.events)
+        // The whole verified log: a key revealed only on the dropped branch is exposed all the same.
+        try KelSteps.checkFreshNext(d, current: nextRoot.publicKey(), events: full)
         let st = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: d, signingPublicKey: signingKey.publicKey(), ts: ts)
         return try ExternalRootIdentity(state: st, signing: signingKey)
     }

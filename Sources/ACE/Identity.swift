@@ -114,13 +114,13 @@ package enum KelSteps {
     }
 
     /// The verified log cut at the start of its current root epoch (its last `icp`/`rot`; later events, possibly a
-    /// thief's, are dropped) and the recovery time `max(now, ts of the epoch start)`.
-    package static func epochStart(_ kel: [KelEvent], now: Int) throws -> (state: KelState, ts: Int) {
+    /// thief's, are dropped), the recovery time `max(now, ts of the epoch start)`, and the whole verified log.
+    package static func epochStart(_ kel: [KelEvent], now: Int) throws -> (state: KelState, ts: Int, full: [KelEvent]) {
         let full = try ACEKel.verify(kel, now: now)
         let start = full.events.lastIndex { $0["t"] == .string("icp") || $0["t"] == .string("rot") } ?? 0
         let events = Array(full.events[...start])
         let ts = max(now, events[start]["ts"]?.intValue ?? now)
-        return (try ACEKel.verify(events, now: ts), ts)
+        return (try ACEKel.verify(events, now: ts), ts, full.events)
     }
 
     /// `rot` revealing `revealed` (the committed next root, else `invalid_argument`) and committing `nextDigest`, then
@@ -200,9 +200,10 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
                                 makeKey: @escaping MakeKey) throws -> KelIdentityCore {
         let digestIn = try checkNextDigest(nextRootDigest)
         let nowTs = try identityNow(now)
-        let (state, ts) = try KelSteps.epochStart(kel, now: nowTs)
+        let (state, ts, full) = try KelSteps.epochStart(kel, now: nowTs)
         try checkCommitted(nextRoot, state)
-        let (newNext, digest) = try newNextRoot(digestIn, current: nextRoot, events: state.events, makeKey: makeKey)
+        // The whole verified log: a key revealed only on the dropped branch is exposed all the same.
+        let (newNext, digest) = try newNextRoot(digestIn, current: nextRoot, events: full, makeKey: makeKey)
         let signing = try makeKey()
         let st = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: digest, signingPublicKey: signing.publicKey(), ts: ts)
         return try KelIdentityCore(root: nextRoot, nextRoot: newNext, signing: signing, kel: st.events, now: ts, makeKey: makeKey)

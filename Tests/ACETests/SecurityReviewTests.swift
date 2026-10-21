@@ -186,6 +186,7 @@ import Testing
         var outcomes: [ReceiveOutcome] = []
         for _ in 0..<ACELimits.maxFetchAttempts { outcomes += try await bob.network.pull() }
         #expect(outcomes.dropLast().allSatisfy { !$0.isFinal } && outcomes.last?.isFinal == true, "\(outcomes)")
+        #expect(outcomes.last == .duplicate, "\(outcomes)")  // its own outcome, as sdk-ts/sdk-py, never `dropped`
         #expect(bob.received.value.count == 1)
         #expect(try bob.store.list(prefix: "inbox/quarantine/").isEmpty)
         #expect(relay.queued(bob.aceId).isEmpty)  // acknowledged
@@ -319,5 +320,48 @@ import Testing
         #expect(agent.descriptor.issuedAt == NOW + 100)
         _ = try verifyCardBundle(card, now: NOW)
         _ = try verifyPublishedAgent(agent.source, now: NOW)
+    }
+
+    // MARK: SP9 — a contact source moves the pin only after the rules pass (06 steps 9–10)
+
+    /// A rule over `ace:contact:1` that refuses every contact while `refusing` is set.
+    private final class ContactGate: ProfileRules, @unchecked Sendable {
+        let types: Set<String> = [CoreTypes.contact]
+        let refusing = LockedValue(false)
+        func check(_ event: ProfileEvent, body: [String: JSONValue]) throws {
+            if refusing.value { throw ACEError(.notPermitted, "contact refused by rule") }
+        }
+        func commit(_ event: ProfileEvent, body: [String: JSONValue]) throws {}
+    }
+
+    @Test func contactRefusedByTheRulesLeavesThePinUnchanged() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let gate = ContactGate()
+        let alice = try await NetPeer.make(relay, clock: clock, rules: { _, _ in [gate] })
+        let bob = try await NetPeer.make(relay, clock: clock)
+        try await bob.network.connect(alice.aceId, profile: ProfileManifest.text.id)
+        _ = try await alice.network.pull()
+        try await alice.network.accept(bob.aceId)
+        _ = try await bob.network.pull()
+        let held = try #require(try await alice.network.peers.agent(bob.aceId))
+        // a newer revision of bob's descriptor, carried only by a contact packet
+        clock.now += 10
+        let newer = try createPublishedAgent(identity: bob.identity, claims: DescriptorClaims(
+            relays: held.descriptor.relays, prekey: held.descriptor.prekey, profiles: held.descriptor.profiles), now: clock.now)
+        let permit = try createPermit(identity: bob.identity, subject: alice.aceId, now: clock.now)
+        let body: [String: JSONValue] = ["kind": "request", "profile": .string(ProfileManifest.text.id), "note": "",
+                                         "source": newer.source, "permit": permit]
+        gate.refusing.value = true
+        try await bob.network.sendCore(to: alice.aceId, type: CoreTypes.contact, body: body)
+        #expect(try await alice.network.pull() == [.dropped(.notPermitted)])
+        #expect(try await alice.network.peers.agent(bob.aceId)?.descriptor.issuedAt == held.descriptor.issuedAt)
+        // the same source past the rules is adopted
+        gate.refusing.value = false
+        try await bob.network.sendCore(to: alice.aceId, type: CoreTypes.contact, body: body)
+        let outcomes = try await alice.network.pull()
+        if case .delivered = outcomes.first {} else { Issue.record("expected delivered, got \(outcomes)") }
+        #expect(try await alice.network.peers.agent(bob.aceId)?.descriptor.issuedAt == newer.descriptor.issuedAt)
+        await alice.network.close()
+        await bob.network.close()
     }
 }

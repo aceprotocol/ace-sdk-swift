@@ -140,6 +140,16 @@ import Testing
         #expect(old.signing?.publicKey != lost.getSigningPublicKey())
     }
 
+    /// SP3(a): the lost device's signing key, revealed only by the `dlg` the recovery drops, may not be committed.
+    @Test func recoverRefusesANextRootRevealedAfterTheEpochStart() throws {
+        let (lost, signing) = try Self.incept()
+        expectCode(.invalidArgument) {
+            try ExternalRootIdentity.recover(kel: try lost.getKel(), revealing: Self.root(1),
+                                             nextRootDigest: keyDigest(publicKey: signing.publicKey()),
+                                             signingKey: SoftwareKey.generate(), now: NOW + 5)
+        }
+    }
+
     @Test func recoverWithADifferentKeyIsRefused() throws {
         let (lost, _) = try Self.incept()
         expectCode(.invalidArgument) {
