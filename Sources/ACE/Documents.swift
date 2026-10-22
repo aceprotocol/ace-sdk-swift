@@ -84,10 +84,12 @@ private func verifiedKel(_ v: JSONValue?, now: Int) throws -> KelState {
 
 private let tagRegex = try! NSRegularExpression(pattern: "^[a-z0-9-]{1,32}$")
 
-/// `card` (a card record's member): self-asserted presentation metadata. The reserved tag `hosted` says a custodian holds the keys.
+/// A card tag: `^[a-z0-9-]{1,32}$`.
+package func isCardTag(_ value: String) -> Bool { regexFullMatch(tagRegex, value) }
+
+/// `card` (a card record's member): self-asserted discovery metadata, nothing that names the agent (a display name is
+/// application data; the handle is the human-readable identifier). The reserved tag `hosted` says a custodian holds the keys.
 public struct AgentCard: Sendable, Equatable {
-    /// 1–64 characters without control characters.
-    public var name: String?
     /// 0–256 characters without control characters.
     public var description: String?
     /// An ACE HTTPS URL.
@@ -97,8 +99,7 @@ public struct AgentCard: Sendable, Equatable {
 
     public static let hostedTag = "hosted"
 
-    public init(name: String? = nil, description: String? = nil, image: String? = nil, tags: [String]? = nil) {
-        self.name = name
+    public init(description: String? = nil, image: String? = nil, tags: [String]? = nil) {
         self.description = description
         self.image = image
         self.tags = tags
@@ -106,7 +107,6 @@ public struct AgentCard: Sendable, Equatable {
 
     public var jsonValue: JSONValue {
         var o: [String: JSONValue] = [:]
-        if let name { o["name"] = .string(name) }
         if let description { o["description"] = .string(description) }
         if let image { o["image"] = .string(image) }
         if let tags { o["tags"] = .array(tags.map { .string($0) }) }
@@ -115,8 +115,8 @@ public struct AgentCard: Sendable, Equatable {
 
     /// The closed card rules (`invalid_authorization`).
     package init(_ v: JSONValue?) throws {
-        guard let o = v?.objectValue, hasMembers(o, [], optional: ["name", "description", "image", "tags"]) else {
-            throw unauthorized("card must be {name?, description?, image?, tags?}")
+        guard let o = v?.objectValue, hasMembers(o, [], optional: ["description", "image", "tags"]) else {
+            throw unauthorized("card permits only description, image and tags")
         }
         func text(_ key: String, _ lo: Int, _ hi: Int) throws -> String? {
             guard let v = o[key] else { return nil }
@@ -125,7 +125,6 @@ public struct AgentCard: Sendable, Equatable {
             }
             return s
         }
-        name = try text("name", 1, 64)
         description = try text("description", 0, 256)
         image = try text("image", 1, 2048)
         if let image, !isHTTPSURL(image) { throw unauthorized("card.image must be an HTTPS URL") }
@@ -145,11 +144,14 @@ public struct AgentCard: Sendable, Equatable {
 
 // MARK: - Relay URLs and handles
 
-/// The handle grammar `[a-z][a-z0-9_-]{2,31}`.
+/// The handle grammar `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`, 3–32 characters (hence a DNS label): no underscore, no
+/// leading, trailing or doubled hyphen.
 public func isHandle(_ value: String) -> Bool {
     let u = Array(value.utf8)
-    guard (3...32).contains(u.count), (0x61...0x7A).contains(u[0]) else { return false }
-    return u.dropFirst().allSatisfy { (0x61...0x7A).contains($0) || (0x30...0x39).contains($0) || $0 == 0x5F || $0 == 0x2D }
+    guard (3...32).contains(u.count), (0x61...0x7A).contains(u[0]), u.last != 0x2D else { return false }
+    return zip(u.dropFirst(), u).allSatisfy { c, prev in
+        (0x61...0x7A).contains(c) || (0x30...0x39).contains(c) || (c == 0x2D && prev != 0x2D)
+    }
 }
 
 /// A canonical relay URL (02 § Relay URLs): HTTPS, at most 2048 characters, equal to its normalization, host in the ACE
@@ -677,7 +679,7 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     }
     var handle: String?
     if let h = r["handle"] {
-        guard let s = h.stringValue, isHandle(s) else { throw unauthorized("handle must match [a-z][a-z0-9_-]{2,31}") }
+        guard let s = h.stringValue, isHandle(s) else { throw unauthorized("handle must match [a-z][a-z0-9]*(-[a-z0-9]+)*, 3-32 characters") }
         guard URLComponents(string: home)?.path.isEmpty ?? false else {
             throw unauthorized("a handle needs a home without a path (it resolves at https://host)")
         }

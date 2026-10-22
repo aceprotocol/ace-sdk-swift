@@ -14,7 +14,7 @@ private let RELAY = "https://relay.test"
 private func aliceCard(home: String = RELAY, handle: String? = "alice", pay: [String]? = [SOL], contact: Contact = .open,
                        now: Int = NOW) throws -> (any ACEManagedIdentity, JSONValue) {
     let id = try makeIdentity(now: NOW)
-    let bundle = try createCardRecord(identity: id, home: home, handle: handle, card: AgentCard(name: "Alice"), pay: pay, contact: contact,
+    let bundle = try createCardRecord(identity: id, home: home, handle: handle, card: AgentCard(description: "Alice"), pay: pay, contact: contact,
                                       listed: false, now: now)
     return (id, bundle)
 }
@@ -55,7 +55,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         let v = try verifyCardBundle(bundle, now: NOW)
         #expect(v.aceId == id.getACEId() && v.state.aceId == id.getACEId())
         #expect(v.record.handle == "alice" && v.record.contact == .open && v.record.pay == [SOL] && v.record.home == RELAY)
-        #expect(v.record.card == AgentCard(name: "Alice") && v.bundle == bundle)
+        #expect(v.record.card == AgentCard(description: "Alice") && v.bundle == bundle)
         // no expiry: a year later it still verifies
         #expect(try verifyCardBundle(bundle, now: NOW + 365 * 86_400 - 1).record.listed == false)
         expectCode(.invalidAuthorization) { try verifyCardBundle(withRecord(bundle, ["listed": true]), now: NOW) }
@@ -92,7 +92,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
 
     @Test func rejectsOversizedRecord() throws {
         let (_, bundle) = try aliceCard()
-        let big = withRecord(bundle, ["card": ["name": "Alice", "description": .string(String(repeating: "x", count: ACELimits.maxCardRecordBytes))]])
+        let big = withRecord(bundle, ["card": ["description": .string(String(repeating: "x", count: ACELimits.maxCardRecordBytes))]])
         expectCode(.invalidAuthorization, messageContains: "16384") { try verifyCardBundle(big, now: NOW) }
     }
 
@@ -101,6 +101,18 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         expectCode(.invalidAuthorization) { try verifyCardBundle(future, now: NOW) }
         expectCode(.invalidAuthorization) { try aliceCard(home: "https://Relay.test/") }
         expectCode(.invalidAuthorization) { try aliceCard(handle: "Al") }
+        expectCode(.invalidAuthorization) { try aliceCard(handle: "al_ice") }
+        expectCode(.invalidAuthorization) { try aliceCard(handle: "al--ice") }
+        #expect(try verifyCardBundle(try aliceCard(handle: "al-ice9").1, now: NOW).record.handle == "al-ice9")
+    }
+
+    /// 04 § Card: the card is `{description?, image?, tags?}`; a display name is application data, an unknown member.
+    @Test func cardNameIsAnUnknownMember() throws {
+        let (_, bundle) = try aliceCard()
+        expectCode(.invalidAuthorization) { try verifyCardBundle(withRecord(bundle, ["card": ["name": "Alice"]]), now: NOW) }
+        expectCode(.invalidAuthorization) { try AgentCard(["name": "Alice"]) }
+        expectCode(.invalidAuthorization) { try AgentCard(["description": .null]) }  // absent is fine, null is not a string
+        #expect(try AgentCard(["description": "translation", "tags": ["hosted", "-x"]]).tags == ["hosted", "-x"])
     }
 
     @Test func cardSignedBySupersededKeyIsStale() throws {

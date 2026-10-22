@@ -289,9 +289,11 @@ public actor NetworkClient: PacketTransport {
 
     // MARK: Discovery
 
-    /// The public directory of the home relay: identities whose card record is listed (verified, not pinned).
-    public func discover(profile: String? = nil, cursor: String? = nil, limit: Int = ACELimits.defaultPageLimit) async throws -> RelayClient.DirectoryPage {
-        try await relay.directory(profile: profile, cursor: cursor, limit: limit)
+    /// The public directory of the home relay: listed card records (verified, not pinned), see `RelayClient.directory`.
+    /// `lookup` an entry's ACE ID to obtain its descriptor before connecting.
+    public func discover(tag: String? = nil, profile: String? = nil, cursor: String? = nil,
+                         limit: Int = ACELimits.defaultPageLimit) async throws -> RelayClient.DirectoryPage {
+        try await relay.directory(tag: tag, profile: profile, cursor: cursor, limit: limit)
     }
 
     /// Verify a PublishedAgent shared out of band against the pin (the descriptor must verify under the newest pinned
@@ -485,7 +487,11 @@ public actor NetworkClient: PacketTransport {
 
     /// `@name@relay-host`: the CardBundle the relay serves for that handle, the relay's URL and the handle.
     private func cardByHandle(_ target: String) async throws -> (bundle: CardBundle, url: String, handle: String) {
-        let parts = target.split(separator: "@", omittingEmptySubsequences: false)
+        // A typed address: the leading @ optional, any ASCII case (04 § Card record, Handles). ASCII only: Unicode
+        // lowercasing folds characters such as U+212A KELVIN SIGN to ASCII.
+        let typed = String(decoding: target.utf8.map { (0x41...0x5A).contains($0) ? $0 + 0x20 : $0 }, as: UTF8.self)
+        var parts = typed.split(separator: "@", omittingEmptySubsequences: false)
+        if parts.count == 2 { parts.insert("", at: 0) }
         guard parts.count == 3, parts[0].isEmpty, isHandle(String(parts[1])), !parts[2].isEmpty,
               parts[2].utf8.allSatisfy({ ($0 >= 0x61 && $0 <= 0x7A) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2E || $0 == 0x2D || $0 == 0x3A }) else {
             throw ACEError(.invalidArgument, "use an ACE ID or @name@relay-host")

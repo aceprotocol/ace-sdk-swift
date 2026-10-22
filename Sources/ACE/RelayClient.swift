@@ -49,9 +49,9 @@ public actor RelayClient {
     }
 
     public struct DirectoryPage: Sendable {
-        /// Verified agents.
-        public let agents: [VerifiedAgent]
-        /// Entries dropped because they failed verification.
+        /// Verified card records (not pinned; `NetworkClient.lookup` an entry's ACE ID for its descriptor).
+        public let cards: [VerifiedCard]
+        /// Entries skipped: failing verification permanently, not listed at this relay or not carrying the requested tag.
         public let rejected: Int
         public let cursor: String?
     }
@@ -275,26 +275,38 @@ public actor RelayClient {
         return card
     }
 
-    /// `GET /v1/descriptors`: the public directory (identities whose card record is listed), optionally only agents
-    /// listing `profile`.
-    public func directory(profile: String? = nil, cursor: String? = nil, limit: Int = ACELimits.defaultPageLimit) async throws -> DirectoryPage {
+    /// `GET /v1/cards`: the public directory (card records listed at this relay), optionally only cards carrying `tag`
+    /// (`^[a-z0-9-]{1,32}$`, else `invalid_argument`). Each entry is verified on its own: one that fails verification
+    /// permanently, is not listed here or does not carry `tag` is skipped; a transient failure throws. `profile` is the
+    /// relay's hint, not checked here: the descriptor obtained before connecting is what counts (07 § Descriptors and cards).
+    public func directory(tag: String? = nil, profile: String? = nil, cursor: String? = nil,
+                          limit: Int = ACELimits.defaultPageLimit) async throws -> DirectoryPage {
         guard (1...ACELimits.maxInboxPage).contains(limit) else { throw ACEError(.invalidArgument, "limit must be 1...\(ACELimits.maxInboxPage)") }
+        if let tag, !isCardTag(tag) { throw ACEError(.invalidArgument, "tag must match [a-z0-9-]{1,32}") }
         var query = [("limit", String(limit))]
+        if let tag { query.append(("tag", tag)) }
         if let profile { query.append(("profile", profile)) }
         if let cursor { query.append(("cursor", cursor)) }
-        let value = try await call("GET", "/v1/descriptors", query: query)
-        guard let list = value["agents"]?.arrayValue, list.count <= limit else { throw ACEError(.relayProtocolError, "invalid directory page") }
-        var agents: [VerifiedAgent] = [], rejected = 0
+        let value = try await call("GET", "/v1/cards", query: query)
+        guard let list = value["cards"]?.arrayValue, list.count <= limit else { throw ACEError(.relayProtocolError, "invalid directory page") }
+        let now = try unixNow(clock)
+        var cards: [VerifiedCard] = [], rejected = 0
         for v in list {
-            try Self.contained(v)
-            guard let a = try? agent(v, nil) else { rejected += 1; continue }  // does not verify: dropped
-            // Filtered by the exact profile ID when one was requested.
-            guard profile.map({ p in a.descriptor.profiles.contains { $0.id == p } }) ?? true else {
-                throw ACEError(.relayProtocolError, "directory entry does not match the query")
+            try Self.contained(v)  // never a skipped entry
+            let c: VerifiedCard
+            do {
+                c = try verifyCardBundle(v, now: now, allowLoopback: allowLoopbackRelays)
+            } catch let error as ACEError where !error.isTransient {
+                rejected += 1  // does not verify: skipped
+                continue
             }
-            agents.append(a)
+            guard c.record.home == baseURLString, c.record.listed, tag.map({ c.record.card.tags?.contains($0) ?? false }) ?? true else {
+                rejected += 1
+                continue
+            }
+            cards.append(c)
         }
-        return DirectoryPage(agents: agents, rejected: rejected, cursor: try nullableField(value, "cursor") { $0.stringValue })
+        return DirectoryPage(cards: cards, rejected: rejected, cursor: try nullableField(value, "cursor") { $0.stringValue })
     }
 
     /// `POST /v1/blocks {peer, blocked, revision}` (action `block`).

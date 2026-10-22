@@ -310,10 +310,17 @@ final class FakeRelay: @unchecked Sendable {
                     }
                     return .json(200, c)
                 }
-                if method == "GET", path == "/v1/descriptors" {
-                    let list = agents.values.filter { cards[$0.aceId]?["card"]?["listed"] == true && live($0.aceId, now: now) != nil }
-                        .sorted { $0.aceId < $1.aceId }
-                    return .json(200, ["agents": .array(list.map(\.source)), "cursor": .null] as JSONValue)
+                if method == "GET", path == "/v1/cards" {
+                    var list = agents.values.filter { a in
+                        cards[a.aceId]?["card"]?["listed"] == true && cards[a.aceId]?["card"]?["home"]?.stringValue == url
+                            && live(a.aceId, now: now) != nil
+                    }.sorted { $0.aceId < $1.aceId }
+                    if let tag = query["tag"] {
+                        list = list.filter { cards[$0.aceId]?["card"]?["card"]?["tags"]?.arrayValue?.contains(.string(tag)) == true }
+                    }
+                    if let profile = query["profile"] { list = list.filter { $0.descriptor.profiles.contains { $0.id == profile } } }
+                    let page = list.prefix(query["limit"].flatMap { Int($0) } ?? ACELimits.defaultPageLimit).compactMap { cards[$0.aceId] }
+                    return .json(200, ["cards": .array(page), "cursor": .null] as JSONValue)
                 }
                 return err(404, "not_found")
             }

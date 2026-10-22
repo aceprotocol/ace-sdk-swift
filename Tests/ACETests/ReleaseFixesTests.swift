@@ -99,8 +99,6 @@ import Testing
         }
         #expect(try await relay(ok.source).descriptor(ok.aceId).aceId == ok.aceId)
         await expectCodeAsync(.relayProtocolError) { try await relay(bad).descriptor(ok.aceId) }
-        #expect(try await relay(["agents": [ok.source], "cursor": .null]).directory().agents.count == 1)
-        await expectCodeAsync(.relayProtocolError) { try await relay(["agents": [ok.source, bad], "cursor": .null]).directory() }
 
         let identity = try makeIdentity(now: now)
         let page = { (n: Int) -> JSONValue in ["messages": [["streamId": "1-0", "packet": Self.nest(n)]], "cursor": "1-0"] }

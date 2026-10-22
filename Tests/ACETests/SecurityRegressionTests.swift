@@ -187,6 +187,9 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
         let alice = try await NetPeer.make(relay, clock: clock)
         let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(handle: "bobby", contact: .open, listed: true))
         #expect(try await alice.network.lookup("@bobby@\(relay.host)").aceId == bob.aceId)
+        // A typed address: the leading @ optional, any ASCII case; never Unicode case folding (U+212A KELVIN SIGN).
+        #expect(try await alice.network.lookup("BoBby@\(relay.host.uppercased())").aceId == bob.aceId)
+        await expectCodeAsync(.invalidArgument) { try await alice.network.lookup("@bob\u{212A}y@\(relay.host)") }
         let prefix = String(relay.host.dropLast(".test".count))
         await expectCodeAsync(.blockedAddress) { try await alice.network.lookup("@bobby@\(prefix)") }
     }
@@ -218,11 +221,37 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
         await expectCodeAsync(.storageFailed) { try await outbox.entries() }
     }
 
-    /// A directory entry that does not list the requested profile is a relay protocol error, never a match.
-    @Test func directoryHonoursProfileFilter() async throws {
+    /// `GET /v1/cards`: the relay filters by `tag` and (a hint) `profile`; an invalid `tag` is never sent.
+    @Test func directoryFiltersByTagAndProfile() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let alice = try await NetPeer.make(relay, clock: clock)
-        await expectCodeAsync(.relayProtocolError) { try await alice.network.discover(profile: "urn:example:none:1") }
-        #expect(try await alice.network.discover(profile: "ace:text:1").agents.contains { $0.aceId == alice.aceId })
+        let alice = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(card: AgentCard(tags: ["nlp"]),
+                                                                                                    contact: .open, listed: true))
+        let bob = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(contact: .open, listed: false))
+        #expect(try await bob.network.discover().cards.map(\.aceId) == [alice.aceId])
+        #expect(try await bob.network.discover(tag: "nlp").cards.map(\.aceId) == [alice.aceId])
+        #expect(try await bob.network.discover(tag: "nope").cards.isEmpty)
+        #expect(try await bob.network.discover(profile: "ace:text:1").cards.map(\.aceId) == [alice.aceId])
+        #expect(try await bob.network.discover(profile: "urn:example:none:1").cards.isEmpty)
+        await expectCodeAsync(.invalidArgument) { try await bob.network.discover(tag: "NLP") }
+    }
+
+    /// Each directory entry is verified on its own: one failing verification, not listed at this relay or not carrying
+    /// the requested tag is skipped and the rest of the page kept; `profile` is not checked client-side.
+    @Test func directorySkipsEntriesFailingVerificationOrTheQuery() async throws {
+        let page = LockedValue<JSONValue>(.null)
+        let relay = try makeRelay { _, _ in .json(200, page.value) }
+        let home = relay.baseURLString, now = systemClock()
+        let alice = try makeIdentity(now: now), bob = try makeIdentity(now: now), carol = try makeIdentity(now: now)
+        let good = try createCardRecord(identity: alice, home: home, card: AgentCard(tags: ["nlp"]), contact: .open, listed: true, now: now)
+        var record = try #require(good["card"]?.objectValue)
+        record["card"] = ["description": "Mallory"]  // changed after signing
+        let forged: JSONValue = ["kel": try #require(good["kel"]), "card": .object(record)]
+        let unlisted = try createCardRecord(identity: bob, home: home, contact: .open, listed: false, now: now)
+        let elsewhere = try createCardRecord(identity: carol, home: "https://other.example", contact: .open, listed: true, now: now)
+        page.value = ["cards": [forged, unlisted, elsewhere, good], "cursor": .null]
+        let all = try await relay.directory()
+        #expect(all.cards.map(\.aceId) == [alice.getACEId()] && all.rejected == 3)
+        #expect(try await relay.directory(tag: "absent").cards.isEmpty)  // not carrying the tag
+        #expect(try await relay.directory(profile: "urn:example:none:1").cards.count == 1)  // the relay's hint only
     }
 }
