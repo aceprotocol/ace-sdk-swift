@@ -565,4 +565,20 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         // and the closed one is not reachable by strangers
         await expectCodeAsync(.notPermitted) { try await b.network.connect(a.aceId, profile: ProfileManifest.text.id) }
     }
+
+    /// A blocked stranger's contact request to an open peer is refused exactly like one to a closed peer: same code,
+    /// same message, no relay status, so the block is not revealed.
+    @Test func blockedContactRequestReadsLikeAClosedPeer() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let open = try await peer(relay, clock, contact: .open), closed = try await peer(relay, clock)
+        let alice = try await peer(relay, clock)
+        try await open.network.block(alice.aceId)
+        func refusal(_ target: String) async -> ACEError? {
+            do { try await alice.network.connect(target, profile: ProfileManifest.text.id); return nil } catch { return error as? ACEError }
+        }
+        let blocked = try #require(await refusal(open.aceId)), shut = try #require(await refusal(closed.aceId))
+        #expect(blocked.code == .notPermitted && blocked.message == shut.message)
+        #expect(blocked.status == nil && blocked.relayCode == nil && blocked.retryAfterSeconds == nil)
+        #expect(relay.queued(open.aceId).isEmpty)
+    }
 }

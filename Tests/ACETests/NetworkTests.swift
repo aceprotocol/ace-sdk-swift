@@ -183,6 +183,8 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
         try await bob.network.block(alice.aceId)
         let entry = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "blocked?"])
         #expect(entry.lastError?.contains("not_permitted") == true && relay.queued(bob.aceId).isEmpty)
+        // the relay's refusal reads like a missing permit: neither the block nor the relay's HTTP text shows
+        #expect(entry.lastError?.contains("no valid permit from this peer") == true && entry.lastError?.contains("HTTP") == false)
         let agent = try #require(try await alice.network.peers.agent(bob.aceId))
         let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "direct"])
         let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: agent.descriptor.prekey, content: c, timestamp: clock.now)

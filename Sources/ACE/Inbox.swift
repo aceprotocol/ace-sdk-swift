@@ -317,7 +317,7 @@ package actor Inbox {
             guard try network.publishedContact() == .open else { throw ACEError(.notPermitted, "sender is not admitted") }
             return try await contactCandidate(packet, record: nil)
         }
-        guard record.state != .blocked else { throw ACEError(.notPermitted, "blocked sender") }
+        guard record.state != .blocked else { throw ACEError(.notPermitted, "sender is blocked") }
         // 3. the sender's pin, refreshed once when the packet names a newer delegation. A peer in the table without a pin
         // (e.g. pending) can only be authenticated by a contact packet's `source`.
         guard var state = try await network.peers.pinned(packet.from) else { return try await contactCandidate(packet, record: record) }

@@ -578,7 +578,7 @@ public actor NetworkClient: PacketTransport {
     public func send(to aceId: String, type: String, body: [String: JSONValue], threadId: String? = nil) async throws -> OutboxEntry {
         guard isACEId(aceId), aceId != me else { throw ACEError(.invalidArgument, "to must be another ACE ID") }
         guard let pin = try await peers.pinned(aceId), try validTheirPermit(aceId, pin) != nil else {
-            throw ACEError(.notPermitted, "no valid permit from this peer")
+            throw noValidPermit
         }
         if try await peers.agent(aceId) == nil { _ = try await agent(aceId) }
         let entry = try await outbox.enqueue(to: aceId, type: type, body: body, threadId: threadId)
@@ -606,12 +606,18 @@ public actor NetworkClient: PacketTransport {
     /// (06 § Outbox step 3).
     package func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey) async throws {
         let agent = try await agent(aceId)
-        guard let permit = try validTheirPermit(aceId, agent.state) else {
-            throw ACEError(.notPermitted, "no valid permit from this peer")
-        }
+        guard let permit = try validTheirPermit(aceId, agent.state) else { throw noValidPermit }
         let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: content, messageId: messageId, timestamp: try now())
-        try await onRoutes(agent.descriptor.relays) { try await $0.send(packet, permit: permit) }
+        do {
+            try await onRoutes(agent.descriptor.relays) { try await $0.send(packet, permit: permit) }
+        } catch let e as ACEError where e.code == .notPermitted {
+            // The relay's refusal (a block among others) reads exactly like a missing permit: no block is revealed.
+            throw noValidPermit
+        }
     }
+
+    /// The one refusal of a message, whether no permit verifies here or the relay answers `not_permitted`.
+    private var noValidPermit: ACEError { ACEError(.notPermitted, "no valid permit from this peer") }
 
     /// The permit `aceId` issued to us, only while it verifies under its current KEL (a bearer credential, never presented
     /// from a superseded key).
@@ -688,16 +694,16 @@ public actor NetworkClient: PacketTransport {
         let peer = agent.aceId
         guard peer != me else { throw ACEError(.invalidArgument, "cannot connect to this identity") }
         guard agent.descriptor.profiles.contains(mine.ref) else { throw ACEError(.invalidArgument, "no common installed profile") }
-        if try admission.get(peer)?.state == .blocked { throw ACEError(.notPermitted, "the peer is blocked; unblock it first") }
+        if try admission.get(peer)?.state == .blocked { throw blockedPeer }
         if try validTheirPermit(peer, agent.state) == nil {
             let contact: Contact
             if let card { contact = card.record.contact } else { contact = try await cardOrNone(peer)?.record.contact ?? .closed }
-            guard contact == .open else { throw ACEError(.notPermitted, "the peer takes contact requests only from peers it issued a permit") }
+            guard contact == .open else { throw contactRefused }
         }
         let source = try await publish()
         let now = try now()
         try admission.update(peer) { r in
-            guard r?.state != .blocked else { throw ACEError(.notPermitted, "the peer is blocked; unblock it first") }
+            guard r?.state != .blocked else { throw blockedPeer }
             var r = r ?? AdmissionRecord(aceId: peer, state: .pending, updatedAt: now)
             if r.state != .admitted {
                 r.state = .pending
@@ -706,7 +712,21 @@ public actor NetworkClient: PacketTransport {
             r.profile = profile
             return r
         }
-        try await sendContact("request", to: peer, profile: profile, note: note, source: source, agent: agent)
+        do {
+            try await sendContact("request", to: peer, profile: profile, note: note, source: source, agent: agent)
+        } catch let e as ACEError where e.code == .notPermitted {
+            // The relay's refusal (a block among others) reads exactly like a closed peer's: no block is revealed.
+            throw contactRefused
+        }
+    }
+
+    /// A peer this identity blocked: only `unblock` (or an invitation) lifts it (05 § Blocks).
+    private var blockedPeer: ACEError { ACEError(.notPermitted, "the peer is blocked; unblock it first") }
+
+    /// The one refusal of a contact request, whether the card record is closed or the relay answers `not_permitted`. It
+    /// names no cause: a closed peer and a blocking one read the same (05 § Blocks).
+    private var contactRefused: ACEError {
+        ACEError(.notPermitted, "the peer does not accept contact requests from this identity")
     }
 
     /// The peer's verified card record; nil when it has none (`unknown_peer`: closed, unlisted).
@@ -747,7 +767,7 @@ public actor NetworkClient: PacketTransport {
         let now = try now()
         let expired = (request.source["descriptor"]?["expiresAt"]?.wireInt ?? 0) <= now
         let fresh = expired ? nil : try verifyPublishedAgent(request.source, now: now, allowLoopback: configuration.allowLoopbackRelays)
-        if try admission.get(request.from)?.state == .blocked { throw ACEError(.notPermitted, "blocked peer") }
+        if try admission.get(request.from)?.state == .blocked { throw blockedPeer }
         let agent: VerifiedAgent
         if let fresh {
             // A source older than the held descriptor never replaces it: the held one is answered while usable (04 § Caching).
@@ -766,7 +786,7 @@ public actor NetworkClient: PacketTransport {
     /// `unblock` (05 § Blocks): a blocked peer's contact request never reaches `accept`.
     private func admit(_ peer: String, profile: String, clearsBlock: Bool = false) async throws {
         func admitted(_ r: AdmissionRecord?) throws -> AdmissionRecord {
-            if r?.state == .blocked, !clearsBlock { throw ACEError(.notPermitted, "the peer is blocked; unblock it first") }
+            if r?.state == .blocked, !clearsBlock { throw blockedPeer }
             var r = r ?? AdmissionRecord(aceId: peer, state: .admitted, updatedAt: 0)
             r.state = .admitted
             r.profile = profile
