@@ -8,12 +8,7 @@ import Testing
 @Suite struct AdmissionRecoveryTests {
     /// Alice and Bob paired and exchanged a message; Bob then lost his store (a reinstall) and came back `closed`.
     private func reinstalled(_ relay: FakeRelay, _ clock: TestClock) async throws -> (alice: NetPeer, bob: NetPeer) {
-        let alice = try await NetPeer.make(relay, clock: clock)
-        let bob = try await NetPeer.make(relay, clock: clock)
-        try await alice.network.connect(bob.aceId, profile: "ace:text:1")
-        _ = try await bob.network.pull()
-        try await bob.network.accept(alice.aceId)
-        _ = try await alice.network.pull()
+        let (alice, bob) = try await connectedText(relay, clock)
         _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "before"])
         guard case .delivered? = try await bob.network.pull().first else { throw ACEError(.storageFailed, "not delivered") }
         _ = try await alice.network.pull()
@@ -161,7 +156,7 @@ import Testing
                                                                                           "outcome": "delivered"])
             .with(admission: Admission(proof: proof, permit: reply, source: try await alice.network.publish().source))
         let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: agent.descriptor.prekey, content: content, timestamp: clock.now)
-        #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.notPermitted))
+        #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.invalidBody))
         #expect(try bob.network.admission.get(alice.aceId) == nil)
         #expect(try await bob.network.peers.pinned(alice.aceId) == nil)
     }
@@ -169,11 +164,14 @@ import Testing
     @Test func receiptsAndContactsCarryNoAdmission() throws {
         let c = try PrivateContent(type: CoreTypes.receipt, schemaDigest: String(repeating: "0", count: 64),
                                    body: ["messageId": .string(UUID().uuidString.lowercased()), "outcome": "delivered"])
+        let text = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:])
+        #expect(try PrivateContent(json: try text.with(admission: Admission(proof: ["a": 1], permit: ["b": 2], source: ["c": 3])).jsonData())
+            .admission != nil)  // decoding checks the shape only; 05 checks the permits
         let raw = try c.with(admission: Admission(proof: ["a": 1], permit: ["b": 2], source: ["c": 3])).jsonData()
-        #expect(try PrivateContent(json: raw).admission != nil)  // decoding checks the shape only; the pipeline drops it
+        #expect(throws: ACEError.self) { try PrivateContent(json: raw) }  // 03: a core packet carrying it is invalid_body
         for bad: JSONValue in [.null, ["proof": ["a": 1], "permit": ["b": 2]], ["proof": ["a": 1], "permit": ["b": 2], "source": ["c": 3], "x": [:]],
                                ["proof": "p", "permit": ["b": 2], "source": ["c": 3]]] {
-            var o = try #require(c.jsonValue.objectValue)
+            var o = try #require(text.jsonValue.objectValue)
             o["admission"] = bad
             #expect(throws: ACEError.self) { try PrivateContent(json: try JSONValue.object(o).jsonData()) }
         }

@@ -22,15 +22,6 @@ private final class CrashStore: ACEStore, @unchecked Sendable {
     func lock(_ name: String, timeout: TimeInterval) throws -> any ACEStoreLock { try base.lock(name, timeout: timeout) }
 }
 
-private func connectedText(_ relay: FakeRelay, _ clock: TestClock) async throws -> (NetPeer, NetPeer) {
-    let alice = try await NetPeer.make(relay, clock: clock)
-    let bob = try await NetPeer.make(relay, clock: clock)
-    try await alice.network.connect(bob.aceId, profile: "ace:text:1")
-    _ = try await bob.network.pull()
-    try await bob.network.accept(alice.aceId)
-    _ = try await alice.network.pull()
-    return (alice, bob)
-}
 
 /// Stage and attempt a message without `send`'s permit gate (these tests exercise the transport after a key change, when
 /// the peer's earlier permit no longer verifies under its new pin). The attempt carries a permit the peer renewed under its

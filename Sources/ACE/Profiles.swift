@@ -209,6 +209,9 @@ public struct InstalledProfiles: Sendable {
         return nil
     }
 
+    /// True when `(type, schemaDigest)` is installed (06 step 7).
+    package func installs(_ content: PrivateContent) -> Bool { schemas[content.type + "\u{0}" + content.schemaDigest] != nil }
+
     /// `unsupported_schema` unless `(type, schemaDigest)` is installed; `invalid_body` when the body does not match it.
     public func validate(_ content: PrivateContent) throws {
         guard let schema = schemas[content.type + "\u{0}" + content.schemaDigest] else {

@@ -617,7 +617,7 @@ public actor NetworkClient: PacketTransport {
         guard let permit = try validTheirPermit(aceId, agent.state) else { throw noValidPermit }
         var sent = content
         let reply = retry ? try replyPermit(for: aceId) : nil
-        if let reply, let source = await currentSource() {
+        if let reply, let source = currentSource() {
             let carried = content.with(admission: Admission(proof: permit, permit: reply.permit, source: source))
             if (try? carried.jsonData()) != nil { sent = carried }
         }
@@ -631,12 +631,10 @@ public actor NetworkClient: PacketTransport {
         if let reply, reply.fresh, sent.admission != nil { try admission.noteIssued(aceId, permit: reply.permit) }
     }
 
-    /// Our PublishedAgent for a retry's `admission`: published now if due, else the last one while it is unexpired; nil
-    /// when neither (the attempt goes without `admission`, never fails for it).
-    private func currentSource() async -> JSONValue? {
-        if let a = try? await publish() { return a.source }
-        guard let a = try? selfAgent(), let now = try? now(),
-              (try? verifyPublishedAgent(a.source, now: now, allowLoopback: true)) != nil else { return nil }
+    /// Our last published PublishedAgent for a retry's `admission`, while unexpired (upkeep republishes it before then);
+    /// nil otherwise, and the attempt goes without `admission`, never failing for it. Local only: no publish on this path.
+    private func currentSource() -> JSONValue? {
+        guard let a = try? selfAgent(), let now = try? now(), a.descriptor.expiresAt > now else { return nil }
         return a.source
     }
 

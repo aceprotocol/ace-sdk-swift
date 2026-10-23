@@ -160,3 +160,14 @@ struct NetPeer {
 
     var aceId: String { identity.getACEId() }
 }
+
+/// Alice connected to Bob for `ace:text:1` and Bob accepted: both hold each other as admitted.
+func connectedText(_ relay: FakeRelay, _ clock: TestClock) async throws -> (NetPeer, NetPeer) {
+    let alice = try await NetPeer.make(relay, clock: clock)
+    let bob = try await NetPeer.make(relay, clock: clock)
+    try await alice.network.connect(bob.aceId, profile: "ace:text:1")
+    _ = try await bob.network.pull()
+    try await bob.network.accept(alice.aceId)
+    _ = try await alice.network.pull()
+    return (alice, bob)
+}

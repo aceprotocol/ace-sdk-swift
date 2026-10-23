@@ -91,7 +91,7 @@ public struct PrivateContent: Sendable, Equatable {
     public let schemaDigest: String
     public let threadId: String?
     public let body: [String: JSONValue]
-    package let admission: Admission?
+    package var admission: Admission?
 
     /// `invalid_body` for a type that is not a namespaced identifier, a digest that is not 64 lowercase hex, a bad
     /// `threadId`, or a body with a non-finite number or nesting deeper than 32.
@@ -107,16 +107,12 @@ public struct PrivateContent: Sendable, Equatable {
         self.admission = nil
     }
 
-    private init(_ c: PrivateContent, admission: Admission?) {
-        type = c.type
-        schemaDigest = c.schemaDigest
-        threadId = c.threadId
-        body = c.body
-        self.admission = admission
-    }
-
     /// This content carrying `admission` (nil: none).
-    package func with(admission: Admission?) -> PrivateContent { PrivateContent(self, admission: admission) }
+    package func with(admission: Admission?) -> PrivateContent {
+        var c = self
+        c.admission = admission
+        return c
+    }
 
     /// The `jsonValue` shape read back from a local store record (members beyond it are ignored), or nil.
     package init?(stored c: [String: JSONValue]) {
@@ -167,8 +163,9 @@ public struct PrivateContent: Sendable, Equatable {
                   let permit = m["permit"], permit.objectValue != nil, let source = m["source"], source.objectValue != nil else {
                 throw ACEError(.invalidBody, "admission must be {proof, permit, source}")
             }
+            guard type != CoreTypes.receipt, type != CoreTypes.contact else { throw ACEError(.invalidBody, "receipts and contacts carry no admission") }
             try checkJSONValue(a, depth: 1)
-            self = with(admission: Admission(proof: proof, permit: permit, source: source))
+            self.admission = Admission(proof: proof, permit: permit, source: source)
         }
     }
 }

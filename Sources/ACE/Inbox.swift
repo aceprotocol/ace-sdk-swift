@@ -319,7 +319,13 @@ package actor Inbox {
             return try await unauthenticated(packet, record: record, recoverable: true)
         }
         if packet.signature.seq > (state.signing?.seq ?? -1) {
-            try suppressLookup(packet.from, "pin refresh suppressed")
+            let t = try now()
+            // A suppressed refresh is a retry, never a drop; like any retry it counts toward the quarantine.
+            if let last = lastRefresh[packet.from], t - last < ACELimits.pinRefreshIntervalSeconds {
+                throw ACEError(.relayUnavailable, "pin refresh suppressed")
+            }
+            lastRefresh = lastRefresh.filter { t - $0.value < ACELimits.pinRefreshIntervalSeconds }
+            lastRefresh[packet.from] = t  // every attempt counts, a failed one too (06 step 3: at most once per interval)
             do {
                 state = try await network.agent(packet.from, refresh: true).state
             } catch let e as ACEError where e.category != .permanent {
@@ -349,17 +355,9 @@ package actor Inbox {
         return try await authenticated(packet, content: content, state: state, record: record, now: now)
     }
 
-    /// At most one pin refresh per sender per `PIN_REFRESH_INTERVAL_SECONDS` (06 step 3).
-    /// A suppressed lookup is a retry, never a drop; like any retry it counts toward the quarantine.
-    private func suppressLookup(_ sender: String, _ reason: String) throws {
-        let t = try now()
-        if let last = lastRefresh[sender], t - last < ACELimits.pinRefreshIntervalSeconds { throw ACEError(.relayUnavailable, reason) }
-        lastRefresh = lastRefresh.filter { t - $0.value < ACELimits.pinRefreshIntervalSeconds }
-        lastRefresh[sender] = t  // every attempt counts, a failed one too
-    }
-
-    /// Steps 7–11 for an authenticated, decrypted packet. A carried `admission` is the core packets' `invalid_body`; on a
-    /// message its reply permit is held like a receipt renewal (05 § Admission recovery) and it never reaches the host.
+    /// Steps 7–11 for an authenticated, decrypted packet. A message's `admission` (never on a core packet: decoding refuses
+    /// it, 03 § Private content) has its reply permit held like a receipt renewal (05 § Admission recovery) and never
+    /// reaches the host.
     private func authenticated(_ packet: Packet, content carried: PrivateContent, state: KelState, record: AdmissionRecord?,
                                now: Int) async throws -> ReceiveOutcome {
         let me = identity.getACEId()
@@ -367,7 +365,6 @@ package actor Inbox {
         let content = carried.with(admission: nil)
         do {
             if let admission = carried.admission {
-                guard !core else { throw ACEError(.invalidBody, "receipts and contacts carry no admission") }
                 try await network.holdTheirPermit(admission.permit, from: packet.from) { $0.map { $0.state != .blocked } ?? false }
             }
             // 7–8. installed schema, body
@@ -392,9 +389,9 @@ package actor Inbox {
             var source: VerifiedAgent?
             if content.type == CoreTypes.receipt { try checkReceipt(content.body, state: state, now: now) }
             if content.type == CoreTypes.contact {
-                let pins = try await network.peers.delegationPins(for: content.body["source"] ?? .null)
                 // verified against the pin; the pin itself moves only once the rules below pass (06 step 10)
-                source = try checkContact(packet, content.body, record: record, pinned: state, delegationPins: pins, now: now)
+                let s = try await verifiedSource(content.body["source"] ?? .null, from: packet.from, pinned: state, now: now)
+                source = try checkContact(content.body, record: record, source: s, now: now)
             }
             // 10. busy-thread check, then the profile rules (08 § Sender state and busy threads)
             if let threadId = content.threadId, network.outbox.governs(content.type),
@@ -529,20 +526,20 @@ package actor Inbox {
         await network.configuration.onReceipt?(from, body, entry)
     }
 
-    /// The contact rules: note bytes, `source` verifies and names `from`, the profile is installed here with the digest
-    /// the source lists, the permit (request / accepted) is issued by `from` to us; a reply needs a `pending` entry for that
-    /// profile.
-    private func checkContact(_ packet: Packet, _ body: [String: JSONValue], record: AdmissionRecord?, pinned: KelState?,
-                              delegationPins: [String: KelState], now: Int) throws -> VerifiedAgent {
+    /// An embedded PublishedAgent (a contact's `source`, a recovery's `admission.source`) verified as naming `from`, never
+    /// older than the pin (01 § Pinning; a stranger usually has none).
+    private func verifiedSource(_ raw: JSONValue, from: String, pinned: KelState?, now: Int) async throws -> VerifiedAgent {
+        guard raw["descriptor"]?["aceId"]?.stringValue == from else { throw ACEError(.invalidAuthorization, "source does not name the sender") }
+        let pins = try await network.peers.delegationPins(for: raw)
+        return try verifyPublishedAgent(raw, now: now, allowLoopback: network.configuration.allowLoopbackRelays, pinned: pinned, delegationPins: pins)
+    }
+
+    /// The contact rules beyond the verified `source`: note bytes, the profile is installed here with the digest the source
+    /// lists, the permit (request / accepted) is issued by `from` to us; a reply needs a `pending` entry for that profile.
+    private func checkContact(_ body: [String: JSONValue], record: AdmissionRecord?, source: VerifiedAgent, now: Int) throws -> VerifiedAgent {
         let me = identity.getACEId()
         guard let note = body["note"]?.stringValue, note.utf8.count <= ACELimits.maxNoteBytes, let kind = body["kind"]?.stringValue,
-              let profile = body["profile"]?.stringValue, let raw = body["source"] else { throw ACEError(.invalidBody, "contact body") }
-        guard raw["descriptor"]?["aceId"]?.stringValue == packet.from else {
-            throw ACEError(.invalidAuthorization, "contact source does not name the sender")
-        }
-        // Never trust a log older than the one pinned (01 § Pinning); a stranger has no pin.
-        let source = try verifyPublishedAgent(raw, now: now, allowLoopback: network.configuration.allowLoopbackRelays, pinned: pinned,
-                                              delegationPins: delegationPins)
+              let profile = body["profile"]?.stringValue else { throw ACEError(.invalidBody, "contact body") }
         guard let mine = network.profiles.manifest(profile), mine.id != ProfileManifest.core.id, source.descriptor.profiles.contains(mine.ref) else {
             throw ACEError(.invalidBody, "contact profile is not shared")
         }
@@ -570,9 +567,9 @@ package actor Inbox {
         let now = try now()
         guard (try? checkPacketTime(packet, now: now)) != nil else { return .dropped(.staleTimestamp) }
         guard let seed = try network.prekeys.open(packet.encryption.prekey, now: now) else { return .dropped(.unknownPrekey) }
-        guard let content = try? decryptPacket(packet, seed: seed) else { return .dropped(.decryptionFailed) }
-        if recoverable, content.type != CoreTypes.contact, content.type != CoreTypes.receipt, let admission = content.admission,
-           validProof(admission.proof, from: packet.from, now: now) {
+        let content: PrivateContent
+        do { content = try decryptPacket(packet, seed: seed) } catch let e as ACEError where e.category == .permanent { return .dropped(e.code) }
+        if recoverable, let admission = content.admission, validProof(admission.proof, from: packet.from, now: now) {
             return try await recovered(packet, content: content, admission: admission, now: now)
         }
         // 05 § Flow: strangers only while this identity's published card record is `open` (no record is `closed`).
@@ -593,19 +590,12 @@ package actor Inbox {
     /// meanwhile wins) with `proof` as the newest permit issued to it, `source` pinned, the permit held, and step 8 follows.
     private func recovered(_ packet: Packet, content: PrivateContent, admission: Admission, now: Int) async throws -> ReceiveOutcome {
         let from = packet.from
-        do { try network.profiles.validate(content) } catch let e as ACEError where e.code == .unsupportedSchema { return .dropped(e.code) } catch {}
+        guard network.profiles.installs(content) else { return .dropped(.unsupportedSchema) }
         let source: VerifiedAgent
         do {
-            guard admission.source["descriptor"]?["aceId"]?.stringValue == from else {
-                throw ACEError(.invalidAuthorization, "admission source does not name the sender")
-            }
-            let pinned = try await network.peers.pinned(from)
-            let pins = try await network.peers.delegationPins(for: admission.source)
-            source = try verifyPublishedAgent(admission.source, now: now, allowLoopback: network.configuration.allowLoopbackRelays,
-                                              pinned: pinned, delegationPins: pins)
-            let state = source.state
-            try verifyPacketSignature(packet, sender: state, now: now)
-            guard (try? verifyPermit(admission.permit, issuer: state, subject: identity.getACEId(), now: now)) != nil else {
+            source = try await verifiedSource(admission.source, from: from, pinned: try await network.peers.pinned(from), now: now)
+            try verifyPacketSignature(packet, sender: source.state, now: now)
+            guard (try? verifyPermit(admission.permit, issuer: source.state, subject: identity.getACEId(), now: now)) != nil else {
                 throw ACEError(.invalidAuthorization, "admission permit is not valid")
             }
         } catch let e as ACEError where e.category == .permanent {
@@ -630,7 +620,7 @@ package actor Inbox {
     /// any kind. Every failure is a silent drop.
     private func contactCandidate(_ packet: Packet, content: PrivateContent, record: AdmissionRecord?, now: Int) async throws -> ReceiveOutcome {
         let stranger = record == nil
-        guard content.type == CoreTypes.contact, content.admission == nil, !stranger || content.body["kind"] == "request",
+        guard content.type == CoreTypes.contact, !stranger || content.body["kind"] == "request",
               (try? network.profiles.validate(content)) != nil else {
             return .dropped(.notPermitted)
         }
@@ -640,9 +630,8 @@ package actor Inbox {
             // M5: a stranger's source is bounded before any of its signatures is verified (05 § Receiver admission).
             if stranger { try checkStrangerSource(raw) }
             // A stranger usually has no pin; a peer in the table may (its pin bounds the source, 01 § Pinning).
-            let pinned = try await network.peers.pinned(packet.from)
-            let pins = try await network.peers.delegationPins(for: raw)
-            source = try checkContact(packet, content.body, record: record, pinned: pinned, delegationPins: pins, now: now)
+            let s = try await verifiedSource(raw, from: packet.from, pinned: try await network.peers.pinned(packet.from), now: now)
+            source = try checkContact(content.body, record: record, source: s, now: now)
             try verifyPacketSignature(packet, sender: source.state, now: now)
         } catch let e as ACEError where e.category == .permanent {
             return .dropped(e.code)
