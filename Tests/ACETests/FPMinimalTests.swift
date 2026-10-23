@@ -330,6 +330,32 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         #expect(try await b.entry(e.messageId)?.inFlightUntil == nil)
     }
 
+    /// A host cancelling an attempt before its post (a stream ended) is not an attempt: the lease is released and the
+    /// entry is untouched. A cancellation after the post returned is recorded, since a receipt names that prekey.
+    @Test func cancelledAttemptIsNotAnAttempt() async throws {
+        let me = try makeIdentity(now: NOW), peer = try TestAgent(now: NOW)
+        let outbox = Outbox(identity: me, store: MemoryStore(), profiles: try InstalledProfiles([.text]), clock: { NOW })
+        let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
+        struct Slow: PacketTransport {
+            func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { try await Task.sleep(for: .seconds(60)); throw ACEError(.relayUnavailable, "late") }
+            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {}
+        }
+        let stopped = Task { try await outbox.deliver(e.messageId, via: Slow()) }
+        #expect(await settles { try! await outbox.entry(e.messageId)?.inFlightUntil != nil })
+        stopped.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await stopped.value }
+        let kept = try #require(try await outbox.entry(e.messageId))
+        #expect(kept.attempts == 0 && kept.lastError == nil && kept.inFlightUntil == nil && kept.firstAttemptAt == nil && kept.nextAttemptAt == e.nextAttemptAt)
+
+        let gate = Gate(peer.agent.descriptor.prekey)
+        let posted = Task { try await outbox.deliver(e.messageId, via: gate) }
+        #expect(await settles { gate.waiting })
+        posted.cancel()
+        gate.release()
+        let done = try await posted.value
+        #expect(done.attempts == 1 && done.lastPrekey == peer.agent.descriptor.prekey.id && done.lastError == nil)
+    }
+
     /// A permanent attempt error ends the entry as `rejected` instead of retrying for the offline window.
     @Test func permanentAttemptErrorIsFinal() async throws {
         let me = try makeIdentity(now: NOW), peer = try TestAgent(now: NOW)

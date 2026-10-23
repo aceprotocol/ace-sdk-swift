@@ -256,6 +256,16 @@ public actor Outbox {
         } catch {
             failure = ACEError(.relayUnavailable, "\(error)")
         }
+        // A cancellation that stopped the post is not an attempt: release the lease and leave the entry as it was. One
+        // after the post returned is recorded, since a receipt for it names that prekey.
+        if posted == nil, Task.isCancelled {
+            try store.withLock("outbox") {
+                guard var current = try entry(messageId) else { return }
+                current.inFlightUntil = nil
+                try save(current)
+            }
+            throw CancellationError()
+        }
         // The entry may have been changed by a receipt while this attempt was suspended: finished, or asked for a prekey
         // refresh (`rejected:unknown_prekey`), which must survive this save. Merged under lock `outbox`.
         let at = try unixNow(clock)
