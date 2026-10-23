@@ -288,7 +288,7 @@ import Testing
                 _ = try await outbox.handleReceipt(from: peer, body: ["messageId": .string(id), "outcome": "delivered"])
                 throw ACEError(.unknownPrekey, "refreshed descriptor refused")
             }
-            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey) async throws {}
+            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {}
         }
         let done = try await outbox.deliver(e.messageId, via: Settling(outbox: outbox, peer: peer.aceId, id: e.messageId))
         #expect(done.status == .delivered && done.code == nil, "\(done)")

@@ -231,7 +231,7 @@ public struct AdmissionTable: Sendable {
         try store.withLock("admission") {
             try updateLocked(peer, body)
             if blocked { try store.checkedDelete(Self.requestKey(peer)) }
-            let revision = (try blockRecord(peer)?.revision ?? 0) + 1
+            let revision = try nextRevision(peer)
             let record = BlockRecord(peer: peer, blocked: blocked, revision: revision, unsyncedRevision: revision)
             try writeBlock(record)
             return record
@@ -245,7 +245,7 @@ public struct AdmissionTable: Sendable {
             let wasBlocked = try live(peer)?.state == .blocked
             try updateLocked(peer, body)
             guard wasBlocked else { return nil }
-            let revision = (try blockRecord(peer)?.revision ?? 0) + 1
+            let revision = try nextRevision(peer)
             let record = BlockRecord(peer: peer, blocked: false, revision: revision, unsyncedRevision: revision)
             try writeBlock(record)
             return record
@@ -268,6 +268,12 @@ public struct AdmissionTable: Sendable {
             }
             return try blockRecord(peer).flatMap { $0.unsyncedRevision == nil ? nil : $0 }
         }
+    }
+
+    /// `max(previous + 1, now)` (05 § Blocks): a decision made after the block records were lost still outranks every
+    /// revision registered before.
+    private func nextRevision(_ peer: String) throws -> Int {
+        max((try blockRecord(peer)?.revision ?? 0) + 1, try now())
     }
 
     private func writeBlock(_ r: BlockRecord) throws {

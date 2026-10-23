@@ -18,7 +18,7 @@ private final class OnceRule: ProfileRules, @unchecked Sendable {
 private struct InstantTransport: PacketTransport {
     let prekeyValue: Prekey
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
-    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey) async throws {}
+    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {}
 }
 
 /// A transport whose `post` suspends until released.
@@ -30,7 +30,7 @@ private final class HeldTransport: PacketTransport, @unchecked Sendable {
 
     init(_ prekey: Prekey) { prekeyValue = prekey }
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
-    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey) async throws {
+    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {
         await withCheckedContinuation { c in
             lock.withLock { continuation = c }
             started.value = true
@@ -122,7 +122,7 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
         await expectCodeAsync(.notPermitted) { try await bob.network.accept(alice.aceId) }
         #expect(try bob.network.admission.get(alice.aceId)?.state == .blocked)
         #expect(relay.blocked(by: bob.aceId, alice.aceId) == true)
-        #expect(try bob.network.admission.blockRecord(alice.aceId)?.revision == 1)
+        #expect(try bob.network.admission.blockRecord(alice.aceId)?.revision == clock.now)  // max(previous + 1, now)
         // the block decision itself discards the held request, in the same `admission` lock section
         _ = try bob.network.admission.decideBlock(alice.aceId, blocked: true) { $0 }
         #expect(try bob.network.admission.request(alice.aceId) == nil)

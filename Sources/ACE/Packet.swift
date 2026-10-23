@@ -67,12 +67,31 @@ public enum XWing {
 
 // MARK: - Private content
 
-/// The private content of a packet, `{type, schemaDigest, threadId?, body}`, carried entirely inside the ciphertext.
+/// The `admission` member of an Outbox retry (05 § Admission recovery): `proof`, the permit the receiver issued to the
+/// sender; `permit`, a reply permit the sender issued to the receiver; `source`, the sender's PublishedAgent. Only their
+/// shape is checked on decoding.
+package struct Admission: Sendable, Equatable {
+    package let proof: JSONValue
+    package let permit: JSONValue
+    package let source: JSONValue
+
+    package init(proof: JSONValue, permit: JSONValue, source: JSONValue) {
+        self.proof = proof
+        self.permit = permit
+        self.source = source
+    }
+
+    var jsonValue: JSONValue { ["proof": proof, "permit": permit, "source": source] }
+}
+
+/// The private content of a packet, `{type, schemaDigest, threadId?, body, admission?}`, carried entirely inside the
+/// ciphertext. `admission` never reaches the host: `ReceivedMessage.content` and stored records carry none.
 public struct PrivateContent: Sendable, Equatable {
     public let type: String
     public let schemaDigest: String
     public let threadId: String?
     public let body: [String: JSONValue]
+    package let admission: Admission?
 
     /// `invalid_body` for a type that is not a namespaced identifier, a digest that is not 64 lowercase hex, a bad
     /// `threadId`, or a body with a non-finite number or nesting deeper than 32.
@@ -85,7 +104,19 @@ public struct PrivateContent: Sendable, Equatable {
         self.schemaDigest = schemaDigest
         self.threadId = threadId
         self.body = body
+        self.admission = nil
     }
+
+    private init(_ c: PrivateContent, admission: Admission?) {
+        type = c.type
+        schemaDigest = c.schemaDigest
+        threadId = c.threadId
+        body = c.body
+        self.admission = admission
+    }
+
+    /// This content carrying `admission` (nil: none).
+    package func with(admission: Admission?) -> PrivateContent { PrivateContent(self, admission: admission) }
 
     /// The `jsonValue` shape read back from a local store record (members beyond it are ignored), or nil.
     package init?(stored c: [String: JSONValue]) {
@@ -100,6 +131,7 @@ public struct PrivateContent: Sendable, Equatable {
     package var jsonValue: JSONValue {
         var o: [String: JSONValue] = ["type": .string(type), "schemaDigest": .string(schemaDigest), "body": .object(body)]
         if let threadId { o["threadId"] = .string(threadId) }
+        if let admission { o["admission"] = admission.jsonValue }
         return .object(o)
     }
 
@@ -112,14 +144,15 @@ public struct PrivateContent: Sendable, Equatable {
         return data
     }
 
-    /// Strict decoding (`invalid_body`): a closed object `{type, schemaDigest, threadId?, body}`, depth ≤ 32.
+    /// Strict decoding (`invalid_body`): a closed object `{type, schemaDigest, threadId?, body, admission?}`, depth ≤ 32;
+    /// `admission` the closed `{proof, permit, source}` of three objects.
     public init(json: Data) throws {
         guard json.count <= ACELimits.maxPlaintextBytes else { throw ACEError(.invalidBody, "private content is too large") }
         let v: JSONValue
         do { v = try JSONParser.parse(json) } catch {
             throw ACEError(.invalidBody, "private content is not valid JSON")
         }
-        guard let o = v.objectValue, Set(o.keys).isSubset(of: ["type", "schemaDigest", "threadId", "body"]),
+        guard let o = v.objectValue, Set(o.keys).isSubset(of: ["type", "schemaDigest", "threadId", "body", "admission"]),
               let type = o["type"]?.stringValue, let digest = o["schemaDigest"]?.stringValue, let body = o["body"]?.objectValue else {
             throw ACEError(.invalidBody, "private content must be {type, schemaDigest, threadId?, body}")
         }
@@ -129,6 +162,14 @@ public struct PrivateContent: Sendable, Equatable {
             threadId = s
         }
         try self.init(type: type, schemaDigest: digest, threadId: threadId, body: body)
+        if let a = o["admission"] {
+            guard let m = a.objectValue, Set(m.keys) == ["proof", "permit", "source"], let proof = m["proof"], proof.objectValue != nil,
+                  let permit = m["permit"], permit.objectValue != nil, let source = m["source"], source.objectValue != nil else {
+                throw ACEError(.invalidBody, "admission must be {proof, permit, source}")
+            }
+            try checkJSONValue(a, depth: 1)
+            self = with(admission: Admission(proof: proof, permit: permit, source: source))
+        }
     }
 }
 

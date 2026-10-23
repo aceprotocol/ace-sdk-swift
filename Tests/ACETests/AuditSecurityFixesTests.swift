@@ -157,7 +157,7 @@ private final class AuditInterleavingStore: ACEStore, @unchecked Sendable {
         }
         _ = try await network.createInvitation(peer: sender)
         #expect(try network.admission.get(sender)?.state == .admitted)
-        #expect(try network.admission.blockRecord(sender)?.revision == 2)
+        #expect(try network.admission.blockRecord(sender)?.revision == clock.now + 1)  // above the interleaved block at `now`
         #expect(try network.admission.blockRecord(sender)?.blocked == false)
         #expect(relay.blocked(by: identity.getACEId(), sender) == false)
         await network.close()

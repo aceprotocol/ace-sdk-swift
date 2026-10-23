@@ -131,7 +131,17 @@ struct NetPeer {
     static func make(_ relay: FakeRelay, clock: TestClock, configuration: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true),
                      capacity: Int = ACELimits.defaultReplayCapacity,
                      rules: (String, MemoryStore) -> [any ProfileRules] = { _, _ in [] }) async throws -> NetPeer {
-        let identity = try makeIdentity(now: clock.now)
+        try await open(try makeIdentity(now: clock.now), relay, clock: clock, configuration: configuration, capacity: capacity, rules: rules)
+    }
+
+    /// `identity` on a new, empty store (a reinstall keeps the identity and loses the rest), published.
+    static func reopen(_ identity: any ACEManagedIdentity, _ relay: FakeRelay, clock: TestClock,
+                       configuration: NetworkConfiguration = NetworkConfiguration(contact: .open, listed: true)) async throws -> NetPeer {
+        try await open(identity, relay, clock: clock, configuration: configuration, capacity: ACELimits.defaultReplayCapacity, rules: { _, _ in [] })
+    }
+
+    private static func open(_ identity: any ACEManagedIdentity, _ relay: FakeRelay, clock: TestClock, configuration: NetworkConfiguration,
+                             capacity: Int, rules: (String, MemoryStore) -> [any ProfileRules]) async throws -> NetPeer {
         let store = MemoryStore()
         let received = LockedValue<[ReceivedMessage]>([])
         var config = configuration

@@ -15,8 +15,9 @@ import Foundation
 package protocol PacketTransport: Sendable {
     /// The peer's current prekey from a valid descriptor; `refresh` forces a descriptor refresh first.
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey
-    /// Encrypt `content` to `prekey`, sign it now and post it to the peer's relays (one attempt).
-    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey) async throws
+    /// Encrypt `content` to `prekey`, sign it now and post it to the peer's relays (one attempt). `retry`: an attempt after
+    /// the first, which carries `admission` (05 § Admission recovery).
+    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws
 }
 
 public enum OutboxStatus: String, Sendable {
@@ -237,10 +238,18 @@ public actor Outbox {
         let refreshAtStart = e.refreshPrekey
         var failure: ACEError?, posted: Prekey?
         do {
-            let prekey = try await transport.prekey(for: e.to, refresh: e.refreshPrekey)
+            // Every retry refreshes the descriptor (the peer may have lost its prekeys with its state); if that fails, a
+            // cached one still unexpired and bound to the pins is used (06 § Outbox step 1).
+            let retry = e.attempts > 0
+            let prekey: Prekey
+            if retry, !e.refreshPrekey, let fresh = try? await transport.prekey(for: e.to, refresh: true) {
+                prekey = fresh
+            } else {
+                prekey = try await transport.prekey(for: e.to, refresh: e.refreshPrekey)
+            }
             // The peer refused the prekey that is still its current one: final.
             if e.refreshPrekey, prekey.id == e.lastPrekey { throw ACEError(.unknownPrekey, "the peer refused its current prekey") }
-            try await transport.post(to: e.to, content: e.content, messageId: e.messageId, prekey: prekey)
+            try await transport.post(to: e.to, content: e.content, messageId: e.messageId, prekey: prekey, retry: retry)
             posted = prekey
         } catch let err as ACEError {
             failure = err

@@ -609,17 +609,35 @@ public actor NetworkClient: PacketTransport {
 
     /// One Outbox attempt. It carries the peer's newest permit valid under its current pin; without one it is
     /// `not_permitted` (retried on the schedule until a renewal or refresh) and never falls back to the stranger path
-    /// (06 § Outbox step 3).
-    package func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey) async throws {
+    /// (06 § Outbox step 3). A retry to an admitted peer also carries `admission`: that permit as the proof, a reply
+    /// permit and our PublishedAgent, so a peer that lost its admission table recovers us without a lookup (05 § Admission
+    /// recovery); left out when the content would outgrow `MAX_PLAINTEXT_BYTES`.
+    package func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {
         let agent = try await agent(aceId)
         guard let permit = try validTheirPermit(aceId, agent.state) else { throw noValidPermit }
-        let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: content, messageId: messageId, timestamp: try now())
+        var sent = content
+        let reply = retry ? try replyPermit(for: aceId) : nil
+        if let reply, let source = await currentSource() {
+            let carried = content.with(admission: Admission(proof: permit, permit: reply.permit, source: source))
+            if (try? carried.jsonData()) != nil { sent = carried }
+        }
+        let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: try now())
         do {
             try await onRoutes(agent.descriptor.relays) { try await $0.send(packet, permit: permit) }
         } catch let e as ACEError where e.code == .notPermitted {
             // The relay's refusal (a block among others) reads exactly like a missing permit: no block is revealed.
             throw noValidPermit
         }
+        if let reply, reply.fresh, sent.admission != nil { try admission.noteIssued(aceId, permit: reply.permit) }
+    }
+
+    /// Our PublishedAgent for a retry's `admission`: published now if due, else the last one while it is unexpired; nil
+    /// when neither (the attempt goes without `admission`, never fails for it).
+    private func currentSource() async -> JSONValue? {
+        if let a = try? await publish() { return a.source }
+        guard let a = try? selfAgent(), let now = try? now(),
+              (try? verifyPublishedAgent(a.source, now: now, allowLoopback: true)) != nil else { return nil }
+        return a.source
     }
 
     /// The one refusal of a message, whether no permit verifies here or the relay answers `not_permitted`.
@@ -848,8 +866,9 @@ public actor NetworkClient: PacketTransport {
         await registerBlock(record)
     }
 
-    /// Remove a block (the explicit admission action, 05 § Blocks): the peer becomes a stranger again until contact is
-    /// re-established, and `blocked: false` is registered with a higher revision at the home relay.
+    /// Remove a block (the explicit admission action, 05 § Blocks): the peer becomes a stranger again until it presents a
+    /// permit it still holds, which re-admits it (05 § Admission recovery), or contact is re-established; `blocked: false`
+    /// is registered with a higher revision at the home relay.
     public func unblock(_ aceId: String) async throws {
         guard try admission.get(aceId)?.state == .blocked else { return }
         await registerBlock(try admission.decideBlock(aceId, blocked: false) { _ in nil })
@@ -885,9 +904,25 @@ public actor NetworkClient: PacketTransport {
     package func renewalPermit(for peer: String) throws -> JSONValue? {
         guard let r = try admission.get(peer), r.state != .blocked else { return nil }
         let now = try now()
-        if let p = r.issuedPermit, let state = try? checkUsable(identity, now: now), let v = try? verifyPermit(p, issuer: state, subject: peer, now: now),
-           v.expiresAt - now >= ACELimits.permitRenewalSeconds { return nil }
+        if currentIssued(r, now: now) != nil { return nil }
         return try createPermit(identity: identity, subject: peer, now: now)
+    }
+
+    /// The reply permit of a retry's `admission` (05 § Admission recovery), only for an `admitted` peer: the newest we
+    /// issued while it needs no renewal, else a fresh one (`fresh`: recorded by the caller once the attempt was sent).
+    private func replyPermit(for peer: String) throws -> (permit: JSONValue, fresh: Bool)? {
+        guard let r = try admission.get(peer), r.state == .admitted else { return nil }
+        let now = try now()
+        if let p = currentIssued(r, now: now) { return (p, false) }
+        return (try createPermit(identity: identity, subject: peer, now: now), true)
+    }
+
+    /// The newest permit we issued to `r`'s peer while it is valid under our current KEL with at least
+    /// `PERMIT_RENEWAL_SECONDS` left.
+    private func currentIssued(_ r: AdmissionRecord, now: Int) -> JSONValue? {
+        guard let p = r.issuedPermit, let state = try? checkUsable(identity, now: now),
+              let v = try? verifyPermit(p, issuer: state, subject: r.aceId, now: now), v.expiresAt - now >= ACELimits.permitRenewalSeconds else { return nil }
+        return p
     }
 
     /// The Inbox's handling of an authenticated contact packet (core rules already passed).

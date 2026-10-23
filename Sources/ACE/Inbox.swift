@@ -312,23 +312,14 @@ package actor Inbox {
         guard packet.to == me else { throw ACEError(.wrongRecipient) }
         // 2. admission
         let record = try network.admission.get(packet.from)
-        guard let record else {
-            // 05 § Flow: strangers only while this identity's published card record is `open` (no record is `closed`).
-            guard try network.publishedContact() == .open else { throw ACEError(.notPermitted, "sender is not admitted") }
-            return try await contactCandidate(packet, record: nil)
+        guard record?.state != .blocked else { throw ACEError(.notPermitted, "sender is blocked") }
+        // 3. the sender's pin, refreshed once when the packet names a newer delegation. A stranger, or a peer in the table
+        // without a pin (e.g. pending), is authenticated only by an admission proof or a contact packet's `source`.
+        guard let record, var state = try await network.peers.pinned(packet.from) else {
+            return try await unauthenticated(packet, record: record, recoverable: true)
         }
-        guard record.state != .blocked else { throw ACEError(.notPermitted, "sender is blocked") }
-        // 3. the sender's pin, refreshed once when the packet names a newer delegation. A peer in the table without a pin
-        // (e.g. pending) can only be authenticated by a contact packet's `source`.
-        guard var state = try await network.peers.pinned(packet.from) else { return try await contactCandidate(packet, record: record) }
         if packet.signature.seq > (state.signing?.seq ?? -1) {
-            let t = try now()
-            // A suppressed refresh is a retry, never a drop; like any retry it counts toward the quarantine.
-            if let last = lastRefresh[packet.from], t - last < ACELimits.pinRefreshIntervalSeconds {
-                throw ACEError(.relayUnavailable, "pin refresh suppressed")
-            }
-            lastRefresh = lastRefresh.filter { t - $0.value < ACELimits.pinRefreshIntervalSeconds }
-            lastRefresh[packet.from] = t  // every attempt counts, a failed one too (06 step 3: at most once per interval)
+            try suppressLookup(packet.from, "pin refresh suppressed")
             do {
                 state = try await network.agent(packet.from, refresh: true).state
             } catch let e as ACEError where e.category != .permanent {
@@ -336,9 +327,9 @@ package actor Inbox {
             } catch {
                 // A permanent failure (e.g. a peer after a signing-key change that has not republished its descriptor
                 // yet): the packet continues only as a contact candidate checked against the pin.
-                return try await contactCandidate(packet, record: record)
+                return try await unauthenticated(packet, record: record, recoverable: false)
             }
-            if packet.signature.seq > (state.signing?.seq ?? -1) { return try await contactCandidate(packet, record: record) }
+            if packet.signature.seq > (state.signing?.seq ?? -1) { return try await unauthenticated(packet, record: record, recoverable: false) }
         }
         // 4. signature (01 § Operational signatures: the sender usable now), 5. time window
         let now = try now()
@@ -355,8 +346,30 @@ package actor Inbox {
                                   prekey: e.code == .unknownPrekey ? packet.encryption.prekey : nil)
             return .rejected(e.outcomeCode)
         }
-        let core = content.type == CoreTypes.receipt || content.type == CoreTypes.contact
+        return try await authenticated(packet, content: content, state: state, record: record, now: now)
+    }
+
+    /// At most one pin refresh per sender per `PIN_REFRESH_INTERVAL_SECONDS` (06 step 3).
+    /// A suppressed lookup is a retry, never a drop; like any retry it counts toward the quarantine.
+    private func suppressLookup(_ sender: String, _ reason: String) throws {
+        let t = try now()
+        if let last = lastRefresh[sender], t - last < ACELimits.pinRefreshIntervalSeconds { throw ACEError(.relayUnavailable, reason) }
+        lastRefresh = lastRefresh.filter { t - $0.value < ACELimits.pinRefreshIntervalSeconds }
+        lastRefresh[sender] = t  // every attempt counts, a failed one too
+    }
+
+    /// Steps 7–11 for an authenticated, decrypted packet. A carried `admission` is the core packets' `invalid_body`; on a
+    /// message its reply permit is held like a receipt renewal (05 § Admission recovery) and it never reaches the host.
+    private func authenticated(_ packet: Packet, content carried: PrivateContent, state: KelState, record: AdmissionRecord?,
+                               now: Int) async throws -> ReceiveOutcome {
+        let me = identity.getACEId()
+        let core = carried.type == CoreTypes.receipt || carried.type == CoreTypes.contact
+        let content = carried.with(admission: nil)
         do {
+            if let admission = carried.admission {
+                guard !core else { throw ACEError(.invalidBody, "receipts and contacts carry no admission") }
+                try await network.holdTheirPermit(admission.permit, from: packet.from) { $0.map { $0.state != .blocked } ?? false }
+            }
             // 7–8. installed schema, body
             try network.profiles.validate(content)
             // 9. dedupe before any rule runs: a retried message is never judged against state it already changed; an
@@ -549,17 +562,76 @@ package actor Inbox {
         return source
     }
 
+    /// A sender the receiver cannot authenticate from a pin: 5, 6, 7 first (a stranger costs one decapsulation; at a
+    /// `closed` agent its relays queued it only on a permit we issued). A message whose `admission.proof` is valid is a
+    /// recovery candidate when `recoverable` (no pin at all); otherwise only a contact candidate goes on, a stranger's only
+    /// at an `open` agent (05 § Receiver admission). Every failure is a silent drop.
+    private func unauthenticated(_ packet: Packet, record: AdmissionRecord?, recoverable: Bool) async throws -> ReceiveOutcome {
+        let now = try now()
+        guard (try? checkPacketTime(packet, now: now)) != nil else { return .dropped(.staleTimestamp) }
+        guard let seed = try network.prekeys.open(packet.encryption.prekey, now: now) else { return .dropped(.unknownPrekey) }
+        guard let content = try? decryptPacket(packet, seed: seed) else { return .dropped(.decryptionFailed) }
+        if recoverable, content.type != CoreTypes.contact, content.type != CoreTypes.receipt, let admission = content.admission,
+           validProof(admission.proof, from: packet.from, now: now) {
+            return try await recovered(packet, content: content, admission: admission, now: now)
+        }
+        // 05 § Flow: strangers only while this identity's published card record is `open` (no record is `closed`).
+        if record == nil, try network.publishedContact() != .open { return .dropped(.notPermitted) }
+        return try await contactCandidate(packet, content: content, record: record, now: now)
+    }
+
+    /// `proof` is a permit we issued to `from`, valid under our current KEL now (05 § Admission recovery step 2): a local
+    /// check of our own signature, before any network lookup.
+    private func validProof(_ proof: JSONValue, from: String, now: Int) -> Bool {
+        guard let mine = try? checkUsable(identity, now: now) else { return false }
+        return (try? verifyPermit(proof, issuer: mine, subject: from, now: now)) != nil
+    }
+
+    /// Admission recovery (05 § Admission recovery step 3), with no network lookup: an uninstalled type is dropped; the
+    /// carried `source` must verify naming the sender under the pin rules (01 § Pinning), and the packet signature and the
+    /// reply permit under it. Only then is the sender recorded `admitted` (a new row with no profile; a block recorded
+    /// meanwhile wins) with `proof` as the newest permit issued to it, `source` pinned, the permit held, and step 8 follows.
+    private func recovered(_ packet: Packet, content: PrivateContent, admission: Admission, now: Int) async throws -> ReceiveOutcome {
+        let from = packet.from
+        do { try network.profiles.validate(content) } catch let e as ACEError where e.code == .unsupportedSchema { return .dropped(e.code) } catch {}
+        let source: VerifiedAgent
+        do {
+            guard admission.source["descriptor"]?["aceId"]?.stringValue == from else {
+                throw ACEError(.invalidAuthorization, "admission source does not name the sender")
+            }
+            let pinned = try await network.peers.pinned(from)
+            let pins = try await network.peers.delegationPins(for: admission.source)
+            source = try verifyPublishedAgent(admission.source, now: now, allowLoopback: network.configuration.allowLoopbackRelays,
+                                              pinned: pinned, delegationPins: pins)
+            let state = source.state
+            try verifyPacketSignature(packet, sender: state, now: now)
+            guard (try? verifyPermit(admission.permit, issuer: state, subject: identity.getACEId(), now: now)) != nil else {
+                throw ACEError(.invalidAuthorization, "admission permit is not valid")
+            }
+        } catch let e as ACEError where e.category == .permanent {
+            return .dropped(e.code)
+        }
+        var blocked = false
+        let record = try network.admission.update(from) { r in
+            guard r?.state != .blocked else { blocked = true; return r }
+            var r = r ?? AdmissionRecord(aceId: from, state: .admitted, updatedAt: 0)
+            r.state = .admitted
+            if (r.issuedPermit?["issuedAt"]?.wireInt ?? -1) < (admission.proof["issuedAt"]?.wireInt ?? 0) { r.issuedPermit = admission.proof }
+            return r
+        }
+        if blocked { return .dropped(.notPermitted) }
+        try await network.peers.adoptOrUsable(source)
+        return try await authenticated(packet, content: content, state: source.state, record: record, now: now)
+    }
+
     /// The contact-candidate path: no pinned KEL, so only an `ace:contact:1` packet is processed, authenticated by its
     /// embedded `source` (1, 2, 5, 6, 7, 8, authenticate by `source`, 9, 10, ack). A stranger (`record` nil,
     /// `open` agents only) may only send `request` and is never pinned; a peer already in the table (e.g. pending) may send
     /// any kind. Every failure is a silent drop.
-    private func contactCandidate(_ packet: Packet, record: AdmissionRecord?) async throws -> ReceiveOutcome {
+    private func contactCandidate(_ packet: Packet, content: PrivateContent, record: AdmissionRecord?, now: Int) async throws -> ReceiveOutcome {
         let stranger = record == nil
-        let now = try now()
-        guard (try? checkPacketTime(packet, now: now)) != nil else { return .dropped(.staleTimestamp) }
-        guard let seed = try network.prekeys.open(packet.encryption.prekey, now: now) else { return .dropped(.unknownPrekey) }
-        guard let content = try? decryptPacket(packet, seed: seed), content.type == CoreTypes.contact,
-              !stranger || content.body["kind"] == "request", (try? network.profiles.validate(content)) != nil else {
+        guard content.type == CoreTypes.contact, content.admission == nil, !stranger || content.body["kind"] == "request",
+              (try? network.profiles.validate(content)) != nil else {
             return .dropped(.notPermitted)
         }
         let source: VerifiedAgent
