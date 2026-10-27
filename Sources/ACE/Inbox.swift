@@ -341,18 +341,34 @@ package actor Inbox {
         let now = try now()
         try verifyPacketSignature(packet, sender: state, now: now)
         try checkPacketTime(packet, now: now)
-        // 6. decrypt (an unknown prekey or an unparsable plaintext is rejected; the type is not known yet). A storage
-        // failure of the vault is a retry.
-        let content: PrivateContent
+        // 6. decrypt and unpad: an unknown prekey is rejected; any other failure (bad padding included) is a drop. A
+        // storage failure of the vault is a retry.
+        let plaintext: Data
         do {
-            content = try PrivateContent(json: try decrypt(packet, now: now))
-        } catch let e as ACEError where e.code == .unknownPrekey || e.code == .invalidBody {
+            plaintext = try decrypt(packet, now: now)
+        } catch let e as ACEError where e.code == .unknownPrekey {
             // L1: an unknown_prekey rejection names the prekey it could not open (06 § Receipts).
             try await sendReceipt(to: packet.from, messageId: packet.messageId, outcome: "rejected", code: e.outcomeCode,
-                                  prekey: e.code == .unknownPrekey ? packet.encryption.prekey : nil)
+                                  prekey: packet.encryption.prekey)
+            return .rejected(e.outcomeCode)
+        }
+        // 7. content shape (a missing or malformed `prekey` included): rejected `invalid_body`, except that receipts and
+        // contact packets are never receipted, only dropped (the type peeked from the raw JSON).
+        let content: PrivateContent
+        do {
+            content = try PrivateContent(json: plaintext)
+        } catch let e as ACEError where e.code == .invalidBody {
+            if Self.isCoreContent(plaintext) { return .dropped(e.code) }
+            try await sendReceipt(to: packet.from, messageId: packet.messageId, outcome: "rejected", code: e.outcomeCode, prekey: nil)
             return .rejected(e.outcomeCode)
         }
         return try await authenticated(packet, content: content, state: state, record: record, now: now)
+    }
+
+    /// Whether content bytes that failed step 7 name a receipt or contact type: such packets are never receipted.
+    private static func isCoreContent(_ plaintext: Data) -> Bool {
+        guard let type = (try? JSONParser.parse(plaintext))?.objectValue?["type"]?.stringValue else { return false }
+        return type == CoreTypes.receipt || type == CoreTypes.contact
     }
 
     /// Step 6 (`unknown_prekey`, `decryption_failed`, `invalid_body` for bad padding), then the issuer rule (04 § Peer

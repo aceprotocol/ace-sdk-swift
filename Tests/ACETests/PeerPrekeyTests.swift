@@ -3,6 +3,7 @@
 //  04 § Peer prekeys: the vault's per-peer surface, and end to end (06 § Outbox step 2, § Receipts, § Receive pipeline).
 //
 
+import CryptoKit
 import Foundation
 import Testing
 @testable import ACE
@@ -413,6 +414,73 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .rejected("invalid_body"))
         #expect(try await held(bob, alice, clock) == nil)
         #expect(bob.received.value.isEmpty)
+    }
+
+    /// The one packet bob sent alice since `n`, decrypted: a `rejected` receipt for `messageId` with `code`.
+    private func expectRejectedReceipt(_ relay: FakeRelay, since n: Int, _ bob: NetPeer, _ alice: NetPeer, _ clock: TestClock,
+                                       messageId: String, code: String) throws {
+        let r = try content(try one(relay, since: n, bob, alice), at: alice, clock)
+        #expect(r.type == CoreTypes.receipt)
+        #expect(r.body["messageId"]?.stringValue == messageId)
+        #expect(r.body["outcome"]?.stringValue == "rejected")
+        #expect(r.body["code"]?.stringValue == code)
+    }
+
+    /// 06 step 7: a malformed `prekey` (not canonical Base64) from a pinned peer is rejected `invalid_body` with a receipt.
+    @Test func step7AMalformedPrekeyIsRejectedWithAReceipt() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connectedText(relay, clock)
+        let d = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"]).schemaDigest
+        let plaintext = Data(#"{"body":{"message":"x"},"prekey":"not base64!","schemaDigest":"\#(d)","type":"ace:text:1"}"#.utf8)
+        let p = try forged(alice, to: bob, plaintext: Packet.pad(plaintext), clock)
+        let n = relay.postedCount
+        #expect(await bob.network.inbox!.receive(p.jsonData()) == .rejected("invalid_body"))
+        try expectRejectedReceipt(relay, since: n, bob, alice, clock, messageId: p.messageId, code: "invalid_body")
+        #expect(try await held(bob, alice, clock) == nil)
+        #expect(bob.received.value.isEmpty)
+    }
+
+    /// 06 step 7: the same failure on receipt-typed content is dropped, never receipted.
+    @Test func step7AMalformedCorePacketIsDroppedWithoutAReceipt() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connectedText(relay, clock)
+        let c = try alice.network.profiles.content(type: CoreTypes.receipt, body: ["messageId": .string(UUID().uuidString.lowercased()),
+                                                                                  "outcome": "delivered"])
+            .with(prekey: Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize))
+        let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: try #require(try bob.network.prekeys.current()).prekey, content: c,
+                                 timestamp: clock.now)
+        let n = relay.postedCount
+        #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.invalidBody))
+        #expect(relay.posted(since: n, from: bob.aceId, to: alice.aceId).isEmpty)
+        #expect(try await held(bob, alice, clock) == nil)
+    }
+
+    /// 06 step 6: non-zero padding is a decryption failure: dropped, no receipt.
+    @Test func step6NonZeroPaddingIsDroppedWithoutAReceipt() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connectedText(relay, clock)
+        var padded = Packet.pad(try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"]).with(prekey: somePrekey()).jsonData())
+        padded[padded.count - 1] = 1
+        let p = try forged(alice, to: bob, plaintext: padded, clock)
+        let n = relay.postedCount
+        #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.invalidBody))
+        #expect(relay.posted(since: n, from: bob.aceId, to: alice.aceId).isEmpty)
+        #expect(try await held(bob, alice, clock) == nil)
+        #expect(bob.received.value.isEmpty)
+    }
+
+    /// A correctly signed packet whose padded plaintext is `plaintext` verbatim (what a faulty or hostile sender can send).
+    private func forged(_ alice: NetPeer, to bob: NetPeer, plaintext: Data, _ clock: TestClock) throws -> Packet {
+        let prekey = try #require(try bob.network.prekeys.current()).prekey
+        let r = try XWingMLKEM768X25519.PublicKey(rawRepresentation: prekey.publicKey).encapsulate()
+        let messageId = UUID().uuidString.lowercased(), kem = Data(r.encapsulated)
+        let header = Packet.header(from: alice.aceId, to: bob.aceId, messageId: messageId, timestamp: clock.now, prekey: prekey.id, kemCiphertext: kem)
+        let payload = try Packet.seal(plaintext, sharedSecret: r.sharedSecret, header: header)
+        let signature = try operationalSign(alice.identity, action: "packet", timestamp: clock.now,
+                                            payload: Packet.signPayload(to: bob.aceId, messageId: messageId, prekey: prekey.id, kemCiphertext: kem,
+                                                                        payload: payload))
+        return Packet(messageId: messageId, from: alice.aceId, to: bob.aceId, timestamp: clock.now, prekey: prekey.id, kemCiphertext: kem,
+                      payload: payload, signature: signature)
     }
 
     /// A vault storage failure at step 6 is a retry, never a drop or a rejection.
