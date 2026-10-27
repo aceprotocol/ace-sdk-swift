@@ -7,7 +7,7 @@
 //    profile digest = SHA-256(canonical(manifest))
 //    message digest = SHA-256(canonical({type, schema}))
 //
-//  The official manifests are the SwiftPM resources Profiles/{core,text,commerce}.json, byte-identical to
+//  The official manifests are the SwiftPM resources Profiles/{core,text,delegation,commerce}.json, byte-identical to
 //  ace-spec/profiles (ace-spec/scripts/check-sdk-artifacts.py checks the bytes).
 //
 //  A manifest is data only: no remote references, code or execution authority.
@@ -57,6 +57,7 @@ public struct ProfileManifest: Sendable {
     /// never listed in a descriptor's `profiles`.
     public static let core = official("core")
     public static let text = official("text")
+    public static let delegation = official("delegation")
     public static let commerce = official("commerce")
 
     /// The exact bytes of the bundled resource `Profiles/<name>.json`.
@@ -71,6 +72,7 @@ public struct ProfileManifest: Sendable {
     public static let officialDigests: [String: String] = [
         "ace:core:1": "66f46d4b8951b75f98abae24a72ceffa173c4e27748d09be78b8d6382ddc8222",
         "ace:text:1": "48619350eaea46b2d60f7ce71fe55867e00c8dd081796b408fb6a95692b8b307",
+        "ace:delegation:1": "fc1653477df13c6c8be00d34ce4811d90365053c0afd2b858f90603eab474964",
         "ace:commerce:1": "30583f0a1acd86ac5a217d706df1c27dc7caea5d4f2deed6112807679afab053",
     ]
 

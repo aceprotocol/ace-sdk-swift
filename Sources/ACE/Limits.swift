@@ -27,30 +27,26 @@ public enum ACELimits {
     public static let maxSigningKeyLifetime = 31_622_400
     /// Longest descriptor lifetime (`expiresAt - issuedAt`, 7 days).
     public static let maxDescriptorSeconds = 604_800
-    public static let maxCredentialSeconds = 604_800
     public static let maxPermitSeconds = 2_592_000
     /// A receipt carries a fresh permit when the peer's permit has less than this left (15 days).
     public static let permitRenewalSeconds = 1_296_000
     /// Superseded prekeys a vault keeps.
     public static let maxPrekeys = 16
-    public static let maxExtBytes = 4096
+    public static let maxExtBytes = 32_768
     /// Canonical JSON of a card record (04 § Card record).
     public static let maxCardRecordBytes = 16_384
     /// Entries of a card record `pay`.
     public static let maxPayAccounts = 8
     public static let maxNoteBytes = 512
-    /// `limit` maximum of inbox and directory pages; the default inbox `limit`.
+    /// Maximum and default `limit` of inbox and directory pages.
     public static let maxInboxPage = 100
-    /// Default `limit` of a directory page.
-    public static let defaultPageLimit = 20
     public static let maxPageBytes = 8_388_608
     public static let maxManifestBytes = 65_536
     public static let maxPendingContactRequests = 16
     /// Lifetime of a held incoming contact request (an outgoing `pending` entry lives `offlineWindowSeconds`).
     public static let contactRequestTTLSeconds = 86_400
-    /// Bounds on a stranger's contact `source`, checked before any signature (05 § Receiver admission).
+    /// Bound on a stranger's contact `source` KEL, checked before any signature (05 § Receiver admission).
     public static let maxStrangerKelEvents = 32
-    public static let maxStrangerDelegations = 1
     /// Relay stranger allowance (07 § Send), relay-side: the client only names them.
     public static let strangerAllowance = 16
     public static let strangerNetworkAllowance = 2

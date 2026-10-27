@@ -256,24 +256,21 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
         expectCode(.invalidAuthorization) { try make(DescriptorClaims(relays: ["https://r.example"], prekey: prekey, ext: ["urn:x:1": [:]])) }  // not listed
     }
 
-    @Test func delegationsAndErc8004() throws {
-        let controller = try makeIdentity(now: NOW), delegate = try makeIdentity(now: NOW)
+    @Test func erc8004IsACardRecordMember() throws {
+        let delegate = try makeIdentity(now: NOW)
         let prekey = try Prekey(publicKey: XWing.publicKey(fromSeed: XWing.generateSeed()))
-        let entry = try createDelegation(issuer: controller, subject: delegate.getACEId(), now: NOW, lifetime: 1000)
         let binding = try ERC8004Binding(agentRegistry: "eip155:8453:0x8004a169fb4a3325136eb29fa0ceb6d2e539a432", agentId: "42")
-        let agent = try createPublishedAgent(identity: delegate, claims: DescriptorClaims(relays: ["https://r.example"], prekey: prekey,
-                                                                                          delegations: [entry], erc8004: [binding]), now: NOW)
-        #expect(agent.descriptor.delegations.map(\.issuer) == [controller.getACEId()] && agent.descriptor.erc8004 == [binding])
-        // expired entries are dropped, not fatal
-        #expect(try verifyPublishedAgent(agent.source, now: NOW + 1000).descriptor.delegations.isEmpty)
-        // an entry for another subject is fatal
-        let stranger = try makeIdentity(now: NOW)
-        let other = try createDelegation(issuer: controller, subject: stranger.getACEId(), now: NOW)
-        expectCode(.invalidAuthorization) {
-            try createPublishedAgent(identity: delegate, claims: DescriptorClaims(relays: ["https://r.example"], prekey: prekey, delegations: [other]), now: NOW)
+        // a descriptor has no `delegations` or `erc8004` member (unknown members are invalid)
+        let agent = try createPublishedAgent(identity: delegate, claims: DescriptorClaims(relays: ["https://r.example"], prekey: prekey), now: NOW)
+        for key in ["erc8004", "delegations"] {
+            var o = agent.source.objectValue!
+            var d = o["descriptor"]!.objectValue!
+            d[key] = [binding.jsonValue]
+            o["descriptor"] = .object(d)
+            expectCode(.invalidAuthorization, key) { try verifyPublishedAgent(.object(o), now: NOW) }
         }
-        expectCode(.invalidArgument) { try createDelegation(issuer: controller, subject: controller.getACEId(), now: NOW) }
-        expectCode(.invalidArgument) { try createDelegation(issuer: controller, subject: delegate.getACEId(), now: NOW, lifetime: ACELimits.maxCredentialSeconds + 1) }
+        let card = try createCardRecord(identity: delegate, home: "https://r.example", erc8004: [binding], contact: .closed, listed: false, now: NOW)
+        #expect(try verifyCardBundle(card, now: NOW).record.erc8004 == [binding])
         expectCode(.invalidArgument) { try ERC8004Binding(agentRegistry: "eip155:8453:0xabc", agentId: "007") }
         // the pure registration-file helper
         let id = delegate.getACEId()

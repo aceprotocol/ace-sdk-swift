@@ -30,21 +30,22 @@ import Testing
         return .array(events)
     }
 
-    /// 04 § Verification step 1: a delegation entry's closed shape is part of the descriptor's shape, checked before the KEL.
-    @Test func descriptorDelegationShapeIsCheckedBeforeTheKel() throws {
+    /// 04 § Verification step 1: an official profile's `ext` value (here `ace:delegation:1`) is part of the descriptor's
+    /// shape, checked before the KEL.
+    @Test func descriptorDelegationExtShapeIsCheckedBeforeTheKel() throws {
         let a = try TestAgent()
         var d = a.agent.source["descriptor"]!.objectValue!
         let other = try makeIdentity()
-        let malformed: JSONValue = ["kel": .array([]), "credential": [
+        var credential: [String: JSONValue] = [
             "issuer": .string(other.getACEId()), "subject": .string(a.aceId), "issuedAt": .number(Double(NOW)), "expiresAt": .number(Double(NOW + 60)),
-            "signature": ["scheme": "ml-dsa-65", "seq": 1, "value": "AAAA"]]]
-        d["delegations"] = .array([malformed])
+            "signature": ["scheme": "ml-dsa-65", "seq": 1, "value": "AAAA"]]
+        d["profiles"] = [ProfileManifest.delegation.ref.jsonValue]
+        d["ext"] = [delegationProfileId: ["credentials": [.object(credential)]]]
         let source: JSONValue = ["kel": Self.brokenKel(a.agent.source["kel"]), "descriptor": .object(d)]
         expectCode(.invalidAuthorization) { try verifyPublishedAgent(source, now: NOW) }
-        // the same descriptor with a well-shaped entry reaches the KEL
-        var credential = malformed["credential"]!.objectValue!
+        // the same descriptor with a well-shaped credential reaches the KEL
         credential["signature"] = a.agent.source["descriptor"]!["signature"]
-        d["delegations"] = .array([["kel": .array([]), "credential": .object(credential)]])
+        d["ext"] = [delegationProfileId: ["credentials": [.object(credential)]]]
         expectCode(.invalidKel) { try verifyPublishedAgent(["kel": Self.brokenKel(a.agent.source["kel"]), "descriptor": .object(d)], now: NOW) }
     }
 

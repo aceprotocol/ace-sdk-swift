@@ -347,24 +347,6 @@ private final class GateTransport: PacketTransport, @unchecked Sendable {
         #expect(try await alice.network.refreshPermits().isEmpty)  // once per delegation
     }
 
-    /// M2: a delegation entry carrying an older issuer KEL, signed by a delegation the pin superseded, is invalid.
-    @Test func delegationIssuerIsReconciledWithItsPin() async throws {
-        let now = systemClock()
-        let alice = try TestAgent(now: now - 10), dave = try makeIdentity(now: now - 10)
-        let stale = try createDelegation(issuer: dave, subject: alice.aceId, now: now - 5)
-        try dave.delegate(now: now - 4, notAfter: nil)
-        let claims = DescriptorClaims(relays: ["https://relay.example"], prekey: alice.agent.descriptor.prekey, delegations: [stale])
-        let src = try createPublishedAgent(identity: alice.identity, claims: claims, now: now - 3)
-        #expect(src.descriptor.delegations.map(\.issuer) == [dave.getACEId()])  // standalone: passes
-        let peers = PeerStore(store: MemoryStore())
-        try await peers.pin(kel: try dave.getKel())
-        await expectCodeAsync(.invalidAuthorization) { try await peers.adopt(source: src.source) }
-        var fresh = claims
-        fresh.delegations = [try createDelegation(issuer: dave, subject: alice.aceId, now: now - 2)]
-        let ok = try createPublishedAgent(identity: alice.identity, claims: fresh, now: now - 1)
-        #expect(try await peers.adopt(source: ok.source).descriptor.delegations.map(\.issuer) == [dave.getACEId()])
-    }
-
     /// Bob, on `relay`, reaching any other relay as `relayB`.
     private func routedPeer(_ relay: FakeRelay, _ relayB: FakeRelay, _ clock: TestClock) async throws -> NetworkClient {
         let store = MemoryStore()
@@ -398,23 +380,20 @@ private final class GateTransport: PacketTransport, @unchecked Sendable {
         await bob.close()
     }
 
-    /// A cached descriptor no longer bound to the current pins (here a delegation issuer's pin advanced past the key that
-    /// signed its entry) is refreshed from its relays and the home relay; a bound one from its relays alone.
+    /// A cached descriptor no longer bound to the current pin (here the subject's pin advanced past the key that signed it)
+    /// is refreshed from its relays and the home relay; a bound one from its relays alone.
     @Test func aStaleCachedDescriptorIsRefreshedFromItsRelaysAndTheHomeRelay() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn), relayB = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock)  // the home relay holds an older revision only
-        let dave = try makeIdentity(now: clock.now)
         let prekey = try #require(relay.publishedAgent(alice.aceId)).descriptor.prekey
         clock.now += 1
-        let delegated = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
-            relays: [relayB.url], prekey: prekey, profiles: [ProfileManifest.text.ref],
-            delegations: [try createDelegation(issuer: dave, subject: alice.aceId, now: clock.now)]), now: clock.now)
+        let cached = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
+            relays: [relayB.url], prekey: prekey, profiles: [ProfileManifest.text.ref]), now: clock.now)
         let bob = try await routedPeer(relay, relayB, clock)
-        try await bob.peers.pin(kel: try dave.getKel())
-        try await bob.importAgent(delegated.source)
+        try await bob.importAgent(cached.source)
         clock.now += 1
-        try dave.delegate(now: clock.now, notAfter: nil)
-        try await bob.peers.pin(kel: try dave.getKel())
+        try alice.identity.delegate(now: clock.now, notAfter: nil)
+        try await bob.peers.pin(kel: try alice.identity.getKel())
         #expect(try await bob.peers.agent(alice.aceId) == nil)  // stale
         clock.now += 1
         let current = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(

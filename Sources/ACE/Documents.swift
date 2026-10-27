@@ -2,8 +2,8 @@
 //  Documents.swift
 //  ACE SDK
 //
-//  Signed documents: the descriptor (`PublishedAgent = {kel, descriptor}`), the card record (`CardBundle = {kel, card}`),
-//  the delegation credential, the delivery permit, and the ERC-8004 binding helper. Every document signature is an operational signature over
+//  Signed documents: the descriptor (`PublishedAgent = {kel, descriptor}`), the card record (`CardBundle = {kel, card}`)
+//  with its ERC-8004 entries, and the delivery permit. Every document signature is an operational signature over
 //  `M(issuer, issuedAt, seq, canonical(claims))` (claims = the document without `signature`). None of them grants
 //  execution, payment or shell rights.
 //
@@ -39,26 +39,18 @@ package func verifyDocument(_ o: [String: JSONValue], state: KelState, action: S
     }
 }
 
-/// The `issuedAt` of a descriptor or card record signed at `now`: never before the last event of the signer's log, so
-/// the record is never older than the `dlg` that delegated its key (a clock behind that event still signs a valid record).
-private func recordTime(_ identity: any ACEIdentity, now: Int?) throws -> Int {
+/// The signer's `t` (01 § Operational signatures): `max(now, ts of the last event of the signer's log)`, `now` defaulting
+/// to the system clock. Every signer signs at it, so nothing is signed before the `dlg` that delegated its key (a clock
+/// behind that event still signs a valid object).
+package func recordTime(_ identity: any ACEIdentity, now: Int?) throws -> Int {
     let at = try identityNow(now)
     return max(at, try identity.getKel().last.flatMap { wireInt($0["ts"]) } ?? at)
-}
-
-/// A descriptor or card record is signed no earlier than the `dlg` its `signature.seq` names (04 § Verification step 3):
-/// an earlier `issuedAt` is `stale_peer_binding`. A recovery that forks the log can delegate the same key at the same
-/// `seq`; a record signed on the abandoned branch is older than the new `dlg` and never verifies under the new log.
-private func checkSignedAfterDelegation(_ o: [String: JSONValue], state: KelState) throws {
-    guard let seq = o["signature"]?["seq"]?.wireInt, seq == state.signing?.seq, state.events.indices.contains(seq),
-          let issuedAt = o["issuedAt"]?.wireInt, let dlgTs = wireInt(state.events[seq]["ts"]) else { return }
-    guard issuedAt >= dlgTs else { throw ACEError(.stalePeerBinding, "signed before its signing delegation") }
 }
 
 /// `issuedAt <= now + 300`, `issuedAt < expiresAt`, `now < expiresAt` (unless `!requireLive`), `expiresAt - issuedAt <=
 /// maximum`. Returns `(issuedAt, expiresAt)`.
 @discardableResult
-private func checkLifetime(_ o: [String: JSONValue], now: Int, maximum: Int, what: String, requireLive: Bool = true) throws -> (Int, Int) {
+package func checkLifetime(_ o: [String: JSONValue], now: Int, maximum: Int, what: String, requireLive: Bool = true) throws -> (Int, Int) {
     guard let issued = o["issuedAt"]?.wireInt, let expires = o["expiresAt"]?.wireInt else { throw unauthorized("\(what) lifetime must be wire integers") }
     guard issued <= now + ACELimits.timestampWindowSeconds, issued < expires, !requireLive || now < expires, expires - issued <= maximum else {
         throw unauthorized("\(what) is not within its lifetime")
@@ -166,7 +158,7 @@ public func isRelayRoute(_ value: String, allowLoopback: Bool = false) -> Bool {
 
 // MARK: - ERC-8004
 
-/// `{agentRegistry, agentId}`: a descriptor's pointer to an on-chain ERC-8004 agent. `agentRegistry` is CAIP-10; `agentId`
+/// `{agentRegistry, agentId}`: a card record's pointer to an on-chain ERC-8004 agent (claimed, not proven). `agentRegistry` is CAIP-10; `agentId`
 /// is the registry's chain-native identifier: for an `eip155` registry a decimal string of at most 78 digits, for any
 /// other CAIP-2 namespace 1–128 characters of `[A-Za-z0-9]` (e.g. a Solana base58 address). The binding holds only when
 /// the agent's registration file also points back (`verifyErc8004Registration`); reading the chain is the host's job.
@@ -208,119 +200,18 @@ public func verifyErc8004Registration(_ registration: JSONValue, aceId: String) 
     return registration["services"]?.arrayValue?.contains { $0["name"] == "ACE" && $0["endpoint"]?.stringValue == aceId } ?? false
 }
 
-// MARK: - Delegation credential
-
-/// A verified delegation edge: `issuer` (controller) declares that `subject` (delegate) acts on its behalf. It grants no
-/// execution, payment or communication right; the issuer revokes it by not renewing.
-public struct VerifiedDelegation: Sendable, Equatable {
-    public let issuer: String
-    public let subject: String
-    public let issuedAt: Int
-    public let expiresAt: Int
-    /// The issuer's verified KEL.
-    public let issuerState: KelState
-    /// `{kel, credential}` as carried in the descriptor.
-    public let entry: JSONValue
-}
-
-/// `{issuer, subject, issuedAt, expiresAt, signature}` signed by `issuer` (action `delegation`), valid for
-/// `lifetime` seconds (at most 7 days). Returns the descriptor entry `{kel, credential}`.
-public func createDelegation(issuer: any ACEIdentity, subject: String, now: Int? = nil,
-                             lifetime: Int = ACELimits.maxCredentialSeconds) throws -> JSONValue {
-    guard isACEId(subject), subject != issuer.getACEId() else { throw ACEError(.invalidArgument, "subject must be another ACE ID") }
-    let at = try identityNow(now)
-    guard (1...ACELimits.maxCredentialSeconds).contains(lifetime) else {
-        throw ACEError(.invalidArgument, "lifetime must be 1...\(ACELimits.maxCredentialSeconds) seconds")
-    }
-    let credential = try signDocument(issuer, action: "delegation", claims: [
-        "issuer": .string(issuer.getACEId()), "subject": .string(subject),
-        "issuedAt": .number(Double(at)), "expiresAt": .number(Double(at + lifetime)),
-    ])
-    return ["kel": ExportJSON.kelValue(try issuer.getKel()), "credential": .object(credential)]
-}
-
-/// Verify a descriptor entry `{kel, credential}` for `subject` (04 § Delegations, in order): shape and lifetime bounds,
-/// the issuer's KEL, the signature by its current signing delegation (usable at `now`), then `now < expiresAt`. Every failure is
-/// `invalid_authorization`. `pinned`: the verifier's pin for the issuer, when it holds one; the carried KEL is then
-/// reconciled with it (01 § Pinning), so a fork, or an older prefix whose credential is signed by a delegation the pin
-/// superseded, is invalid.
-public func verifyDelegation(_ entry: JSONValue, subject: String, now: Int, pinned: KelState? = nil) throws -> VerifiedDelegation {
-    let (verified, live) = try checkDelegationEntry(entry, subject: subject, now: now, pinned: pinned)
-    guard live else { throw unauthorized("delegation has expired") }
-    return verified
-}
-
-/// `verifyDelegation` that reports an entry failing only by expiry as `live == false` (dropped from a descriptor, not
-/// invalid). Every other failure, the issuer's KEL included, is `invalid_authorization`.
-package func checkDelegationEntry(_ entry: JSONValue, subject: String, now: Int, pinned: KelState? = nil) throws -> (VerifiedDelegation, live: Bool) {
-    guard let e = entry.objectValue, hasMembers(e, ["kel", "credential"]), let c = e["credential"]?.objectValue,
-          hasMembers(c, ["issuer", "subject", "issuedAt", "expiresAt", "signature"]),
-          let issuer = c["issuer"]?.stringValue, isACEId(issuer), c["subject"]?.stringValue == subject, issuer != subject else {
-        throw unauthorized("delegation must be {kel, credential} for this subject")
-    }
-    let (issued, expires) = try checkLifetime(c, now: now, maximum: ACELimits.maxCredentialSeconds, what: "delegation", requireLive: false)
-    var state: KelState
-    do {
-        state = try verifiedKel(e["kel"], now: now)
-        if let pinned, pinned.aceId == state.aceId {
-            state = try ACEKel.extend(pinned: pinned, verified: state).state
-        }
-        guard state.aceId == issuer else { throw unauthorized("delegation kel is not the issuer's KEL") }
-        try verifyDocument(c, state: state, action: "delegation", now: now)
-    } catch let err as ACEError where err.code != .invalidAuthorization {
-        throw unauthorized("delegation: \(err.message)")
-    }
-    let verified = VerifiedDelegation(issuer: issuer, subject: subject, issuedAt: issued, expiresAt: expires, issuerState: state, entry: entry)
-    return (verified, now < expires)
-}
-
-/// The bounds on a stranger's contact `source` (05 § Receiver admission), checked before any signature: its KEL and each
-/// delegation entry's KEL hold at most `ACELimits.maxStrangerKelEvents` events and it carries at most
-/// `ACELimits.maxStrangerDelegations` delegation entries (`not_permitted`; the request is dropped).
+/// The bound on a stranger's contact `source` (05 § Receiver admission), checked before any signature: its `kel` holds at
+/// most `ACELimits.maxStrangerKelEvents` events (`not_permitted`; the request is dropped). Nothing else in it is counted.
 public func checkStrangerSource(_ source: JSONValue) throws {
-    func short(_ v: JSONValue?) -> Bool { (v?.arrayValue?.count).map { $0 <= ACELimits.maxStrangerKelEvents } ?? false }
-    guard let o = source.objectValue, let d = o["descriptor"]?.objectValue, short(o["kel"]) else {
+    guard let kel = source["kel"]?.arrayValue, kel.count <= ACELimits.maxStrangerKelEvents else {
         throw ACEError(.notPermitted, "stranger source exceeds the KEL bound")
     }
-    let entries: [JSONValue]
-    if let raw = d["delegations"] {
-        guard let list = raw.arrayValue else { throw ACEError(.notPermitted, "stranger source carries too many delegations") }
-        entries = list
-    } else {
-        entries = []
-    }
-    guard entries.count <= ACELimits.maxStrangerDelegations else { throw ACEError(.notPermitted, "stranger source carries too many delegations") }
-    guard entries.allSatisfy({ $0.objectValue != nil && short($0["kel"]) }) else {
-        throw ACEError(.notPermitted, "stranger delegation exceeds the KEL bound")
-    }
 }
 
-/// The closed shape of a delegation entry, part of a descriptor's shape (04 § Verification step 1, before any KEL or
-/// signature work): `{kel, credential: {issuer: ACE ID, subject: string, issuedAt, expiresAt: wire integers,
-/// signature: operational signature shape}}`. The entry's rules (04 § Delegations) are checked in step 4.
-private func isDelegationEntryShape(_ entry: JSONValue) -> Bool {
-    guard let e = entry.objectValue, hasMembers(e, ["kel", "credential"]), let c = e["credential"]?.objectValue, hasMembers(c, ["issuer", "subject", "issuedAt", "expiresAt", "signature"]),
-          let issuer = c["issuer"]?.stringValue, isACEId(issuer), c["subject"]?.stringValue != nil,
-          c["issuedAt"]?.wireInt != nil, c["expiresAt"]?.wireInt != nil, SignatureEnvelope(operational: c["signature"]) != nil else { return false }
-    return true
-}
+/// Entries of a card record `erc8004`.
+private let maxCardErc8004 = 4
 
-/// The verifier's pins for the delegation issuers `source` names, read through `pin` (01 § Pinning).
-package func delegationPins(_ source: JSONValue, pin: (String) throws -> KelState?) throws -> [String: KelState] {
-    var pins: [String: KelState] = [:]
-    for entry in source["descriptor"]?["delegations"]?.arrayValue ?? [] {
-        guard let who = delegationIssuer(entry), pins[who] == nil else { continue }
-        if let state = try pin(who) { pins[who] = state }
-    }
-    return pins
-}
-
-/// The ACE ID a delegation entry names as `credential.issuer`, or nil: what its issuer's pin is looked up by.
-package func delegationIssuer(_ entry: JSONValue) -> String? {
-    entry["credential"]?["issuer"]?.stringValue.flatMap { isACEId($0) ? $0 : nil }
-}
-
-/// The `erc8004` entry shape `{agentRegistry: CAIP-10, agentId: decimal}` (`invalid_authorization`).
+/// A card record `erc8004` entry `{agentRegistry: CAIP-10, agentId}` (`invalid_authorization`).
 package func validateErc8004Entry(_ item: JSONValue) throws -> ERC8004Binding {
     guard let b = item.objectValue, hasMembers(b, ["agentRegistry", "agentId"]), let reg = b["agentRegistry"]?.stringValue,
           let id = b["agentId"]?.stringValue, let binding = try? ERC8004Binding(agentRegistry: reg, agentId: id) else {
@@ -341,11 +232,11 @@ public struct VerifiedPermit: Sendable, Equatable {
     public let value: JSONValue
 }
 
-/// `{issuer, subject, issuedAt, expiresAt, signature}` (action `delivery-permit`), valid for `lifetime` seconds (at most
-/// 30 days).
+/// `{issuer, subject, issuedAt, expiresAt, signature}` (action `delivery-permit`) issued at `max(now, ts of the issuer's
+/// last KEL event)`, valid for `lifetime` seconds (at most 30 days).
 public func createPermit(identity: any ACEIdentity, subject: String, now: Int? = nil, lifetime: Int = ACELimits.maxPermitSeconds) throws -> JSONValue {
     guard isACEId(subject), subject != identity.getACEId() else { throw ACEError(.invalidArgument, "permit subject must be another ACE ID") }
-    let at = try identityNow(now)
+    let at = try recordTime(identity, now: now)
     guard (1...ACELimits.maxPermitSeconds).contains(lifetime) else {
         throw ACEError(.invalidArgument, "lifetime must be 1...\(ACELimits.maxPermitSeconds) seconds")
     }
@@ -379,9 +270,6 @@ public struct Descriptor: Sendable, Equatable {
     public let profiles: [ProfileRef]
     /// Profile-defined members keyed by profile ID (each key is in `profiles`); validated by the profile, not by core.
     public let ext: [String: JSONValue]?
-    /// The unexpired, verified delegations (expired entries are dropped).
-    public internal(set) var delegations: [VerifiedDelegation]
-    public let erc8004: [ERC8004Binding]
 }
 
 /// A verified `PublishedAgent`: the KEL state, the descriptor claims and the signed source as received.
@@ -400,18 +288,12 @@ public struct DescriptorClaims: Sendable {
     public var prekey: Prekey
     public var profiles: [ProfileRef]
     public var ext: [String: JSONValue]?
-    /// `{kel, credential}` entries from `createDelegation` (by controllers of this identity).
-    public var delegations: [JSONValue]
-    public var erc8004: [ERC8004Binding]
 
-    public init(relays: [String], prekey: Prekey, profiles: [ProfileRef] = [], ext: [String: JSONValue]? = nil, delegations: [JSONValue] = [],
-                erc8004: [ERC8004Binding] = []) {
+    public init(relays: [String], prekey: Prekey, profiles: [ProfileRef] = [], ext: [String: JSONValue]? = nil) {
         self.relays = relays
         self.prekey = prekey
         self.profiles = profiles
         self.ext = ext
-        self.delegations = delegations
-        self.erc8004 = erc8004
     }
 }
 
@@ -430,21 +312,22 @@ public func createPublishedAgent(identity: any ACEIdentity, claims: DescriptorCl
         "profiles": .array(claims.profiles.map(\.jsonValue)),
     ]
     if let ext = claims.ext, !ext.isEmpty { d["ext"] = .object(ext) }
-    if !claims.delegations.isEmpty { d["delegations"] = .array(claims.delegations) }
-    if !claims.erc8004.isEmpty { d["erc8004"] = .array(claims.erc8004.map(\.jsonValue)) }
     let descriptor = try signDocument(identity, action: "agent-descriptor", claims: d)
     let source: JSONValue = ["kel": ExportJSON.kelValue(try identity.getKel()), "descriptor": .object(descriptor)]
     return try verifyPublishedAgent(source, now: at, allowLoopback: allowLoopback)
 }
 
-/// The `ext` value rules of the official profiles: `ace:commerce:1` is `validateCommerceExt`; `ace:text:1` defines none
-/// (any key is invalid). Third-party values are opaque objects.
-private func checkOfficialExt(_ key: String, _ value: JSONValue) throws {
+/// The `ext` value rules of the official profiles for the descriptor of `subject` at `now`: `ace:commerce:1` is
+/// `validateCommerceExt`, `ace:delegation:1` is `validateDelegationExt` (shape only); `ace:text:1` defines none (any key
+/// is invalid). Third-party values are opaque objects.
+private func checkOfficialExt(_ key: String, _ value: JSONValue, subject: String, now: Int) throws {
     switch key {
     case ProfileManifest.text.id, ProfileManifest.core.id:
         throw unauthorized("\(key) defines no ext")
     case ProfileManifest.commerce.id:
         try validateCommerceExt(value)
+    case delegationProfileId:
+        _ = try validateDelegationExt(value, subject: subject, now: now)
     default:
         return
     }
@@ -470,22 +353,18 @@ package func verifyDescriptorSignature(_ source: JSONValue, state: KelState, now
     guard let d = source["descriptor"]?.objectValue, d["aceId"]?.stringValue == state.aceId else {
         throw unauthorized("descriptor must name the KEL's aceId")
     }
-    try checkSignedAfterDelegation(d, state: state)
     try verifyDocument(d, state: state, action: "agent-descriptor", now: now)
 }
 
 /// Verify a `PublishedAgent` at `now` (04 § Verification, first failure wins): shape (`invalid_authorization`), the KEL
-/// (`invalid_kel` / `invalid_signature`; usable at `now`), the descriptor signature (`stale_peer_binding` /
-/// `invalid_authorization`), then the delegations (expired entries dropped; other failures `invalid_authorization`).
+/// (`invalid_kel` / `invalid_signature`; usable at `now`), then the descriptor signature (`stale_peer_binding` /
+/// `invalid_authorization`).
 /// `allowLoopback` admits loopback HTTP relays (development only). `pinned` is the verifier's pin for this identity: the
 /// carried KEL is reconciled with it under the fork rules (`kel_conflict`) and the signature must verify under the
 /// resulting newest state, so a descriptor carrying an older prefix signed by a superseded delegation is
 /// `stale_peer_binding`; the returned `state` is that newest state.
-/// `delegationPins` maps delegation issuers to the verifier's pins for them; each entry's issuer KEL is reconciled with its
-/// pin the same way (a failure is `invalid_authorization`).
-public func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: Bool = false, pinned: KelState? = nil,
-                                 delegationPins: [String: KelState] = [:]) throws -> VerifiedAgent {
-    try verifyPublishedAgent(source, now: now, allowLoopback: allowLoopback, pinned: pinned, kelNow: nil, delegationPins: delegationPins)
+public func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: Bool = false, pinned: KelState? = nil) throws -> VerifiedAgent {
+    try verifyPublishedAgent(source, now: now, allowLoopback: allowLoopback, pinned: pinned, kelNow: nil)
 }
 
 /// The KEL a signed document carries, verified (at `max(now, kelNow)`) and usable at `now`, deriving `aceId`, then
@@ -506,15 +385,14 @@ private func carriedKel(_ kel: JSONValue?, aceId: String, pinned: KelState?, now
 
 /// `kelNow`: verify the carried KEL at `max(now, kelNow)` (a stored descriptor re-verified at its `issuedAt` beside a pin that
 /// grew later); everything else at `now`.
-package func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: Bool, pinned: KelState?, kelNow: Int?,
-                                  delegationPins: [String: KelState] = [:]) throws -> VerifiedAgent {
+package func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: Bool, pinned: KelState?, kelNow: Int?) throws -> VerifiedAgent {
     try checkJSONValue(source, code: .invalidAuthorization)  // depth counts from the agent's root (02 § JSON values)
     guard let size = try? source.jsonData().count, size <= ACELimits.maxPublishedAgentBytes else {
         throw unauthorized("published agent exceeds \(ACELimits.maxPublishedAgentBytes) bytes")
     }
     guard let o = source.objectValue, hasMembers(o, ["kel", "descriptor"]), let d = o["descriptor"]?.objectValue,
           hasMembers(d, ["aceId", "issuedAt", "expiresAt", "relays", "prekey", "profiles", "signature"],
-                     optional: ["ext", "delegations", "erc8004"]),
+                     optional: ["ext"]),
           let aceId = d["aceId"]?.stringValue, isACEId(aceId), SignatureEnvelope(operational: d["signature"]) != nil else {
         throw unauthorized("descriptor has unknown, missing or malformed members")
     }
@@ -538,35 +416,13 @@ package func verifyPublishedAgent(_ source: JSONValue, now: Int, allowLoopback: 
               !e.isEmpty, try raw.jsonData().count <= ACELimits.maxExtBytes else {
             throw unauthorized("ext keys must be listed profiles, values objects, canonical JSON at most \(ACELimits.maxExtBytes) bytes")
         }
-        for (k, v) in e { try checkOfficialExt(k, v) }
+        for (k, v) in e { try checkOfficialExt(k, v, subject: aceId, now: now) }
         ext = e
-    }
-    var delegationItems: [JSONValue] = []
-    if let raw = d["delegations"] {
-        guard let items = raw.arrayValue, (1...4).contains(items.count) else { throw unauthorized("delegations must hold 1-4 entries") }
-        let issuers = items.map { $0["credential"]?["issuer"]?.stringValue ?? "" }
-        guard Set(issuers).count == issuers.count, items.allSatisfy(isDelegationEntryShape) else {
-            throw unauthorized("delegations must be {kel, credential} with distinct issuers")
-        }
-        delegationItems = items
-    }
-    var erc8004: [ERC8004Binding] = []
-    if let raw = d["erc8004"] {
-        guard let items = raw.arrayValue, (1...4).contains(items.count), Set(items).count == items.count else {
-            throw unauthorized("erc8004 must hold 1-4 distinct entries")
-        }
-        erc8004 = try items.map(validateErc8004Entry)
     }
     let state = try carriedKel(o["kel"], aceId: aceId, pinned: pinned, now: now, kelNow: kelNow)
     try verifyDescriptorSignature(source, state: state, now: now)
-    var delegations: [VerifiedDelegation] = []
-    for item in delegationItems {
-        let pin = delegationIssuer(item).flatMap { delegationPins[$0] }
-        let (verified, live) = try checkDelegationEntry(item, subject: aceId, now: now, pinned: pin)
-        if live { delegations.append(verified) }  // an entry failing only by expiry is dropped
-    }
     return VerifiedAgent(state: state, descriptor: Descriptor(
-        aceId: aceId, issuedAt: issuedAt, expiresAt: expiresAt, relays: relays, prekey: prekey, profiles: profiles, ext: ext, delegations: delegations, erc8004: erc8004), source: source)
+        aceId: aceId, issuedAt: issuedAt, expiresAt: expiresAt, relays: relays, prekey: prekey, profiles: profiles, ext: ext), source: source)
 }
 
 // MARK: - Card record (04 § Card record)
@@ -591,6 +447,8 @@ public struct CardRecord: Sendable, Equatable {
     public let card: AgentCard
     /// 1–`ACELimits.maxPayAccounts` distinct CAIP-10 accounts the agent asks to be paid at (claimed, not proven).
     public let pay: [String]?
+    /// 1–4 distinct ERC-8004 registrations (claimed, not proven: `verifyErc8004Registration` checks one).
+    public let erc8004: [ERC8004Binding]?
     public let contact: Contact
     /// Whether the home relay's directory lists this identity.
     public let listed: Bool
@@ -605,9 +463,9 @@ public struct VerifiedCard: Sendable, Equatable {
     public let record: CardRecord
     /// `{kel, card}` exactly as signed.
     public let bundle: CardBundle
-    /// Whether a live descriptor confirmed the KEL it verified under, in this lookup or an earlier one recorded with the
-    /// pin (`lookupCard`); false when only a bundle's own KEL vouches for it: from `verifyCardBundle` alone, or a lookup of
-    /// an identity that has had no live descriptor since it was pinned that way (04 § Card record).
+    /// Whether a live descriptor confirmed the KEL it verified under (`lookupCard`: the pin's own flag after the lookup,
+    /// false only when the pin moved past the served descriptor's KEL by another path); false from `verifyCardBundle`
+    /// alone. Rely on `pay` or `erc8004` only when it is true (04 § Card record).
     public internal(set) var kelLive = false
 
     public var aceId: String { record.aceId }
@@ -629,10 +487,12 @@ package func documentDigest(_ document: JSONValue) throws -> String {
 }
 
 /// The card record's settings: its claims less `aceId`, `issuedAt` and `signature`.
-package func cardClaims(home: String, handle: String?, card: AgentCard, pay: [String]?, contact: Contact, listed: Bool) -> [String: JSONValue] {
+package func cardClaims(home: String, handle: String?, card: AgentCard, pay: [String]?, erc8004: [ERC8004Binding]?, contact: Contact,
+                        listed: Bool) -> [String: JSONValue] {
     var claims: [String: JSONValue] = ["home": .string(home), "card": card.jsonValue, "contact": .string(contact.rawValue), "listed": .bool(listed)]
     if let handle { claims["handle"] = .string(handle) }
     if let pay { claims["pay"] = .array(pay.map { .string($0) }) }
+    if let erc8004 { claims["erc8004"] = .array(erc8004.map(\.jsonValue)) }
     return claims
 }
 
@@ -640,10 +500,10 @@ package func cardClaims(home: String, handle: String?, card: AgentCard, pay: [St
 /// KEL event)`), verified before it
 /// is returned (`invalid_authorization` for any invalid claim).
 public func createCardRecord(identity: any ACEIdentity, home: String, handle: String? = nil, card: AgentCard = AgentCard(),
-                             pay: [String]? = nil, contact: Contact, listed: Bool, now: Int? = nil,
+                             pay: [String]? = nil, erc8004: [ERC8004Binding]? = nil, contact: Contact, listed: Bool, now: Int? = nil,
                              allowLoopback: Bool = false) throws -> CardBundle {
     let at = try recordTime(identity, now: now)
-    var claims = cardClaims(home: home, handle: handle, card: card, pay: pay, contact: contact, listed: listed)
+    var claims = cardClaims(home: home, handle: handle, card: card, pay: pay, erc8004: erc8004, contact: contact, listed: listed)
     claims["aceId"] = .string(identity.getACEId())
     claims["issuedAt"] = .number(Double(at))
     let record = try signDocument(identity, action: "card-record", claims: claims)
@@ -664,7 +524,7 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
         throw unauthorized("card bundle exceeds \(ACELimits.maxPublishedAgentBytes) bytes")
     }
     guard let r = o["card"]?.objectValue,
-          hasMembers(r, ["aceId", "issuedAt", "home", "card", "contact", "listed", "signature"], optional: ["handle", "pay"]),
+          hasMembers(r, ["aceId", "issuedAt", "home", "card", "contact", "listed", "signature"], optional: ["handle", "pay", "erc8004"]),
           let aceId = r["aceId"]?.stringValue, isACEId(aceId), let signature = SignatureEnvelope(operational: r["signature"]) else {
         throw unauthorized("invalid card record shape")
     }
@@ -694,12 +554,18 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
         }
         pay = list
     }
+    var erc8004: [ERC8004Binding]?
+    if let raw = r["erc8004"] {
+        guard let items = raw.arrayValue, (1...maxCardErc8004).contains(items.count), Set(items).count == items.count else {
+            throw unauthorized("erc8004 must hold 1-\(maxCardErc8004) distinct entries")
+        }
+        erc8004 = try items.map(validateErc8004Entry)
+    }
     guard let contact = r["contact"]?.stringValue.flatMap(Contact.init(rawValue:)) else { throw unauthorized("contact must be open or closed") }
     guard let listed = r["listed"]?.boolValue else { throw unauthorized("listed must be a boolean") }
     let state = try carriedKel(o["kel"], aceId: aceId, pinned: pinned, now: now)
-    try checkSignedAfterDelegation(r, state: state)
     try verifyDocument(r, state: state, action: "card-record", now: now)
-    let record = CardRecord(aceId: aceId, issuedAt: issuedAt, home: home, handle: handle, card: card, pay: pay, contact: contact,
+    let record = CardRecord(aceId: aceId, issuedAt: issuedAt, home: home, handle: handle, card: card, pay: pay, erc8004: erc8004, contact: contact,
                             listed: listed, signature: signature, value: .object(r))
     return VerifiedCard(state: state, record: record, bundle: value)
 }

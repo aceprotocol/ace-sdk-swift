@@ -177,55 +177,6 @@ private func buyer(_ relay: FakeRelay, _ clock: TestClock) async throws -> NetPe
         #expect(try await peers.agent(alice.aceId)?.source == newer.source)
     }
 
-    /// A cached descriptor stops reporting a delegation once the issuer's pin advances past the key that signed it.
-    @Test func advancedIssuerPinMakesTheCachedDelegationStale() async throws {
-        let now = systemClock()
-        let alice = try TestAgent(now: now - 10), dave = try makeIdentity(now: now - 10)
-        let claims = DescriptorClaims(relays: ["https://relay.example"], prekey: alice.agent.descriptor.prekey,
-                                      delegations: [try createDelegation(issuer: dave, subject: alice.aceId, now: now - 5)])
-        let src = try createPublishedAgent(identity: alice.identity, claims: claims, now: now - 3)
-        let peers = PeerStore(store: MemoryStore())
-        try await peers.pin(kel: try dave.getKel())
-        try await peers.adopt(source: src.source)
-        #expect(try await peers.agent(alice.aceId)?.descriptor.delegations.map(\.issuer) == [dave.getACEId()])
-        try dave.delegate(now: now - 2, notAfter: nil)
-        try await peers.pin(kel: try dave.getKel())
-        #expect(try await peers.agent(alice.aceId) == nil)
-    }
-
-    /// A cached descriptor never reports a delegation whose credential has expired since it was adopted.
-    @Test func expiredDelegationIsDroppedFromTheCache() async throws {
-        let clock = TestClock(systemClock())
-        let alice = try TestAgent(now: clock.now - 10), dave = try makeIdentity(now: clock.now - 10)
-        let credential = try createDelegation(issuer: dave, subject: alice.aceId, now: clock.now - 5, lifetime: 60)
-        let src = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
-            relays: ["https://relay.example"], prekey: alice.agent.descriptor.prekey, delegations: [credential]), now: clock.now - 3)
-        let peers = PeerStore(store: MemoryStore(), clock: clock.fn)
-        try await peers.adopt(source: src.source)
-        #expect(try await peers.agent(alice.aceId)?.descriptor.delegations.map(\.issuer) == [dave.getACEId()])
-        clock.now += 60
-        let cached = try #require(try await peers.agent(alice.aceId))
-        #expect(cached.descriptor.delegations.isEmpty && cached.source == src.source)
-    }
-
-    /// A descriptor verified elsewhere (a relay lookup, a contact target) is adopted only when each delegation whose issuer
-    /// is pinned verifies under that pin: a credential the issuer's superseded key signed, carried with its older KEL, is
-    /// refused (01 § Pinning: a carried KEL never rolls an issuer's pin back).
-    @Test func adoptedDelegationIsReconciledWithTheIssuerPin() async throws {
-        let now = systemClock()
-        let alice = try TestAgent(now: now - 10), dave = try makeIdentity(now: now - 10)
-        let stale = try createDelegation(issuer: dave, subject: alice.aceId, now: now - 5)
-        try dave.delegate(now: now - 4, notAfter: nil)  // dave replaces the key that signed `stale`
-        let peers = PeerStore(store: MemoryStore())
-        try await peers.pin(kel: try dave.getKel())
-        let src = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
-            relays: ["https://relay.example"], prekey: alice.agent.descriptor.prekey, delegations: [stale]), now: now - 3)
-        let unpinned = try verifyPublishedAgent(src.source, now: now)  // as a relay client verifies it
-        await expectCodeAsync(.invalidAuthorization) { try await peers.adopt(unpinned) }
-        await expectCodeAsync(.invalidAuthorization) { try await peers.adopt(source: src.source) }
-        #expect(try await peers.agent(alice.aceId) == nil)
-    }
-
     /// A permit (a bearer credential) signed by the issuer's superseded key is never presented once the issuer rotated,
     /// even to the relays of its current descriptor.
     @Test func permitFromASupersededKeyIsNeverPresented() async throws {

@@ -12,7 +12,9 @@ import Foundation
 
 /// What a `NetworkClient` publishes and admits, and its host callbacks.
 public struct NetworkConfiguration: Sendable {
-    /// Installed profiles besides `core` (announced in the descriptor).
+    /// Installed profiles besides `core` (announced in the descriptor). With `.delegation` the client runs
+    /// `delegationRules` itself (unless `rules` already governs `ace:delegation:1`); the host publishes credentials in
+    /// `ext["ace:delegation:1"] = {credentials}`.
     public var profiles: [ProfileManifest]
     /// Profile IDs whose contact requests are accepted without an explicit `accept` (must be installed).
     public var acceptProfiles: [String]
@@ -27,8 +29,7 @@ public struct NetworkConfiguration: Sendable {
     /// Whether the home relay's directory lists this identity (default false).
     public var listed: Bool
     public var ext: [String: JSONValue]?
-    /// `{kel, credential}` entries issued to this identity by its controllers (`createDelegation`).
-    public var delegations: [JSONValue]
+    /// The card record's ERC-8004 registrations: 1–4 distinct entries, or none.
     public var erc8004: [ERC8004Binding]
     /// Profile rules for the Outbox and Inbox (for example `commerceRules`).
     public var rules: [any ProfileRules]
@@ -43,7 +44,7 @@ public struct NetworkConfiguration: Sendable {
 
     public init(profiles: [ProfileManifest] = [.text], acceptProfiles: [String] = [], handle: String? = nil, card: AgentCard = AgentCard(),
                 pay: [String]? = nil, contact: Contact = .closed, listed: Bool = false,
-                ext: [String: JSONValue]? = nil, delegations: [JSONValue] = [], erc8004: [ERC8004Binding] = [],
+                ext: [String: JSONValue]? = nil, erc8004: [ERC8004Binding] = [],
                 rules: [any ProfileRules] = [], allowLoopbackRelays: Bool = false,
                 onMessage: (@Sendable (ReceivedMessage) async throws -> Void)? = nil,
                 onReceipt: (@Sendable (String, [String: JSONValue], OutboxEntry?) async -> Void)? = nil) {
@@ -55,7 +56,6 @@ public struct NetworkConfiguration: Sendable {
         self.contact = contact
         self.listed = listed
         self.ext = ext
-        self.delegations = delegations
         self.erc8004 = erc8004
         self.rules = rules
         self.allowLoopbackRelays = allowLoopbackRelays
@@ -111,6 +111,12 @@ public actor NetworkClient: PacketTransport {
             throw ACEError(.invalidArgument, "acceptProfiles must name installed profiles")
         }
         let loopback = configuration.allowLoopbackRelays
+        let peers = PeerStore(store: store, clock: clock)
+        var configuration = configuration
+        // an installed `ace:delegation:1` runs its message rule over our peer pins
+        if profiles.manifest(delegationProfileId) != nil, !configuration.rules.contains(where: { $0.types.contains(delegationType) }) {
+            configuration.rules.append(delegationRules(peers: peers, localAceId: identity.getACEId()))
+        }
         self.identity = identity
         self.store = store
         self.relay = relay
@@ -119,7 +125,7 @@ public actor NetworkClient: PacketTransport {
         self.profiles = profiles
         self.foreignRelay = foreignRelay ?? { url in try RelayClient.foreign(url, allowLoopbackRelays: loopback, clock: clock) }
         self.clock = clock
-        self.peers = PeerStore(store: store, clock: clock)
+        self.peers = peers
         self.outbox = Outbox(identity: identity, store: store, profiles: profiles, rules: configuration.rules, clock: clock)
         self.admission = AdmissionTable(store: store, clock: clock)
     }
@@ -205,8 +211,7 @@ public actor NetworkClient: PacketTransport {
             rotated = true
         }
         try prekeys.prune(now: now)
-        let claims = DescriptorClaims(relays: [relay.baseURLString], prekey: current!.prekey, profiles: profiles.refs, ext: configuration.ext,
-                                      delegations: configuration.delegations, erc8004: configuration.erc8004)
+        let claims = DescriptorClaims(relays: [relay.baseURLString], prekey: current!.prekey, profiles: profiles.refs, ext: configuration.ext)
         let old = try selfAgent()
         if !rotated, let old, old.descriptor.expiresAt - now > 3600, try same(old, claims) {
             if force { try await post(old) }
@@ -239,8 +244,9 @@ public actor NetworkClient: PacketTransport {
     /// (a new `dlg` re-signs it), else posted again only with `force`.
     private func publishCard(force: Bool) async throws {
         let now = try now()
+        let erc8004 = configuration.erc8004.isEmpty ? nil : configuration.erc8004
         let settings = cardClaims(home: relay.baseURLString, handle: configuration.handle, card: configuration.card, pay: configuration.pay,
-                                  contact: configuration.contact, listed: configuration.listed)
+                                  erc8004: erc8004, contact: configuration.contact, listed: configuration.listed)
         let lastHash = try checkUsable(identity, now: now).lastHash
         let digest = sha256Hex(try JSONValue.object(["settings": .object(settings), "lastHash": .string(lastHash)]).jsonData())
         let old = try selfCard()
@@ -250,7 +256,7 @@ public actor NetworkClient: PacketTransport {
         }
         let issuedAt = max(now, (old?.bundle["card"]?["issuedAt"]?.wireInt ?? -1) + 1)
         let bundle = try createCardRecord(identity: identity, home: relay.baseURLString, handle: configuration.handle, card: configuration.card,
-                                          pay: configuration.pay, contact: configuration.contact, listed: configuration.listed, now: issuedAt,
+                                          pay: configuration.pay, erc8004: erc8004, contact: configuration.contact, listed: configuration.listed, now: issuedAt,
                                           allowLoopback: configuration.allowLoopbackRelays)
         try await registered { try await self.relay.publishCard(bundle) }
         try store.checkedWrite(Self.cardKey, try JSONValue.object(["bundle": bundle, "params": .string(digest)]).jsonData())
@@ -283,8 +289,7 @@ public actor NetworkClient: PacketTransport {
         let kel = ExportJSON.kelValue(try identity.getKel())
         let d = old.descriptor
         return old.source["kel"] == kel && d.relays == c.relays && d.prekey == c.prekey && d.profiles == c.profiles
-            && d.ext == c.ext && (old.source["descriptor"]?["delegations"]?.arrayValue ?? []) == c.delegations
-            && d.erc8004 == c.erc8004
+            && d.ext == c.ext
     }
 
     // MARK: Discovery
@@ -292,7 +297,7 @@ public actor NetworkClient: PacketTransport {
     /// The public directory of the home relay: listed card records (verified, not pinned), see `RelayClient.directory`.
     /// `lookup` an entry's ACE ID to obtain its descriptor before connecting.
     public func discover(tag: String? = nil, profile: String? = nil, cursor: String? = nil,
-                         limit: Int = ACELimits.defaultPageLimit) async throws -> RelayClient.DirectoryPage {
+                         limit: Int = ACELimits.maxInboxPage) async throws -> RelayClient.DirectoryPage {
         try await relay.directory(tag: tag, profile: profile, cursor: cursor, limit: limit)
     }
 
@@ -329,59 +334,26 @@ public actor NetworkClient: PacketTransport {
         return (agent, try await checkCard(bundle, resolved: (home: url, handle: handle), kelLive: try await peers.kelLive(id)))
     }
 
-    /// The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
-    /// `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). Every record is checked against
-    /// the identity's card pin, kept durably: an older `issuedAt` than one already verified, or an equal one with other
-    /// claims, is `stale_descriptor`; a handle is set once per home, so after a record with a handle was seen, a record
-    /// naming the same home with another or no handle is `invalid_authorization` (a new home re-pins). A handle's first
-    /// resolution pins its ACE ID; a later resolution to another one is `invalid_authorization`. Without a KEL pin for the
-    /// identity, its descriptor is looked up first and its KEL pinned, so the card is verified under the current KEL, never
-    /// one a relay chose. When every route answers `unknown_peer` (no live descriptor: offline past its lifetime), the card
-    /// is verified under the bundle's own KEL instead, that KEL is pinned as a descriptor's would be, and the result has
-    /// `kelLive` false (04 § Card record). That pin is recorded as not confirmed live: later lookups look the descriptor up
-    /// again and report false until one confirms it.
+    /// The verified card record of `target` (an ACE ID or `@name@relay-host`). The identity's descriptor is looked up
+    /// first, at a relay (never a cached one), and its KEL pinned, so the card verifies under a KEL a live descriptor
+    /// confirmed, never one a relay chose; a descriptor failure (`unknown_peer` included: no live descriptor) is the
+    /// lookup's failure and pins nothing (04 § Card record). A handle resolves only to a record whose `home` is the queried
+    /// relay and whose `handle` is the queried one (`unknown_peer`). Every record is checked against the identity's card
+    /// pin, kept durably: an older `issuedAt` than one already verified, or an equal one with other claims, is
+    /// `stale_descriptor`; a handle is set once per home, so after a record with a handle was seen, a record naming the
+    /// same home with another or no handle is `invalid_authorization` (a new home re-pins). A handle's first resolution
+    /// pins its ACE ID; a later resolution to another one is `invalid_authorization`. `kelLive` is the pin's own flag
+    /// after the lookup: false only when the pin moved past the served descriptor's KEL by another path.
     public func lookupCard(_ target: String) async throws -> VerifiedCard {
         if isACEId(target) {
-            let (kelLive, fetched) = try await cardKel(target, { _ = try await self.agent(target, refresh: true) }, { try await self.fetchCard(target) })
-            let bundle: CardBundle
-            if let fetched { bundle = fetched } else { bundle = try await fetchCard(target) }
-            return try await checkCard(bundle, kelLive: kelLive)
+            _ = try await agent(target, refresh: true)
+            let bundle = try await fetchCard(target)
+            return try await checkCard(bundle, kelLive: try await peers.kelLive(target))
         }
         let (bundle, url, handle) = try await cardByHandle(target)
         let id = Self.aceId(of: bundle)
-        let (kelLive, _) = try await cardKel(id, { _ = try await self.fetchAgent(id, routes: [url]) }, { bundle })
-        return try await checkCard(bundle, resolved: (home: url, handle: handle), kelLive: kelLive)
-    }
-
-    /// The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A pin confirmed live is used as is.
-    /// Otherwise the descriptor is looked up at a relay through `fetch` (never a cached one) and the result is the pin's
-    /// `kelLive` after it: a relay's descriptor bound to the pin confirms it, a replayed or older one does not. When
-    /// every route answers `unknown_peer`, an unconfirmed pin stays unconfirmed, and
-    /// without a pin the card's own bundle (`card`) pins the KEL (`pinBundleKel`). Every other failure propagates.
-    private func cardKel(_ aceId: String, _ fetch: () async throws -> Void,
-                         _ card: () async throws -> CardBundle) async throws -> (Bool, CardBundle?) {
-        guard isACEId(aceId) else { return (true, nil) }
-        let pinned = try await peers.pinned(aceId)
-        if pinned != nil, try await peers.kelLive(aceId) { return (true, nil) }
-        do {
-            try await fetch()
-        } catch let e as ACEError where e.code == .unknownPeer {
-            if pinned != nil { return (false, nil) }
-            return (false, try await pinBundleKel(aceId, try await card()))
-        }
-        return (try await peers.kelLive(aceId), nil)
-    }
-
-    /// Pin the verified KEL of `bundle` (no live descriptor: not `kelLive`).
-    private func pinBundleKel(_ aceId: String, _ bundle: CardBundle) async throws -> CardBundle {
-        let v = try verifyCardBundle(bundle, now: try now(), allowLoopback: configuration.allowLoopbackRelays,
-                                     pinned: try await peers.pinned(aceId))
-        guard v.aceId == aceId else { throw ACEError(.invalidAuthorization, "the card record names another identity") }
-        // As for a descriptor: another path advanced the pin past the state the card verified under (left as it was).
-        guard try await peers.pin(kel: v.state.events).state.lastHash == v.state.lastHash else {
-            throw ACEError(.stalePeerBinding, "the pin advanced past the card record")
-        }
-        return bundle
+        _ = try await fetchAgent(id, routes: [url])
+        return try await checkCard(bundle, resolved: (home: url, handle: handle), kelLive: try await peers.kelLive(id))
     }
 
     private static func cardPinKey(_ aceId: String) -> String { "network/handles/\(sha256Hex(Data(aceId.utf8))).json" }
@@ -505,17 +477,16 @@ public actor NetworkClient: PacketTransport {
         return (try await client(url).handle(String(parts[1])).bundle, url, String(parts[1]))
     }
 
-    /// The peer's current descriptor (04 § Caching): the pinned one while it is unexpired, bound to the current pins and
+    /// The peer's current descriptor (04 § Caching): the pinned one while it is unexpired, bound to the current pin and
     /// its identity usable (unless `refresh`), else fetched from its relays (`GET /v1/descriptor`) and pinned. A failed
     /// refresh throws: a stale descriptor is never used.
     @discardableResult
     public func agent(_ aceId: String, refresh: Bool = false) async throws -> VerifiedAgent {
         guard isACEId(aceId) else { throw ACEError(.invalidArgument, "invalid ACE ID") }
         if !refresh, let a = try await peers.usableAgent(aceId) { return a }
-        // A cached descriptor bound to the current pins (`peers.agent`: KEL and delegation issuers) names the routes; a stale
-        // one (the pin advanced past its KEL, or past a delegation issuer's key; possibly a compromised key) may name
-        // attacker relays: the home relay is asked too, as when nothing is cached. A stale one is never used itself: the
-        // refreshed descriptor must verify under the current pins to replace it.
+        // A cached descriptor bound to the current pin (`peers.agent`) names the routes; a stale one (the pin advanced past
+        // its KEL; possibly a compromised key) may name attacker relays: the home relay is asked too, as when nothing is
+        // cached. A stale one is never used itself: the refreshed descriptor must verify under the current pin to replace it.
         if let bound = try await peers.agent(aceId) { return try await fetchAgent(aceId, routes: bound.descriptor.relays) }
         return try await fetchAgent(aceId, routes: routes(of: try await peers.heldRelays(aceId)))
     }
@@ -527,9 +498,18 @@ public actor NetworkClient: PacketTransport {
     }
 
     /// Pin a fetched descriptor. An older revision refused under the same KEL never stands in for the cached one: that
-    /// one is returned only while usable (unexpired and bound to the current pins), else `stale_peer_binding`.
+    /// one is returned only while usable (unexpired and bound to the current pin), else `stale_peer_binding`.
     private func adoptFetched(_ agent: VerifiedAgent) async throws -> VerifiedAgent {
         try await peers.adoptOrUsable(agent, live: true) ?? agent
+    }
+
+    /// The `ace:delegation:1` credential `value` once it verifies under our pin of its issuer (profiles/delegation.md §
+    /// Verifying a credential): the issuer's descriptor (cached while usable, else looked up and pinned), then
+    /// `now < expiresAt` and the signature. A lookup or pin failure propagates as itself, never as "not delegated".
+    public func verifyDelegation(_ value: JSONValue) async throws -> DelegationCredential {
+        let now = try now()
+        let issuer = try DelegationCredential(value, now: now).issuer
+        return try verifyDelegationCredential(value, issuer: try await agent(issuer).state, now: now)
     }
 
     // MARK: Invitations (05 § Invitations)

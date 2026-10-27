@@ -194,11 +194,12 @@ public actor RelayClient {
 
     // MARK: API
 
-    /// `POST /v1/register` with a registration request signed at `max(now, last + 1)` for this relay (action
-    /// `register-request` over `encodePayload(lastHashHex, audience)`). Body-signed, never retried.
+    /// `POST /v1/register` with a registration request signed at `max(t, last + 1)` for this relay, `t` = max(now, ts of
+    /// the last KEL event) (action `register-request` over `encodePayload(lastHashHex, audience)`). Body-signed, never
+    /// retried.
     @discardableResult
     public func register(_ identity: any ACEIdentity) async throws -> RegisterStatus {
-        let ts = try nextRegistrationTimestamp(identity, floor: try unixNow(clock))
+        let ts = try nextRegistrationTimestamp(identity, floor: try recordTime(identity, now: try unixNow(clock)))
         let body = try createRegistrationRequest(identity: identity, timestamp: ts, audience: baseURLString)
         let v = try await call("POST", "/v1/register", body: try body.jsonData())
         guard let s = v["status"]?.stringValue, let status = RegisterStatus(rawValue: s) else {
@@ -280,7 +281,7 @@ public actor RelayClient {
     /// permanently, is not listed here or does not carry `tag` is skipped; a transient failure throws. `profile` is the
     /// relay's hint, not checked here: the descriptor obtained before connecting is what counts (07 § Descriptors and cards).
     public func directory(tag: String? = nil, profile: String? = nil, cursor: String? = nil,
-                          limit: Int = ACELimits.defaultPageLimit) async throws -> DirectoryPage {
+                          limit: Int = ACELimits.maxInboxPage) async throws -> DirectoryPage {
         guard (1...ACELimits.maxInboxPage).contains(limit) else { throw ACEError(.invalidArgument, "limit must be 1...\(ACELimits.maxInboxPage)") }
         if let tag, !isCardTag(tag) { throw ACEError(.invalidArgument, "tag must match [a-z0-9-]{1,32}") }
         var query = [("limit", String(limit))]
@@ -520,11 +521,12 @@ public actor RelayClient {
 
     // MARK: HTTP
 
-    /// `unregister` is signed at `max(now, last registration + 1)` (it must exceed the stored registration timestamp) and
+    /// `unregister` is signed at `max(t, last registration + 1)` (it must exceed the stored registration timestamp) and
     /// becomes the new barrier: a later `register` is signed above it, since the relay refuses a registration timestamp at
     /// or below the unregister barrier (`identity_conflict`).
     private func addAuth(_ request: inout URLRequest, _ identity: any ACEIdentity, _ auth: RelayAuthRequest) throws {
-        var timestamp = try unixNow(clock)  // a bad clock reading is `invalid_argument` before any request
+        // a bad clock reading is `invalid_argument` before any request; the signer's `t` is at the log tail
+        var timestamp = try recordTime(identity, now: try unixNow(clock))
         if auth.action == "unregister" { timestamp = try nextRegistrationTimestamp(identity, floor: timestamp) }
         for (k, v) in try createAuthHeaders(identity, request: auth, timestamp: timestamp, audience: baseURLString) {
             request.setValue(v, forHTTPHeaderField: k)

@@ -149,6 +149,7 @@ final class FakeRelay: @unchecked Sendable {
     /// Every packet `/v1/send` parsed, in order (accepted or not): the wire facts tests assert on.
     private var postedPackets: [Packet] = []
     private(set) var requests: [String] = []
+    private var queryLog: [(path: String, query: [String: String])] = []
     /// When set, `/v1/send` answers this status/code once.
     var failSend: (Int, String)?
     /// Paths answered 503 (the relay is unreachable for them).
@@ -168,6 +169,8 @@ final class FakeRelay: @unchecked Sendable {
     func withLock<R>(_ body: () throws -> R) rethrows -> R { lock.lock(); defer { lock.unlock() }; return try body() }
 
     var requestCount: Int { withLock { requests.count } }
+    /// Each request's path and query items, in order.
+    var queries: [(path: String, query: [String: String])] { withLock { queryLog } }
     func queued(_ aceId: String) -> [Data] { withLock { (queues[aceId] ?? []).map(\.packet) } }
     /// Queue `packet` for `aceId` as a send without a permit would (a forger needs no credentials for a public agent).
     func inject(to aceId: String, _ packet: Data) { withLock { seq += 1; queues[aceId, default: []].append(("\(seq)-0", packet)) } }
@@ -215,6 +218,7 @@ final class FakeRelay: @unchecked Sendable {
             if down.contains(path) { return err(503, "internal_error") }
             var query: [String: String] = [:]
             for item in URLComponents(url: req.url!, resolvingAgainstBaseURL: false)?.queryItems ?? [] { query[item.name] = item.value }
+            queryLog.append((path, query))
             let headers = req.allHTTPHeaderFields ?? [:]
             let body = try? JSONValue(json: raw)
             let now = clock()
@@ -328,7 +332,7 @@ final class FakeRelay: @unchecked Sendable {
                         list = list.filter { cards[$0.aceId]?["card"]?["card"]?["tags"]?.arrayValue?.contains(.string(tag)) == true }
                     }
                     if let profile = query["profile"] { list = list.filter { $0.descriptor.profiles.contains { $0.id == profile } } }
-                    let page = list.prefix(query["limit"].flatMap { Int($0) } ?? ACELimits.defaultPageLimit).compactMap { cards[$0.aceId] }
+                    let page = list.prefix(query["limit"].flatMap { Int($0) } ?? ACELimits.maxInboxPage).compactMap { cards[$0.aceId] }
                     return .json(200, ["cards": .array(page), "cursor": .null] as JSONValue)
                 }
                 return err(404, "not_found")

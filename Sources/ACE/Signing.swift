@@ -85,12 +85,15 @@ package func operationalSign(_ identity: any ACEIdentity, action: String, timest
 }
 
 /// 01 § Operational signatures, in order: (1) the scheme is `ml-dsa-65` (`SignatureEnvelope` only holds that one);
-/// (2) `signature.seq` names the current signing delegation and (3) the signed `timestamp` is before its `notAfter`
-/// (`stale_peer_binding`); (4) the signature verifies (`invalid_signature`); (5) the signer is usable at `now`
-/// (`stale_peer_binding`).
+/// (2) `signature.seq` names the current signing delegation and (3) the signed `timestamp` is at or after the `ts` of its
+/// `dlg` and before its `notAfter` (`stale_peer_binding`); (4) the signature verifies (`invalid_signature`); (5) the
+/// signer is usable at `now` (`stale_peer_binding`).
 package func verifyOperational(_ sig: SignatureEnvelope, state: KelState, action: String, timestamp: Int, payload: Data, now: Int) throws {
     guard let key = state.signing, sig.seq == key.seq else {
         throw ACEError(.stalePeerBinding, "signature.seq is not the current signing delegation")
+    }
+    if state.events.indices.contains(key.seq), let dlgTs = wireInt(state.events[key.seq]["ts"]), timestamp < dlgTs {
+        throw ACEError(.stalePeerBinding, "signed before the delegating dlg's ts")
     }
     if let notAfter = key.notAfter, timestamp >= notAfter {
         throw ACEError(.stalePeerBinding, "signed at or after the signing delegation's notAfter")

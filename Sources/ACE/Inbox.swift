@@ -562,8 +562,7 @@ package actor Inbox {
     /// older than the pin (01 § Pinning; a stranger usually has none).
     private func verifiedSource(_ raw: JSONValue, from: String, pinned: KelState?, now: Int) async throws -> VerifiedAgent {
         guard raw["descriptor"]?["aceId"]?.stringValue == from else { throw ACEError(.invalidAuthorization, "source does not name the sender") }
-        let pins = try await network.peers.delegationPins(for: raw)
-        return try verifyPublishedAgent(raw, now: now, allowLoopback: network.configuration.allowLoopbackRelays, pinned: pinned, delegationPins: pins)
+        return try verifyPublishedAgent(raw, now: now, allowLoopback: network.configuration.allowLoopbackRelays, pinned: pinned)
     }
 
     /// The contact rules beyond the verified `source`: note bytes, the profile is installed here with the digest the source

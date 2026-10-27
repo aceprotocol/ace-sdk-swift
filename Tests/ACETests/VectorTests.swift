@@ -270,12 +270,11 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
         }
     }
 
-    // MARK: descriptor, delegation, permit, ERC-8004
+    // MARK: descriptor
 
     @Test func descriptorValid() throws {
         for c in V["descriptor"]!["valid"]!.a {
-            let a = try verifyPublishedAgent(c["publishedAgent"]!, now: c["now"]!.i)
-            #expect(a.descriptor.delegations.map(\.issuer) == c["delegations"]!.a.map(\.s), "\(label(c))")
+            #expect(codeOf { _ = try verifyPublishedAgent(c["publishedAgent"]!, now: c["now"]!.i) } == nil, "\(label(c))")
         }
     }
 
@@ -313,7 +312,8 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
             let r = v.record
             let got: JSONValue = [
                 "aceId": .string(v.aceId), "home": .string(r.home), "handle": r.handle.map { .string($0) } ?? .null,
-                "pay": r.pay.map { .array($0.map { .string($0) }) } ?? .null, "contact": .string(r.contact.rawValue), "listed": .bool(r.listed),
+                "pay": r.pay.map { .array($0.map { .string($0) }) } ?? .null, "erc8004": r.erc8004.map { .array($0.map(\.jsonValue)) } ?? .null,
+                "contact": .string(r.contact.rawValue), "listed": .bool(r.listed),
             ]
             #expect(got == c["expect"]!, "\(label(c))")
         }
@@ -325,30 +325,37 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
         }
     }
 
-    @Test func delegationPermitAndErc8004() throws {
-        for c in V["delegation"]!["cases"]!.a {
-            var got: String?
-            do {
-                got = try checkDelegationEntry(c["entry"]!, subject: c["subject"]!.s, now: c["now"]!.i).live ? "live" : "expired"
-            } catch let e as ACEError { got = e.code.rawValue }
-            #expect(got == (expected(c, "result") ?? expected(c)), "\(label(c))")
-        }
-        for c in V["delegation"]!["pinned"]!.a {
+    // MARK: delegation profile, permit, ERC-8004
+
+    @Test func delegationCredentials() {
+        for c in V["delegation"]!["credentials"]!.a {
             let now = c["now"]!.i
-            var got: String?
-            do {
-                got = try checkDelegationEntry(c["entry"]!, subject: c["subject"]!.s, now: now, pinned: try stateOf(c["pinned"]!.s, now)).live
-                    ? "live" : "expired"
-            } catch let e as ACEError { got = e.code.rawValue }
-            #expect(got == (expected(c, "result") ?? expected(c)), "pinned \(label(c))")
+            let got = codeOf { _ = try verifyDelegationCredential(c["credential"]!, issuer: try stateOf(c["issuer"]!.s, now), now: now) }
+            #expect(got == expected(c), "\(label(c))")
         }
-        for c in V["delegation"]!["descriptors"]!.a {
+    }
+
+    @Test func delegationExt() {
+        for c in V["delegation"]!["ext"]!.a {
+            #expect(codeOf { _ = try validateDelegationExt(c["value"]!, subject: c["subject"]!.s, now: c["now"]!.i) } == expected(c), "\(label(c))")
+        }
+    }
+
+    @Test func delegationMessages() async throws {
+        for c in V["delegation"]!["messages"]!.a {
             let now = c["now"]!.i
-            var pins: [String: KelState] = [:]
-            for x in c["delegationPins"]!.a { pins[agentId(x.s)] = try stateOf(x.s, now) }
-            #expect(codeOf { _ = try verifyPublishedAgent(c["publishedAgent"]!, now: now, delegationPins: pins) } == expected(c), "\(label(c))")
-            #expect(codeOf { _ = try verifyPublishedAgent(c["publishedAgent"]!, now: now) } == nil, "\(label(c)) without pins")
+            let peers = PeerStore(store: MemoryStore(), clock: { now })
+            if c["senderPinned"] == true { try await peers.pin(kel: kelOf(c["from"]!.s)) }
+            let from = agentId(c["from"]!.s), to = agentId(c["to"]!.s)
+            let direction: ProfileEvent.Direction = c["direction"] == "receive" ? .receive : .send
+            let rules = delegationRules(peers: peers, localAceId: direction == .receive ? to : from)
+            let event = ProfileEvent(direction: direction, from: from, to: to, messageId: "8a4f6a2e-3c0b-4d1e-9f7a-1b2c3d4e5f60", timestamp: now,
+                                     type: delegationType, threadId: nil)
+            #expect(codeOf { try rules.check(event, body: c["body"]!.o) } == expected(c), "\(label(c))")
         }
+    }
+
+    @Test func permitAndErc8004() throws {
         for c in V["permit"]!["cases"]!.a {
             let now = c["now"]!.i
             let got = codeOf { _ = try verifyPermit(c["permit"]!, issuer: try stateOf(c["issuer"]!.s, now), subject: c["subject"]!.s, now: now) }
@@ -378,7 +385,7 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
 
     @Test func manifests() throws {
         let m = V["manifests"]!
-        let bundled = Dictionary(uniqueKeysWithValues: [ProfileManifest.core, .text, .commerce].map { ($0.id, $0) })
+        let bundled = Dictionary(uniqueKeysWithValues: [ProfileManifest.core, .text, .delegation, .commerce].map { ($0.id, $0) })
         for o in m["official"]!.a {
             let pm = bundled[o["id"]!.s]!
             #expect(pm.digest == o["digest"]!.s)

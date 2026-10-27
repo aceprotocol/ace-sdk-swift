@@ -244,25 +244,21 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         await late.close()
     }
 
-    @Test func lookupCardFallsBackToTheBundleKelWhenNoLiveDescriptor() async throws {
+    /// 04 § Card record: a card lookup needs a live descriptor; without one it fails with the descriptor's error and pins
+    /// nothing (no bundle-KEL fallback).
+    @Test func lookupCardWithoutALiveDescriptorFailsAndPinsNothing() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let alice = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration(handle: "alice", pay: [SOL], contact: .open))
         // Alice is offline past her descriptor's lifetime: the relay serves her card record but no descriptor.
         clock.now += 8 * 86_400
         await expectCodeAsync(.unknownPeer) { try await relay.client(clock: clock.fn).descriptor(alice.aceId) }
+        #expect(try await relay.client(clock: clock.fn).card(alice.aceId).aceId == alice.aceId)
         for target in [alice.aceId, "@alice@\(relay.host)"] {
             let bob = try await peer(relay, clock)
-            let v = try await bob.network.lookupCard(target)
-            #expect(v.kelLive == false)
-            #expect(v.aceId == alice.aceId && v.record.handle == "alice" && v.record.pay == [SOL])
-            // The bundle's KEL is pinned, under the same rules as a descriptor's.
-            #expect(try await bob.network.peers.pinned(alice.aceId)?.lastHash == (try ACEKel.verify(alice.identity.getKel(), now: clock.now)).lastHash)
-            // The card pin still applies: a rollback is refused.
-            relay.setCard(alice.aceId, try card(alice, home: relay.url, handle: "alice", contact: .closed, now: v.record.issuedAt - 1))
-            await expectCodeAsync(.staleDescriptor) { try await bob.network.lookupCard(target) }
-            relay.setCard(alice.aceId, v.bundle)
+            await expectCodeAsync(.unknownPeer) { try await bob.network.lookupCard(target) }
+            #expect(try await bob.network.peers.pinned(alice.aceId) == nil)
         }
-        // Any other descriptor failure (here an unreachable relay) still fails the lookup, pinning nothing.
+        // Any other descriptor failure (here an unreachable relay) fails the lookup as itself, pinning nothing.
         let carol = try await peer(relay, clock)
         relay.withLock { relay.down = ["/v1/descriptor/\(alice.aceId)"] }
         do {
@@ -274,43 +270,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         #expect(try await carol.network.peers.pinned(alice.aceId) == nil)
     }
 
-    private func reopened(_ who: NetPeer, _ relay: FakeRelay, _ clock: TestClock) async throws -> NetworkClient {
-        try await NetworkClient.open(identity: who.identity, store: who.store, relay: try relay.client(clock: clock.fn),
-                                     prekeys: StorePrekeyVault(store: who.store), receive: false, clock: clock.fn)
-    }
-
-    @Test func fallbackPinnedKelStaysKelLiveFalseOnLaterLookups() async throws {
-        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
-        clock.now += 8 * 86_400
-        let bob = try await peer(relay, clock)
-        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == false)
-        // The pin exists now, but no live descriptor ever confirmed it: every later lookup says so, durably.
-        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == false)
-        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").kelLive == false)
-        let again = try await reopened(bob, relay, clock)
-        #expect(try await again.lookupCard(alice.aceId).kelLive == false)
-        await again.close()
-    }
-
-    @Test func aLaterLiveDescriptorConfirmsAFallbackPinnedKel() async throws {
-        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
-        clock.now += 8 * 86_400
-        let bob = try await peer(relay, clock)
-        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").kelLive == false)
-        // Alice comes back online: her new descriptor reconciles with the pin and confirms it.
-        try await alice.network.publish()
-        #expect(try await bob.network.lookupCard("@alice@\(relay.host)").kelLive == true)
-        // Confirmed for good, durably: even after she goes offline again.
-        clock.now += 8 * 86_400
-        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == true)
-        let again = try await reopened(bob, relay, clock)
-        #expect(try await again.lookupCard(alice.aceId).kelLive == true)
-        await again.close()
-    }
-
-    @Test func transientOnOneRoutePlusUnknownPeerOnAnotherDoesNotFallBack() async throws {
+    @Test func transientOnOneRoutePlusUnknownPeerOnAnotherIsTheTransientFailure() async throws {
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn), relayB = FakeRelay(clock: clock.fn)
         let alice = try await peer(relay, clock, contact: .open)
         let path = "/v1/descriptor/\(alice.aceId)"
@@ -328,7 +288,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         await expectTransient { try await carol.network.lookupCard(alice.aceId) }
         #expect(try await carol.network.peers.pinned(alice.aceId) == nil)
         relay.withLock { relay.down = [] }
-        // Alice's descriptor names relay B first; her home relay has lost it, so bob pins her card's KEL.
+        // Alice's descriptor names relay B first; her home relay has lost it. Bob holds it, shared out of band.
         let own = try #require(relay.publishedAgent(alice.aceId))
         let twoRoutes = try createPublishedAgent(identity: alice.identity, claims: DescriptorClaims(
             relays: [relayB.url, relay.url], prekey: own.descriptor.prekey, profiles: [ProfileManifest.text.ref]), now: clock.now)
@@ -337,19 +297,18 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         let bob = try await NetworkClient.open(identity: try makeIdentity(now: clock.now), store: store, relay: try relay.client(clock: clock.fn),
                                                prekeys: StorePrekeyVault(store: store), receive: false,
                                                foreignRelay: { _ in try relayB.client(clock: clock.fn) }, clock: clock.fn)
-        #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
-        _ = try await bob.importAgent(twoRoutes.source)  // shared out of band; it expires before bob looks again
+        _ = try await bob.importAgent(twoRoutes.source)
         // Self-signed, not served by a relay: it does not confirm the pin.
         #expect(try await bob.peers.kelLive(alice.aceId) == false)
         // Nor does a card lookup take that cached, still usable descriptor for a live one: it asks the relays.
-        #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
+        await expectCodeAsync(.unknownPeer) { try await bob.lookupCard(alice.aceId) }
         clock.now += 8 * 86_400
-        // Relay B is unreachable and the home relay answers unknown_peer: the lookup fails instead of reporting not live.
+        // Relay B is unreachable and the home relay answers unknown_peer: the transient failure is reported.
         relayB.withLock { relayB.down = [path] }
         await expectTransient { try await bob.lookupCard(alice.aceId) }
-        // Both routes answering unknown_peer: no live descriptor, still not confirmed.
+        // Both routes answering unknown_peer: no live descriptor.
         relayB.withLock { relayB.down = [] }
-        #expect(try await bob.lookupCard(alice.aceId).kelLive == false)
+        await expectCodeAsync(.unknownPeer) { try await bob.lookupCard(alice.aceId) }
         await bob.close()
     }
 
@@ -404,12 +363,15 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         relay.dropAgent(bob.aceId)
         await expectCodeAsync(.unknownPeer) { try await alice.network.accept(bob.aceId) }
         #expect(try await alice.network.peers.pinned(bob.aceId) != nil)
-        #expect(try await alice.network.lookupCard(bob.aceId).kelLive == false)
+        #expect(try await alice.network.peers.kelLive(bob.aceId) == false)
+        // No live descriptor: the card lookup fails.
+        await expectCodeAsync(.unknownPeer) { try await alice.network.lookupCard(bob.aceId) }
         // Bob republishes: the next card lookup sees a live descriptor and confirms the pin, durably.
         try await bob.network.publish()
         #expect(try await alice.network.lookupCard(bob.aceId).kelLive == true)
         relay.dropAgent(bob.aceId)
-        #expect(try await alice.network.lookupCard(bob.aceId).kelLive == true)
+        #expect(try await alice.network.peers.kelLive(bob.aceId) == true)
+        await expectCodeAsync(.unknownPeer) { try await alice.network.lookupCard(bob.aceId) }
     }
 
     @Test func pinMissingRequiredFieldsIsStorageFailed() async throws {
@@ -430,30 +392,14 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
             try bob.store.checkedWrite(key, good)
         }
         // A peer pin whose `kelLive` is not a boolean.
-        clock.now += 8 * 86_400
         let carol = try await peer(relay, clock)
-        #expect(try await carol.network.lookupCard(alice.aceId).kelLive == false)
+        #expect(try await carol.network.lookupCard(alice.aceId).kelLive == true)
         let peerPin = "peers/\(sha256Hex(Data(alice.aceId.utf8))).json"
         let raw = try #require(try carol.store.read(peerPin))
         var row = try #require(JSONValue(stored: raw)?.objectValue)
         row["kelLive"] = "no"
         try carol.store.checkedWrite(peerPin, try JSONValue.object(row).jsonData())
         await expectCodeAsync(.storageFailed) { try await carol.network.lookupCard(alice.aceId) }
-    }
-
-    @Test func aRelayServedDescriptorFromAnyLookupConfirmsAFallbackPinnedKel() async throws {
-        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let alice = try await peer(relay, clock, contact: .open, handle: "alice")
-        clock.now += 8 * 86_400
-        let bob = try await peer(relay, clock)
-        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == false)
-        // Alice is back: bob's plain descriptor lookup fetches it from her relay and confirms the pin, so the next card
-        // lookup needs no descriptor request of its own (one would fail here).
-        try await alice.network.publish()
-        try await bob.network.agent(alice.aceId)
-        #expect(try await bob.network.peers.kelLive(alice.aceId) == true)
-        relay.dropAgent(alice.aceId)
-        #expect(try await bob.network.lookupCard(alice.aceId).kelLive == true)
     }
 
     @Test func kelLiveIsTrueWithALiveDescriptor() async throws {

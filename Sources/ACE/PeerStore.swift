@@ -51,7 +51,14 @@ public actor PeerStore {
         let key = Self.key(aceId)
         guard let raw = try store.checkedRead(key) else { return nil }
         if let hit = cache[key], hit.raw == raw { return hit.pin }
-        let pin: Pin
+        let pin = try Self.decode(raw, aceId: aceId, key: key)
+        if cache.count >= Self.cacheSize { cache.removeAll() }
+        cache[key] = (raw, pin)
+        return pin
+    }
+
+    /// A stored row, verified (`storage_failed` for anything malformed).
+    private static func decode(_ raw: Data, aceId: String, key: String) throws -> Pin {
         do {
             guard let o = JSONValue(stored: raw)?.objectValue, o["version"] == 1, o["aceId"]?.stringValue == aceId,
                   let at = o["fetchedAt"]?.wireInt, let list = o["kel"]?.arrayValue, let source = o["agent"],
@@ -82,13 +89,10 @@ public actor PeerStore {
                 stale = try Self.reverify(old, issuedAt: issued, state: bound)
             }
             // A row written before `kelLive` existed was pinned through a descriptor: live.
-            pin = Pin(state: state, agent: agent, stale: stale, fetchedAt: at, kelLive: o["kelLive"]?.boolValue ?? true)
+            return Pin(state: state, agent: agent, stale: stale, fetchedAt: at, kelLive: o["kelLive"]?.boolValue ?? true)
         } catch let e as ACEError {
             throw ACEError(.storageFailed, "\(key): \(e.message)")
         }
-        if cache.count >= Self.cacheSize { cache.removeAll() }
-        cache[key] = (raw, pin)
-        return pin
     }
 
     /// A stored descriptor, verified as adopted: its claims at `issuedAt`, its signature under the pinned `state`.
@@ -104,33 +108,33 @@ public actor PeerStore {
         return try load(aceId)?.state
     }
 
+    /// `pinned(_:)` read synchronously, without the actor's cache: for profile rules, whose `check` is synchronous
+    /// (`delegationRules`).
+    public nonisolated func pinnedState(_ aceId: String) throws -> KelState? {
+        try Self.checkId(aceId)
+        let key = Self.key(aceId)
+        guard let raw = try store.checkedRead(key) else { return nil }
+        return try Self.decode(raw, aceId: aceId, key: key).state
+    }
+
+    /// The store clock (`invalid_argument` for a reading outside [0, 2^53 − 1]).
+    public nonisolated func clockNow() throws -> Int { try unixNow(clock) }
+
     /// Whether a live descriptor served by a relay vouched for the pinned KEL (`adopt(_:live:)`); false without a pin.
     public func kelLive(_ aceId: String) throws -> Bool {
         try Self.checkId(aceId)
         return try load(aceId)?.kelLive ?? false
     }
 
-    /// The newest adopted descriptor (possibly expired: check `descriptor.expiresAt`), or nil. Its `state` is the pinned
-    /// (newest) KEL state. A descriptor is bound to the pins it was verified under: when a delegation issuer's pin has
-    /// advanced since, the entry must verify again against it, else the descriptor is stale (nil: refresh it). Delegations
-    /// expired at the store clock are dropped.
+    /// The newest adopted descriptor bound to the pinned KEL (possibly expired: check `descriptor.expiresAt`), or nil. Its
+    /// `state` is the pinned (newest) KEL state.
     public func agent(_ aceId: String) throws -> VerifiedAgent? {
         try Self.checkId(aceId)
-        guard let agent = try load(aceId)?.agent else { return nil }
-        for d in agent.descriptor.delegations {
-            guard let pin = try load(d.issuer)?.state, pin.lastHash != d.issuerState.lastHash else { continue }
-            if (try? checkDelegationEntry(d.entry, subject: aceId, now: agent.descriptor.issuedAt, pinned: pin)) == nil { return nil }
-        }
-        // an entry that has expired since is dropped (04 § Delegations), never reported
-        let now = try unixNow(clock)
-        guard agent.descriptor.delegations.contains(where: { now >= $0.expiresAt }) else { return agent }
-        var d = agent.descriptor
-        d.delegations.removeAll { now >= $0.expiresAt }
-        return VerifiedAgent(state: agent.state, descriptor: d, source: agent.source)
+        return try load(aceId)?.agent
     }
 
-    /// The relays of the held descriptor, bound to the current pins or not (one the pin advanced past, or whose delegation
-    /// issuer's pin advanced), nil when none: routes to try when refreshing, never a descriptor to use.
+    /// The relays of the held descriptor, bound to the current pin or not (one the pin advanced past), nil when none:
+    /// routes to try when refreshing, never a descriptor to use.
     package func heldRelays(_ aceId: String) throws -> [String]? {
         try Self.checkId(aceId)
         guard let pin = try load(aceId) else { return nil }
@@ -144,12 +148,6 @@ public actor PeerStore {
         let now = try unixNow(clock)
         guard let a = try agent(aceId), now < a.descriptor.expiresAt, ACEKel.isUsable(a.state, now: now) else { return nil }
         return a
-    }
-
-    /// The pins held for the delegation issuers a PublishedAgent names (01 § Pinning): pass them as
-    /// `verifyPublishedAgent(delegationPins:)` so a carried issuer KEL is reconciled with them.
-    public func delegationPins(for source: JSONValue) throws -> [String: KelState] {
-        try ACE.delegationPins(source) { try load($0)?.state }
     }
 
     /// Pin (or extend the pin to) a KEL under the fork rules, without a descriptor. A held descriptor is bound to the KEL
@@ -174,7 +172,7 @@ public actor PeerStore {
 
     /// Verify a PublishedAgent against the pin (`verifyPublishedAgent(pinned:)` at the store clock) and adopt it. An older
     /// revision refused under the same KEL never stands in for the held one: that one is returned only while usable
-    /// (unexpired and bound to the current pins), else `stale_peer_binding`.
+    /// (unexpired and bound to the current pin), else `stale_peer_binding`.
     @discardableResult
     public func adopt(source: JSONValue, allowLoopback: Bool = false) throws -> VerifiedAgent {
         guard let aceId = source["descriptor"]?["aceId"]?.stringValue, isACEId(aceId) else {
@@ -182,14 +180,13 @@ public actor PeerStore {
         }
         let now = try unixNow(clock)
         let pinned = try load(aceId)?.state
-        let agent = try verifyPublishedAgent(source, now: now, allowLoopback: allowLoopback, pinned: pinned,
-                                             delegationPins: try delegationPins(for: source))
+        let agent = try verifyPublishedAgent(source, now: now, allowLoopback: allowLoopback, pinned: pinned)
         if let kept = try adoptOrUsable(agent) { return kept }
         return try load(aceId)?.agent ?? agent
     }
 
     /// `adopt(_:live:)`, except that a refused older revision (`stale_peer_binding`) falls back to the held descriptor
-    /// while it is usable (unexpired and bound to the current pins), returned; nil when `agent` was adopted (04 § Caching).
+    /// while it is usable (unexpired and bound to the current pin), returned; nil when `agent` was adopted (04 § Caching).
     /// Without a usable held descriptor the refusal stands.
     @discardableResult
     package func adoptOrUsable(_ agent: VerifiedAgent, live: Bool = false) throws -> VerifiedAgent? {
@@ -206,8 +203,7 @@ public actor PeerStore {
     /// the descriptor must verify under the resulting newest state: one signed by a delegation the pin has superseded is
     /// `stale_peer_binding` (no prekey substitution by a replaced signing key). A descriptor under an advanced pin replaces
     /// the held one unconditionally; under the same pin, an older `issuedAt`, or the same `issuedAt` with other content, is
-    /// `stale_peer_binding`. Each delegation whose issuer is pinned must verify under that pin
-    /// (`invalid_authorization`). `live`: a relay served the descriptor, so it vouches for the KEL it is bound to and the
+    /// `stale_peer_binding`. `live`: a relay served the descriptor, so it vouches for the KEL it is bound to and the
     /// pin becomes `kelLive`. Anything else (an imported or contact source, which a holder of a superseded key can sign)
     /// confirms nothing: a pin it moves is not live, an unchanged one keeps its flag (04 § Card record).
     @discardableResult
@@ -217,12 +213,6 @@ public actor PeerStore {
             let old = try load(agent.aceId)
             let (state, outcome) = try ACEKel.extend(pinned: old?.state, events: agent.state.events, now: max(now, agent.descriptor.issuedAt))
             try verifyDescriptorSignature(agent.source, state: state, now: now)
-            // A delegation whose issuer is pinned must verify under that pin (01 § Pinning), however the agent was verified:
-            // a carried older issuer KEL never stands in for the pin.
-            for entry in agent.source["descriptor"]?["delegations"]?.arrayValue ?? [] {
-                guard let issuer = delegationIssuer(entry), let pin = try load(issuer)?.state else { continue }
-                _ = try checkDelegationEntry(entry, subject: agent.aceId, now: now, pinned: pin)
-            }
             var kept = agent.source
             if let previous = old?.agent, old?.state.lastHash == state.lastHash {
                 // An older revision, or the same `issuedAt` with other claims, never replaces the held one (04 § Caching).

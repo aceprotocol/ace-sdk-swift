@@ -326,15 +326,16 @@ public struct Packet: Sendable, Equatable {
     }
 }
 
-/// Encrypt `content` to `prekey` and sign it as `sender` (the packet's `from`). Order: arguments (`invalid_argument`) →
+/// Encrypt `content` to `prekey` and sign it as `sender` (the packet's `from`) at `max(timestamp, ts of the sender's last
+/// KEL event)` (the signer's `t`, the packet's `timestamp`; `timestamp` defaults to now). Order: arguments (`invalid_argument`) →
 /// content size (`limit_exceeded`) → `checkUsable(sender, timestamp)` (`identity_unavailable`, before any crypto) →
 /// encapsulate → seal → sign.
 public func createPacket(sender: any ACEIdentity, to: String, prekey: Prekey, content: PrivateContent,
                          messageId: String = UUID().uuidString.lowercased(), timestamp: Int? = nil) throws -> Packet {
     guard isACEId(to), to != sender.getACEId() else { throw ACEError(.invalidArgument, "to must be another ACE ID") }
     guard isMessageId(messageId) else { throw ACEError(.invalidArgument, "messageId must be a lowercase UUIDv4") }
-    let ts = timestamp ?? systemClock()
-    guard isWireInt(ts) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
+    if let timestamp, !isWireInt(timestamp) { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
+    let ts = try recordTime(sender, now: timestamp)
     let plaintext = try content.jsonData()
     let from = sender.getACEId()
     _ = try usableSigningSeq(sender, now: ts)

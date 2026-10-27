@@ -96,11 +96,13 @@ package func authPayload(_ request: RelayAuthRequest, audience: String, nonce: S
 }
 
 /// The six `X-ACE-*` headers of one relay call (07 § Authentication): a delegated signature with ctx = the request's
-/// action over `authPayload`, a fresh nonce per call. `invalid_argument` for a malformed request or timestamp;
-/// `identity_unavailable` when the identity cannot sign at `timestamp`.
+/// action over `authPayload` at `max(timestamp, ts of the identity's last KEL event)` (the signer's `t`, sent as
+/// `X-ACE-Timestamp`), a fresh nonce per call. `invalid_argument` for a malformed request or timestamp;
+/// `identity_unavailable` when the identity cannot sign at that time.
 public func createAuthHeaders(_ identity: any ACEIdentity, request: RelayAuthRequest, timestamp: Int, audience: String,
                               nonce: String? = nil) throws -> [String: String] {
     guard isWireInt(timestamp) else { throw ACEError(.invalidArgument, "timestamp must be an integer in [0, 2^53-1]") }
+    let timestamp = try recordTime(identity, now: timestamp)
     let nonce = nonce ?? randomHex(32)
     let sig = try operationalSign(identity, action: request.action, timestamp: timestamp,
                                   payload: try authPayload(request, audience: audience, nonce: nonce))
@@ -114,11 +116,12 @@ public func createAuthHeaders(_ identity: any ACEIdentity, request: RelayAuthReq
     ]
 }
 
-/// A `POST /v1/register` body `{aceId, kel, timestamp, audience, signature}` (07 § Registration) signed at `timestamp`
-/// with action `register-request` over `encodePayload(lastHashHex, audience)`. `audience` is the canonical URL of the relay
+/// A `POST /v1/register` body `{aceId, kel, timestamp, audience, signature}` (07 § Registration) signed at
+/// `max(timestamp, ts of the identity's last KEL event)` with action `register-request` over `encodePayload(lastHashHex, audience)`. `audience` is the canonical URL of the relay
 /// the request is meant for, so no relay can replay it to another (`invalid_argument` when not a relay URL).
 public func createRegistrationRequest(identity: any ACEIdentity, timestamp: Int, audience: String) throws -> JSONValue {
     let aud = try normalizeRelayURL(audience)
+    let timestamp = try recordTime(identity, now: timestamp)
     let state = try checkUsable(identity, now: timestamp)
     let signature = try operationalSign(identity, action: "register-request", timestamp: timestamp,
                                         payload: ACESigning.encodePayload([.string(state.lastHash), .string(aud)]))
