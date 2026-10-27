@@ -115,7 +115,7 @@ public actor NetworkClient: PacketTransport {
         var configuration = configuration
         // an installed `ace:delegation:1` runs its message rule over our peer pins
         if profiles.manifest(delegationProfileId) != nil, !configuration.rules.contains(where: { $0.types.contains(delegationType) }) {
-            configuration.rules.append(delegationRules(peers: peers, localAceId: identity.getACEId()))
+            configuration.rules.append(delegationRules(peers: peers))
         }
         self.identity = identity
         self.store = store
@@ -598,7 +598,8 @@ public actor NetworkClient: PacketTransport {
     package func post(to aceId: String, content: PrivateContent, messageId: String, prekey published: Prekey, attempts: Int) async throws -> Prekey {
         let agent = try await agent(aceId)
         guard let permit = try validTheirPermit(aceId, agent.state) else { throw noValidPermit }
-        let now = try now(), retry = attempts > 0
+        // The signer's `t` (the packet's timestamp), so the offered seed's window starts with the packet's (04 § Peer prekeys).
+        let now = try recordTime(identity, now: try now()), retry = attempts > 0
         var prekey = published
         if !retry, let pin = try await peers.pinned(aceId), let held = try prekeys.held(peer: aceId, pin: pin.lastHash, now: now) { prekey = held }
         var sent = content.with(prekey: try prekeys.offer(peer: aceId, now: now).publicKey)
@@ -662,7 +663,7 @@ public actor NetworkClient: PacketTransport {
         let target: VerifiedAgent
         if let agent { target = agent } else { target = try await self.agent(aceId) }
         // Receipts and contacts go to the published prekey and offer our peer prekey like every packet (04 § Peer prekeys).
-        let now = try now()
+        let now = try recordTime(identity, now: try now())
         let content = try profiles.content(type: type, body: body).with(prekey: try prekeys.offer(peer: aceId, now: now).publicKey)
         let packet = try createPacket(sender: identity, to: aceId, prekey: target.descriptor.prekey, content: content, timestamp: now)
         let permit = try explicit ?? validTheirPermit(aceId, target.state)

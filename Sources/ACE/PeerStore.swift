@@ -62,7 +62,7 @@ public actor PeerStore {
         do {
             guard let o = JSONValue(stored: raw)?.objectValue, o["version"] == 1, o["aceId"]?.stringValue == aceId,
                   let at = o["fetchedAt"]?.wireInt, let list = o["kel"]?.arrayValue, let source = o["agent"],
-                  o["kelLive"].map({ $0.boolValue != nil }) ?? true else {
+                  let kelLive = o["kelLive"]?.boolValue else {
                 throw ACEError(.storageFailed, "\(key) is malformed")
             }
             let events = try list.map { e -> KelEvent in
@@ -88,8 +88,7 @@ public actor PeerStore {
                 guard bound.aceId == aceId else { throw ACEError(.storageFailed, "\(key) does not match its aceId") }
                 stale = try Self.reverify(old, issuedAt: issued, state: bound)
             }
-            // A row written before `kelLive` existed was pinned through a descriptor: live.
-            return Pin(state: state, agent: agent, stale: stale, fetchedAt: at, kelLive: o["kelLive"]?.boolValue ?? true)
+            return Pin(state: state, agent: agent, stale: stale, fetchedAt: at, kelLive: kelLive)
         } catch let e as ACEError {
             throw ACEError(.storageFailed, "\(key): \(e.message)")
         }

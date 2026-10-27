@@ -100,7 +100,7 @@ private func event(_ direction: ProfileEvent.Direction, _ from: String, _ to: St
         let dave = try identity(), bob = try identity(), carol = try identity()
         let d = dave.getACEId(), b = bob.getACEId(), cId = carol.getACEId()
         let peers = PeerStore(store: MemoryStore(), clock: clock.fn)
-        let rules = delegationRules(peers: peers, localAceId: b)
+        let rules = delegationRules(peers: peers)
         #expect(rules.types == [delegationType])
         let c = try createDelegationCredential(issuer: dave, subject: b, now: NOW)
         let body: [String: JSONValue] = ["credential": c.jsonValue]
@@ -118,7 +118,7 @@ private func event(_ direction: ProfileEvent.Direction, _ from: String, _ to: St
         clock.now = c.expiresAt
         expectCode(.invalidBody, "expired") { try rules.check(event(.receive, d, b), body: body) }
         // on send: the sender is the issuer (its own credential), no pin needed
-        let senderRules = delegationRules(peers: PeerStore(store: MemoryStore(), clock: clock.fn), localAceId: d)
+        let senderRules = delegationRules(peers: PeerStore(store: MemoryStore(), clock: clock.fn))
         clock.now = NOW
         try senderRules.check(event(.send, d, b), body: body)
         expectCode(.invalidBody) { try senderRules.check(event(.send, d, cId), body: body) }

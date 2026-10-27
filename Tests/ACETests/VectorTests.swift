@@ -348,7 +348,7 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
             if c["senderPinned"] == true { try await peers.pin(kel: kelOf(c["from"]!.s)) }
             let from = agentId(c["from"]!.s), to = agentId(c["to"]!.s)
             let direction: ProfileEvent.Direction = c["direction"] == "receive" ? .receive : .send
-            let rules = delegationRules(peers: peers, localAceId: direction == .receive ? to : from)
+            let rules = delegationRules(peers: peers)
             let event = ProfileEvent(direction: direction, from: from, to: to, messageId: "8a4f6a2e-3c0b-4d1e-9f7a-1b2c3d4e5f60", timestamp: now,
                                      type: delegationType, threadId: nil)
             #expect(codeOf { try rules.check(event, body: c["body"]!.o) } == expected(c), "\(label(c))")

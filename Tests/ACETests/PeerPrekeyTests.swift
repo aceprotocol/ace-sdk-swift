@@ -187,7 +187,7 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
 
     /// The private content of `p` as its recipient decrypts it.
     private func content(_ p: Packet, at recipient: NetPeer, _ clock: TestClock) throws -> PrivateContent {
-        try decryptPacket(p, seed: try #require(try recipient.network.prekeys.open(p.encryption.prekey, sender: p.from, now: clock.now)))
+        try PrivateContent(json: try decryptPacket(p, vault: recipient.network.prekeys, now: clock.now))
     }
 
     private func offered(_ p: Packet, at recipient: NetPeer, _ clock: TestClock) throws -> String {

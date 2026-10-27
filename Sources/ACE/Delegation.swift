@@ -103,12 +103,11 @@ public func verifyDelegationCredential(_ value: JSONValue, issuer: KelState, now
 /// publishes it in its `ext`.
 public struct DelegationRules: ProfileRules {
     public let peers: PeerStore
-    public let localAceId: String
     public var types: Set<String> { [delegationType] }
 
     public func check(_ event: ProfileEvent, body: [String: JSONValue]) throws {
+        let now = try peers.clockNow()
         do {
-            let now = try peers.clockNow()
             let raw = body["credential"] ?? .null
             let c = try DelegationCredential(raw, now: now)
             guard c.issuer == event.from, c.subject == event.to else {
@@ -128,6 +127,6 @@ public struct DelegationRules: ProfileRules {
 }
 
 /// The `ace:delegation:1` message rule; `peers` supplies the sender's pin and the clock.
-public func delegationRules(peers: PeerStore, localAceId: String) -> DelegationRules {
-    DelegationRules(peers: peers, localAceId: localAceId)
+public func delegationRules(peers: PeerStore) -> DelegationRules {
+    DelegationRules(peers: peers)
 }

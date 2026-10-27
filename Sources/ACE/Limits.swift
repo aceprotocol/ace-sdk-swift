@@ -37,6 +37,8 @@ public enum ACELimits {
     public static let maxCardRecordBytes = 16_384
     /// Entries of a card record `pay`.
     public static let maxPayAccounts = 8
+    /// Entries of a card record `erc8004`.
+    public static let maxCardErc8004 = 4
     public static let maxNoteBytes = 512
     /// Maximum and default `limit` of inbox and directory pages.
     public static let maxInboxPage = 100

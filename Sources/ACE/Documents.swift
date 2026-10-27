@@ -208,9 +208,6 @@ public func checkStrangerSource(_ source: JSONValue) throws {
     }
 }
 
-/// Entries of a card record `erc8004`.
-private let maxCardErc8004 = 4
-
 /// A card record `erc8004` entry `{agentRegistry: CAIP-10, agentId}` (`invalid_authorization`).
 package func validateErc8004Entry(_ item: JSONValue) throws -> ERC8004Binding {
     guard let b = item.objectValue, hasMembers(b, ["agentRegistry", "agentId"]), let reg = b["agentRegistry"]?.stringValue,
@@ -556,8 +553,8 @@ public func verifyCardBundle(_ value: JSONValue, now: Int, allowLoopback: Bool =
     }
     var erc8004: [ERC8004Binding]?
     if let raw = r["erc8004"] {
-        guard let items = raw.arrayValue, (1...maxCardErc8004).contains(items.count), Set(items).count == items.count else {
-            throw unauthorized("erc8004 must hold 1-\(maxCardErc8004) distinct entries")
+        guard let items = raw.arrayValue, (1...ACELimits.maxCardErc8004).contains(items.count), Set(items).count == items.count else {
+            throw unauthorized("erc8004 must hold 1-\(ACELimits.maxCardErc8004) distinct entries")
         }
         erc8004 = try items.map(validateErc8004Entry)
     }

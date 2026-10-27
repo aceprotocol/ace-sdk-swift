@@ -85,7 +85,7 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
         let moved = Packet(messageId: p.messageId, from: p.from, to: p.to, timestamp: p.timestamp + 1, prekey: p.encryption.prekey,
                            kemCiphertext: p.kemCiphertext, payload: p.payload, signature: p.signature)
         expectCode(.invalidSignature) { try verifyPacketSignature(moved, sender: a.state, now: NOW) }
-        expectCode(.decryptionFailed) { try decryptPacket(moved, seed: try #require(try b.vault.open(p.encryption.prekey, now: NOW))) }
+        expectCode(.decryptionFailed) { try decryptPacket(moved, vault: b.vault, now: NOW) }
     }
 
     @Test func privateContentIsClosed() throws {

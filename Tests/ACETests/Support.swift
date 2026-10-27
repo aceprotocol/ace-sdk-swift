@@ -37,8 +37,7 @@ func openPacket(_ packet: Packet, sender: KelState, recipient: String, vault: an
     guard packet.to == recipient else { throw ACEError(.wrongRecipient) }
     try verifyPacketSignature(packet, sender: sender, now: now)
     try checkPacketTime(packet, now: now)
-    guard let seed = try vault.open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
-    return try decryptPacket(packet, seed: seed)
+    return try PrivateContent(json: try decryptPacket(packet, vault: vault, now: now))
 }
 
 func json(_ object: Any) -> Data {

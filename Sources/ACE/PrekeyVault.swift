@@ -348,9 +348,6 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
     public func hold(peer: String, prekey: Prekey, timestamp: Int, pin: String) throws {
         try Self.check(peer: peer, now: timestamp)
         guard isSHA256Hex(pin) else { throw ACEError(.invalidArgument, "pin must be 64 lowercase hex") }
-        guard prekey.publicKey.count == ACELimits.kemPublicKeySize, sha256Hex(prekey.publicKey) == prekey.id else {
-            throw ACEError(.invalidArgument, "prekey must be a \(ACELimits.kemPublicKeySize)-byte public key and its ID")
-        }
         try update { doc in
             var p = doc.peers[peer] ?? Peer()
             if let h = p.held, timestamp <= h.timestamp { return ((), false) }

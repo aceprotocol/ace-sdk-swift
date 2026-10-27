@@ -375,8 +375,7 @@ package actor Inbox {
     /// prekeys): a packet that opened under the key we offered `from` makes it the in-use key, whatever its disposition from
     /// step 7 on. The content bytes, not yet decoded.
     private func decrypt(_ packet: Packet, now: Int) throws -> Data {
-        guard let seed = try network.prekeys.open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
-        let plaintext = try decryptPlaintext(packet, seed: seed)
+        let plaintext = try decryptPacket(packet, vault: network.prekeys, now: now)
         try network.prekeys.used(peer: packet.from, prekeyId: packet.encryption.prekey)
         return plaintext
     }

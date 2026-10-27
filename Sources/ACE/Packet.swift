@@ -375,10 +375,12 @@ public func verifyPacketSignature(_ packet: Packet, sender: KelState, now: Int) 
                                                       kemCiphertext: packet.kemCiphertext, payload: packet.payload), now: now)
 }
 
-/// Decrypt with the prekey seed (`decryption_failed` for every crypto failure), then decode the private content
-/// (`invalid_body`).
-public func decryptPacket(_ packet: Packet, seed: Data) throws -> PrivateContent {
-    try PrivateContent(json: try decryptPlaintext(packet, seed: seed))
+/// 06 step 6: decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`): `unknown_prekey`
+/// when `vault` does not hold it for this sender, `decryption_failed` for every crypto failure. The content bytes, not yet
+/// decoded (step 7, `PrivateContent(json:)`).
+public func decryptPacket(_ packet: Packet, vault: any PrekeyVault, now: Int) throws -> Data {
+    guard let seed = try vault.open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
+    return try decryptPlaintext(packet, seed: seed)
 }
 
 /// 06 step 6: decrypt with the prekey seed (`decryption_failed` for every crypto failure); the content bytes, not yet

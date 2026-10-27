@@ -22,7 +22,7 @@ let packet = try createPacket(sender: alice, to: verifiedBob.aceId, prekey: veri
 let received = try Packet(json: packet.jsonData())
 let aliceKel = try ACEKel.verify(alice.getKel(), now: systemClock())
 try verifyPacketSignature(received, sender: aliceKel, now: systemClock())
-let opened = try decryptPacket(received, seed: try bobPrekeys.open(received.encryption.prekey, now: systemClock())!)
+let opened = try PrivateContent(json: try decryptPacket(received, vault: bobPrekeys, now: systemClock()))
 try text.validate(opened)
 print(opened.type, opened.body["message"]?.stringValue ?? "")
 

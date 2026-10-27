@@ -133,8 +133,7 @@ func openPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws ->
         try verifyPacketSignature(packet, sender: sender, now: now)                         // 3
         guard packet.timestamp >= now - ACELimits.offlineWindowSeconds,
               packet.timestamp <= now + ACELimits.timestampWindowSeconds else { throw ACEError(.staleTimestamp) }  // 4
-        guard let seed = try vault(dir).open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
-        let content = try decryptPacket(packet, seed: seed)                                  // 5
+        let content = try PrivateContent(json: try decryptPacket(packet, vault: vault(dir), now: now))  // 5
         try installed.validate(content)                                                      // 6
         let b = content.body                                                                 // 7
         if content.type == CoreTypes.contact {
