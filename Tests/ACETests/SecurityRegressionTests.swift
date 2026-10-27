@@ -73,7 +73,7 @@ private func link(_ alice: NetPeer, _ bob: NetPeer) async throws {
         let bobAgent = try #require(try await alice.network.peers.agent(bob.aceId))
         let id = UUID().uuidString.lowercased()
         func packet(_ ts: Int) throws -> Data {
-            let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "pay once"])
+            let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "pay once"]).with(prekey: somePrekey())
             return try createPacket(sender: alice.identity, to: bob.aceId, prekey: bobAgent.descriptor.prekey, content: c, messageId: id, timestamp: ts).jsonData()
         }
         guard case .delivered = await bob.network.inbox!.receive(try packet(clock.now)) else { Issue.record("first not delivered"); return }

@@ -11,8 +11,10 @@ public enum ACELimits {
     // 02 § Constants (checked against protocol-contract.json by ace-spec/scripts/check-sdk-artifacts.py).
     public static let timestampWindowSeconds = 300
     public static let offlineWindowSeconds = 604_800
-    /// Canonical private content `{type, schemaDigest, threadId?, body}` (1 MiB + 128 KiB).
+    /// Canonical private content `{type, schemaDigest, threadId?, body, prekey, admission?}` (1 MiB + 128 KiB).
     public static let maxPlaintextBytes = 1_179_648
+    /// The smallest padded plaintext (03 § Encryption).
+    public static let minPlaintextBucket = 4096
     public static let maxPacketBytes = 2_097_152
     /// `POST /v1/send` body: a packet plus room for a permit.
     public static let maxSendBodyBytes = maxPacketBytes + 65_536

@@ -559,7 +559,7 @@ private func expectRelayCode(_ relayCode: String, sourceLocation: SourceLocation
         let content = try InstalledProfiles([.text]).content(type: CoreTypes.contact, body: [
             "kind": "request", "profile": .string(ProfileManifest.text.id), "note": "", "source": source.source,
             "permit": try createPermit(identity: alice.identity, subject: bobId.getACEId(), now: clock.now),
-        ])
+        ]).with(prekey: somePrekey())
         let packet = try createPacket(sender: alice.identity, to: bobId.getACEId(), prekey: prekey, content: content, timestamp: clock.now)
         relay.inject(to: bobId.getACEId(), packet.jsonData())
         #expect(try await bob.pull() == [.dropped(.notPermitted)])

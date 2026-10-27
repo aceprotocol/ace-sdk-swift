@@ -57,7 +57,7 @@ import Testing
     private func packet(from: String, signer: any ACEIdentity, to bob: NetPeer, proof: JSONValue, permit: JSONValue,
                         source: JSONValue, clock: TestClock, network: NetworkClient) async throws -> Data {
         let agent = try await network.agent(bob.aceId, refresh: true)
-        let content = try network.profiles.content(type: "ace:text:1", body: ["message": "x"])
+        let content = try network.profiles.content(type: "ace:text:1", body: ["message": "x"]).with(prekey: somePrekey())
             .with(admission: Admission(proof: proof, permit: permit, source: source))
         guard from != signer.getACEId() else {
             return try createPacket(sender: signer, to: bob.aceId, prekey: agent.descriptor.prekey, content: content, timestamp: clock.now).jsonData()
@@ -138,7 +138,7 @@ import Testing
         let proof = try #require(try alice.network.admission.heldPermit(bob.aceId))
         let reply = try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now)
         let agent = try await alice.network.agent(bob.aceId, refresh: true)
-        let content = try PrivateContent(type: "urn:example:other:1", schemaDigest: String(repeating: "a", count: 64), body: [:])
+        let content = try PrivateContent(type: "urn:example:other:1", schemaDigest: String(repeating: "a", count: 64), body: [:]).with(prekey: somePrekey())
             .with(admission: Admission(proof: proof, permit: reply, source: try await alice.network.publish().source))
         let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: agent.descriptor.prekey, content: content, timestamp: clock.now)
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.unsupportedSchema))
@@ -153,7 +153,7 @@ import Testing
         let reply = try createPermit(identity: alice.identity, subject: bob.aceId, now: clock.now)
         let agent = try await alice.network.agent(bob.aceId, refresh: true)
         let content = try alice.network.profiles.content(type: CoreTypes.receipt, body: ["messageId": .string(UUID().uuidString.lowercased()),
-                                                                                          "outcome": "delivered"])
+                                                                                          "outcome": "delivered"]).with(prekey: somePrekey())
             .with(admission: Admission(proof: proof, permit: reply, source: try await alice.network.publish().source))
         let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: agent.descriptor.prekey, content: content, timestamp: clock.now)
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.invalidBody))
@@ -163,8 +163,8 @@ import Testing
 
     @Test func receiptsAndContactsCarryNoAdmission() throws {
         let c = try PrivateContent(type: CoreTypes.receipt, schemaDigest: String(repeating: "0", count: 64),
-                                   body: ["messageId": .string(UUID().uuidString.lowercased()), "outcome": "delivered"])
-        let text = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:])
+                                   body: ["messageId": .string(UUID().uuidString.lowercased()), "outcome": "delivered"]).with(prekey: somePrekey())
+        let text = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:]).with(prekey: somePrekey())
         #expect(try PrivateContent(json: try text.with(admission: Admission(proof: ["a": 1], permit: ["b": 2], source: ["c": 3])).jsonData())
             .admission != nil)  // decoding checks the shape only; 05 checks the permits
         let raw = try c.with(admission: Admission(proof: ["a": 1], permit: ["b": 2], source: ["c": 3])).jsonData()

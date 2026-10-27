@@ -171,3 +171,6 @@ func connectedText(_ relay: FakeRelay, _ clock: TestClock) async throws -> (NetP
     _ = try await alice.network.pull()
     return (alice, bob)
 }
+
+/// A fresh 1216-byte X-Wing public key: the `prekey` every test content carries (04 § Peer prekeys).
+func somePrekey() -> Data { try! XWing.publicKey(fromSeed: XWing.generateSeed()) }

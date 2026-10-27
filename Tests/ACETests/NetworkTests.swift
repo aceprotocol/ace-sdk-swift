@@ -83,7 +83,7 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
         let carol = try await NetPeer.make(relay, clock: clock, configuration: NetworkConfiguration())
         let mallory = try TestAgent(now: clock.now)
         let carolAgent = try await carol.network.publish()
-        let content = try carol.network.profiles.content(type: "ace:text:1", body: ["message": "spam"])
+        let content = try carol.network.profiles.content(type: "ace:text:1", body: ["message": "spam"]).with(prekey: somePrekey())
         let packet = try createPacket(sender: mallory.identity, to: carol.aceId, prekey: carolAgent.descriptor.prekey, content: content, timestamp: clock.now)
         let before = relay.requestCount
         #expect(await carol.network.inbox!.receive(packet.jsonData()) == .dropped(.notPermitted))
@@ -150,7 +150,7 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
         let small = try await Inbox.open(network: bob.network, onMessage: { _ in }, capacity: 16, clock: clock.fn)  // quota 1 per sender
         let bobAgent = try #require(try await alice.network.peers.agent(bob.aceId))
         func packet(_ ts: Int, id: String = UUID().uuidString.lowercased()) throws -> Data {
-            let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": .string("m\(ts)")])
+            let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": .string("m\(ts)")]).with(prekey: somePrekey())
             return try createPacket(sender: alice.identity, to: bob.aceId, prekey: bobAgent.descriptor.prekey, content: c, messageId: id, timestamp: ts).jsonData()
         }
         let first = UUID().uuidString.lowercased()
@@ -186,7 +186,7 @@ private func connected(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig
         // the relay's refusal reads like a missing permit: neither the block nor the relay's HTTP text shows
         #expect(entry.lastError?.contains("no valid permit from this peer") == true && entry.lastError?.contains("HTTP") == false)
         let agent = try #require(try await alice.network.peers.agent(bob.aceId))
-        let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "direct"])
+        let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "direct"]).with(prekey: somePrekey())
         let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: agent.descriptor.prekey, content: c, timestamp: clock.now)
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.notPermitted))
         // the relay refuses the blocked sender's contact request too

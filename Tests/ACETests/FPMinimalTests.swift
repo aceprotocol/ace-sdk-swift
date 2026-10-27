@@ -26,7 +26,7 @@ private func linked(_ relay: FakeRelay, _ clock: TestClock, alice aliceConfig: N
 /// A packet from `from` to `to` (its pinned descriptor) signed at `ts`.
 private func textPacket(_ from: NetPeer, to: NetPeer, _ text: String, at ts: Int, messageId: String = UUID().uuidString.lowercased()) async throws -> Data {
     let agent = try #require(try await from.network.peers.agent(to.aceId))
-    let c = try from.network.profiles.content(type: "ace:text:1", body: ["message": .string(text)])
+    let c = try from.network.profiles.content(type: "ace:text:1", body: ["message": .string(text)]).with(prekey: somePrekey())
     return try createPacket(sender: from.identity, to: to.aceId, prekey: agent.descriptor.prekey, content: c, messageId: messageId, timestamp: ts).jsonData()
 }
 
@@ -580,7 +580,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let permit = try createPermit(identity: bob.identity, subject: alice.aceId, now: clock.now)
         let body: [String: JSONValue] = ["messageId": .string(UUID().uuidString.lowercased()), "outcome": "delivered", "permit": permit]
         let agent = try #require(try await bob.network.peers.agent(alice.aceId))
-        let c = try bob.network.profiles.content(type: CoreTypes.receipt, body: body)
+        let c = try bob.network.profiles.content(type: CoreTypes.receipt, body: body).with(prekey: somePrekey())
         relay.inject(to: alice.aceId, try createPacket(sender: bob.identity, to: alice.aceId, prekey: agent.descriptor.prekey, content: c,
                                                        timestamp: clock.now).jsonData())
         _ = try await alice.network.pull()

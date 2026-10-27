@@ -615,10 +615,11 @@ public actor NetworkClient: PacketTransport {
     package func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {
         let agent = try await agent(aceId)
         guard let permit = try validTheirPermit(aceId, agent.state) else { throw noValidPermit }
-        var sent = content
+        // Task 11: the vault's `offer(peer:now:)` key; a throwaway one until then.
+        var sent = content.with(prekey: try XWing.publicKey(fromSeed: XWing.generateSeed()))
         let reply = retry ? try replyPermit(for: aceId) : nil
         if let reply, let source = currentSource() {
-            let carried = content.with(admission: Admission(proof: permit, permit: reply.permit, source: source))
+            let carried = sent.with(admission: Admission(proof: permit, permit: reply.permit, source: source))
             if (try? carried.jsonData()) != nil { sent = carried }
         }
         let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: try now())
@@ -655,7 +656,8 @@ public actor NetworkClient: PacketTransport {
                           permit explicit: JSONValue? = nil) async throws {
         let target: VerifiedAgent
         if let agent { target = agent } else { target = try await self.agent(aceId) }
-        let content = try profiles.content(type: type, body: body)
+        // Task 11: the vault's `offer(peer:now:)` key; a throwaway one until then.
+        let content = try profiles.content(type: type, body: body).with(prekey: try XWing.publicKey(fromSeed: XWing.generateSeed()))
         let packet = try createPacket(sender: identity, to: aceId, prekey: target.descriptor.prekey, content: content, timestamp: try now())
         let permit = try explicit ?? validTheirPermit(aceId, target.state)
         try await onRoutes(target.descriptor.relays) { try await $0.send(packet, permit: permit) }

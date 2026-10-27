@@ -362,7 +362,8 @@ package actor Inbox {
                                now: Int) async throws -> ReceiveOutcome {
         let me = identity.getACEId()
         let core = carried.type == CoreTypes.receipt || carried.type == CoreTypes.contact
-        let content = carried.with(admission: nil)
+        var content = carried.with(admission: nil)
+        content.prekey = nil  // the offered peer prekey never reaches the host
         do {
             if let admission = carried.admission {
                 try await network.holdTheirPermit(admission.permit, from: packet.from) { $0.map { $0.state != .blocked } ?? false }
@@ -649,7 +650,10 @@ package actor Inbox {
         if !stranger { try await network.peers.adoptOrUsable(source) }
         try await network.receivedContact(from: packet.from, body: content.body, source: source)
         try commitSeen(packet.messageId, from: packet.from, timestamp: packet.timestamp, now: now)
-        return .delivered(ReceivedMessage(from: packet.from, to: packet.to, messageId: packet.messageId, timestamp: packet.timestamp, content: content))
+        var delivered = content
+        delivered.prekey = nil  // the offered peer prekey never reaches the host
+        return .delivered(ReceivedMessage(from: packet.from, to: packet.to, messageId: packet.messageId, timestamp: packet.timestamp,
+                                          content: delivered))
     }
 }
 

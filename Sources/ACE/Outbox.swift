@@ -193,7 +193,7 @@ public actor Outbox {
             throw ACEError(.invalidArgument, "receipts and contacts never enter the Outbox")
         }
         let content = try profiles.content(type: type, body: body, threadId: threadId)
-        _ = try content.jsonData()
+        _ = try content.with(prekey: Data(count: ACELimits.kemPublicKeySize)).jsonData()  // the size it is sent at: any prekey
         let now = try unixNow(clock)
         let entry = OutboxEntry(messageId: messageId ?? UUID().uuidString.lowercased(), to: to, content: content, createdAt: now)
         let ev = event(entry)

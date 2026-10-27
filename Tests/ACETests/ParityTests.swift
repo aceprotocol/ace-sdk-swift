@@ -57,7 +57,7 @@ import Testing
     @Test func permitMustMatchThePacket() async throws {
         let alice = try TestAgent(now: NOW), bob = try TestAgent(now: NOW), carol = try TestAgent(now: NOW)
         let relay = try makeRelay({ _, _ in .json(200, ["ok": true] as JSONValue) }, clock: { NOW })
-        let content = try InstalledProfiles([.text]).content(type: "ace:text:1", body: ["message": "x"])
+        let content = try InstalledProfiles([.text]).content(type: "ace:text:1", body: ["message": "x"]).with(prekey: somePrekey())
         let packet = try createPacket(sender: alice.identity, to: bob.aceId, prekey: bob.agent.descriptor.prekey, content: content, timestamp: NOW)
         let good = try createPermit(identity: bob.identity, subject: alice.aceId, now: NOW)
         try await relay.send(packet, permit: good)
