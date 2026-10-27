@@ -38,7 +38,7 @@ private func codeOf(_ body: () throws -> Void) -> String? {
 private func expected(_ c: JSONValue, _ key: String = "error") -> String? { c[key]?.stringValue }
 
 /// A vault holding the vector prekey seed as its current published prekey and, per `peerSeeds` entry, the peer prekey
-/// offered to that peer (offeredAt = the vectors' `now`, nothing in use or held): the `prekeys.json` document, version 2.
+/// offered to that peer (offeredAt = the vectors' `now`, nothing in use or held): the `prekeys.json` document, version 1.
 private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVault {
     func entry(_ seedHex: String, _ at: String, _ t: Int) throws -> JSONValue {
         let seed = hex(seedHex)
@@ -51,7 +51,7 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
     }
     let store = MemoryStore()
     try store.write("prekeys.json", try JSONValue.object([
-        "version": 2, "current": try entry(V["packet"]!["deterministic"]!["prekeySeed"]!.s, "createdAt", VNOW), "retained": .array([]),
+        "version": 1, "current": try entry(V["packet"]!["deterministic"]!["prekeySeed"]!.s, "createdAt", VNOW), "retained": .array([]),
         "peers": .object(peers),
     ]).jsonData())
     return StorePrekeyVault(store: store)

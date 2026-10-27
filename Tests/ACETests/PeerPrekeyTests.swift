@@ -118,33 +118,16 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(try v.open(k.id, sender: A, now: T + W - 1) != nil)
         try v.prune(now: T + W + 5)
         let doc = try #require(try store.readJSON("prekeys.json"))
-        #expect(doc["version"] == 2 && doc["peers"] == .object([:]))
+        #expect(doc["version"] == 1 && doc["peers"] == .object([:]))
         #expect(try v.current()?.prekey == published.prekey)
     }
 
-    /// A 0.6.0 vault keeps its published prekeys across the upgrade: same current, same retained, still opens.
-    @Test func aVersion1DocumentIsReadAsVersion2() throws {
-        let old = MemoryStore()
-        let v1 = vault(old)
-        let first = try v1.rotate(now: T)
-        let second = try v1.rotate(now: T + 10)
-        guard let doc = try old.readJSON("prekeys.json")?.objectValue else { Issue.record("no document"); return }
-        let keys: [JSONValue] = (doc["retained"]?.arrayValue ?? []) + [doc["current"]].compactMap { $0 }
+    @Test func anUnknownVersionOrShapeIsAStorageFailure() throws {
         let store = MemoryStore()
-        try store.write("prekeys.json", try JSONValue.object(["version": 1, "keys": .array(keys)]).jsonData())
+        try store.write("prekeys.json", try JSONValue.object(["version": 1, "keys": .array([])]).jsonData())
         let v = vault(store)
-        #expect(try v.current()?.prekey == second.prekey)
-        #expect(try v.open(first.prekey.id, now: T + 20) != nil)
-        _ = try v.offer(peer: A, now: T + 20)
-        #expect(try store.readJSON("prekeys.json")?["version"] == 2)
-    }
-
-    @Test func otherVersionsAreAStorageFailure() throws {
-        let store = MemoryStore()
-        try store.write("prekeys.json", try JSONValue.object(["version": 3, "keys": .array([])]).jsonData())
-        expectCode(.storageFailed) { _ = try vault(store).current() }
-        try store.write("prekeys.json", try JSONValue.object(["version": 1, "keys": .array([]), "peers": .object([:])]).jsonData())
-        expectCode(.storageFailed) { _ = try vault(store).current() }
+        expectCode(.storageFailed) { _ = try v.current() }
+        expectCode(.storageFailed) { _ = try v.offer(peer: A, now: T) }
     }
 
     @Test func peerArgumentsAreChecked() throws {
@@ -443,7 +426,7 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: try #require(try bob.network.prekeys.current()).prekey, content: c,
                                  timestamp: clock.now)
         let saved = try #require(try bob.store.read("prekeys.json"))
-        try bob.store.write("prekeys.json", Data("{\"version\":3}".utf8))
+        try bob.store.write("prekeys.json", Data("{\"version\":1,\"keys\":[]}".utf8))
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .retry(.storageFailed))
         try bob.store.write("prekeys.json", saved)
         guard case .delivered = await bob.network.inbox!.receive(p.jsonData()) else { Issue.record("not delivered once restored"); return }

@@ -68,14 +68,14 @@ public enum PrekeyProtection: Sendable {
 /// A `PrekeyVault` over an `ACEStore` (`prekeys.json` under lock `prekeys`): `MemoryStore` for in-memory, `FileStore` for
 /// a keystore file, `protection: .secureEnclave` for Secure Enclave–sealed seeds (published and peer seeds alike).
 ///
-/// The document, version 2 (version 1 is read as version 2 with no peers; any other is `storage_failed`):
-/// `{version: 2, current: Entry|null, retained: Entry[], peers: {<aceId>: {offered: Seed|null, inUse: Seed|null,
+/// The document, version 1 (any other version is `storage_failed`):
+/// `{version: 1, current: Entry|null, retained: Entry[], peers: {<aceId>: {offered: Seed|null, inUse: Seed|null,
 /// held: {publicKey, timestamp, pin}|null}}}`, where `Entry` is `{prekey, createdAt, supersededAt (retained only), secret}`,
 /// `Seed` is `{prekey, offeredAt, secret}` and `secret` is `{seed}` (software) or `{seal}` (Secure Enclave). The public
 /// half is stored beside each secret so lookups by ID never unseal.
 public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
     private static let key = "prekeys.json"
-    private static let version = 2
+    private static let version = 1
     private static let sealInfo = "ace.secure-enclave.mlkem768.prekey-seed"
     private let store: any ACEStore
     private let protection: PrekeyProtection
@@ -134,7 +134,6 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
 
     private func load() throws -> Document {
         guard let raw = try store.checkedRead(Self.key) else { return Document() }
-        if let o = JSONValue(stored: raw)?.objectValue, o["version"] == 1 { return try upgrade(o) }
         guard let o = JSONValue(stored: raw)?.objectValue, o["version"] == .number(Double(Self.version)),
               Set(o.keys) == ["version", "current", "retained", "peers"], let current = o["current"], let retained = o["retained"]?.arrayValue,
               let peers = o["peers"]?.objectValue else {
@@ -147,20 +146,6 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
             guard isACEId(peer), let p = v.objectValue, Set(p.keys) == ["offered", "inUse", "held"] else { throw malformed }
             doc.peers[peer] = Peer(offered: try seed(p["offered"]!), inUse: try seed(p["inUse"]!), held: try held(p["held"]!))
         }
-        return doc
-    }
-
-    /// Version 1 (0.6.0 and earlier): `{version: 1, keys: [{prekey, createdAt, supersededAt?, secret}]}`, published
-    /// prekeys only. Read as version 2 with no peers; the next save writes version 2. Refusing it would cut every agent
-    /// upgraded with a vault off its own published prekey.
-    private func upgrade(_ o: [String: JSONValue]) throws -> Document {
-        guard Set(o.keys) == ["version", "keys"], let keys = o["keys"]?.arrayValue else { throw malformed }
-        var doc = Document()
-        for k in keys {
-            guard let e = k.objectValue else { throw malformed }
-            doc.entries.append(try entry(k, retained: e["supersededAt"] != nil))
-        }
-        guard doc.entries.filter({ $0.record.supersededAt == nil }).count <= 1 else { throw malformed }
         return doc
     }
 
