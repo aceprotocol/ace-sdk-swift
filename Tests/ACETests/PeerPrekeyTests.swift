@@ -147,47 +147,9 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(try vault(try FileStore(directory: dir)).open(k.id, sender: A, now: T) != nil)
     }
 
-    @Test func aPrekeyThatIsNotAnXWingKeyIsMalformed() throws {
-        let bad = Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize)
-        #expect(!XWing.isPublicKey(bad) && XWing.isPublicKey(somePrekey()))
-        let good = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:]).with(prekey: somePrekey())
-        var o = try #require(good.jsonValue.objectValue)
-        o["prekey"] = .string(ACEBase64.encode(bad))
-        expectCode(.invalidBody) { try PrivateContent(json: try JSONValue.object(o).jsonData()) }
-        expectCode(.invalidArgument) { try Prekey(publicKey: bad) }
-        // `hold` refuses it
-        let v = vault()
-        expectCode(.invalidArgument) { try v.hold(peer: A, prekey: Prekey(validated: bad), timestamp: T, pin: PIN) }
-        #expect(try v.held(peer: A, pin: PIN, now: T) == nil)
-    }
-
-    /// The vault trusts its own document at load: a held key is checked for its length (and gets its ID) only, never
-    /// trial-encapsulated, so a load costs nothing per peer. A planted key with an invalid ML-KEM half proves no check ran;
-    /// a wrong length is still `storage_failed`.
-    @Test func loadsDoNotRevalidateHeldKeys() throws {
-        let unchecked = Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize)
-        let store = MemoryStore(), v = vault(store)
-        var peers: [String: JSONValue] = [:]
-        for i in 0..<50 {
-            peers[peerId("peer-\(i)")] = ["offered": .null, "inUse": .null,
-                                         "held": ["publicKey": .string(ACEBase64.encode(unchecked)), "timestamp": .number(Double(T)), "pin": .string(PIN)]]
-        }
-        let doc: JSONValue = ["version": 2, "current": .null, "retained": .array([]), "peers": .object(peers)]
-        try store.write("prekeys.json", try doc.jsonData())
-        #expect(try v.held(peer: peerId("peer-0"), pin: PIN, now: T)?.publicKey == unchecked)
-        for _ in 0..<20 { _ = try v.current() }  // 20 loads of 50 held keys: no encapsulation (would be 1000)
-        var short = try #require(try store.readJSON("prekeys.json")?.objectValue)
-        short["peers"] = .object([A: ["offered": .null, "inUse": .null,
-                                      "held": ["publicKey": .string(ACEBase64.encode(Data(count: 1215))), "timestamp": .number(Double(T)),
-                                               "pin": .string(PIN)]]])
-        try store.write("prekeys.json", try JSONValue.object(short).jsonData())
-        expectCode(.storageFailed) { _ = try v.current() }
-    }
-
-    /// Only the ML-KEM-768 half is checked: an all-zero X25519 half is a valid X-Wing public key (03 § X-Wing).
+    /// A content `prekey` is checked for its length only: an all-zero X25519 half decodes (03 § X-Wing).
     @Test func anAllZeroX25519HalfIsAPublicKey() throws {
         let key = zeroX25519Key()
-        #expect(XWing.isPublicKey(key))
         #expect(try Prekey(publicKey: key).publicKey == key)
         let c = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:]).with(prekey: key)
         #expect(try PrivateContent(json: try c.jsonData()).prekey == key)
@@ -403,19 +365,6 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(try alice.network.prekeys.held(peer: bob.aceId, pin: p, now: clock.now) == nil)
     }
 
-    /// A content `prekey` that is not an X-Wing public key, from a pinned peer: rejected (`invalid_body`), never held.
-    @Test func aMalformedOfferedKeyIsRejectedAndNotHeld() async throws {
-        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await connectedText(relay, clock)
-        let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"])
-            .with(prekey: Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize))
-        let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: try #require(try bob.network.prekeys.current()).prekey, content: c,
-                                 timestamp: clock.now)
-        #expect(await bob.network.inbox!.receive(p.jsonData()) == .rejected("invalid_body"))
-        #expect(try await held(bob, alice, clock) == nil)
-        #expect(bob.received.value.isEmpty)
-    }
-
     /// The one packet bob sent alice since `n`, decrypted: a `rejected` receipt for `messageId` with `code`.
     private func expectRejectedReceipt(_ relay: FakeRelay, since n: Int, _ bob: NetPeer, _ alice: NetPeer, _ clock: TestClock,
                                        messageId: String, code: String) throws {
@@ -432,7 +381,7 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         let (alice, bob) = try await connectedText(relay, clock)
         let d = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"]).schemaDigest
         let plaintext = Data(#"{"body":{"message":"x"},"prekey":"not base64!","schemaDigest":"\#(d)","type":"ace:text:1"}"#.utf8)
-        let p = try forged(alice, to: bob, plaintext: Packet.pad(plaintext), clock)
+        let p = try forged(alice, to: bob, plaintext: plaintext, clock)
         let n = relay.postedCount
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .rejected("invalid_body"))
         try expectRejectedReceipt(relay, since: n, bob, alice, clock, messageId: p.messageId, code: "invalid_body")
@@ -446,30 +395,16 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         let (alice, bob) = try await connectedText(relay, clock)
         let c = try alice.network.profiles.content(type: CoreTypes.receipt, body: ["messageId": .string(UUID().uuidString.lowercased()),
                                                                                   "outcome": "delivered"])
-            .with(prekey: Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize))
-        let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: try #require(try bob.network.prekeys.current()).prekey, content: c,
-                                 timestamp: clock.now)
+        var o = try #require(c.with(prekey: somePrekey()).jsonValue.objectValue)
+        o["prekey"] = "not base64!"
+        let p = try forged(alice, to: bob, plaintext: try JSONValue.object(o).jsonData(), clock)
         let n = relay.postedCount
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.invalidBody))
         #expect(relay.posted(since: n, from: bob.aceId, to: alice.aceId).isEmpty)
         #expect(try await held(bob, alice, clock) == nil)
     }
 
-    /// 06 step 6: non-zero padding is a decryption failure: dropped, no receipt.
-    @Test func step6NonZeroPaddingIsDroppedWithoutAReceipt() async throws {
-        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
-        let (alice, bob) = try await connectedText(relay, clock)
-        var padded = Packet.pad(try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"]).with(prekey: somePrekey()).jsonData())
-        padded[padded.count - 1] = 1
-        let p = try forged(alice, to: bob, plaintext: padded, clock)
-        let n = relay.postedCount
-        #expect(await bob.network.inbox!.receive(p.jsonData()) == .dropped(.invalidBody))
-        #expect(relay.posted(since: n, from: bob.aceId, to: alice.aceId).isEmpty)
-        #expect(try await held(bob, alice, clock) == nil)
-        #expect(bob.received.value.isEmpty)
-    }
-
-    /// A correctly signed packet whose padded plaintext is `plaintext` verbatim (what a faulty or hostile sender can send).
+    /// A correctly signed packet whose plaintext is `plaintext` verbatim (what a faulty or hostile sender can send).
     private func forged(_ alice: NetPeer, to bob: NetPeer, plaintext: Data, _ clock: TestClock) throws -> Packet {
         let prekey = try #require(try bob.network.prekeys.current()).prekey
         let r = try XWingMLKEM768X25519.PublicKey(rawRepresentation: prekey.publicKey).encapsulate()

@@ -341,8 +341,8 @@ package actor Inbox {
         let now = try now()
         try verifyPacketSignature(packet, sender: state, now: now)
         try checkPacketTime(packet, now: now)
-        // 6. decrypt and unpad: an unknown prekey is rejected; any other failure (bad padding included) is a drop. A
-        // storage failure of the vault is a retry.
+        // 6. decrypt: an unknown prekey is rejected; any other failure is a drop. A storage failure of the vault is a
+        // retry.
         let plaintext: Data
         do {
             plaintext = try decrypt(packet, now: now)
@@ -371,7 +371,7 @@ package actor Inbox {
         return type == CoreTypes.receipt || type == CoreTypes.contact
     }
 
-    /// Step 6 (`unknown_prekey`, `decryption_failed`, `invalid_body` for bad padding), then the issuer rule (04 § Peer
+    /// Step 6 (`unknown_prekey`, `decryption_failed`), then the issuer rule (04 § Peer
     /// prekeys): a packet that opened under the key we offered `from` makes it the in-use key, whatever its disposition from
     /// step 7 on. The content bytes, not yet decoded.
     private func decrypt(_ packet: Packet, now: Int) throws -> Data {
@@ -391,7 +391,7 @@ package actor Inbox {
         let me = identity.getACEId()
         let core = carried.type == CoreTypes.receipt || carried.type == CoreTypes.contact
         if carried.type != CoreTypes.contact, let offered = carried.prekey {
-            try network.prekeys.hold(peer: packet.from, prekey: Prekey(validated: offered), timestamp: packet.timestamp, pin: state.lastHash)
+            try network.prekeys.hold(peer: packet.from, prekey: Prekey(publicKey: offered), timestamp: packet.timestamp, pin: state.lastHash)
         }
         var content = carried.with(admission: nil)
         content.prekey = nil  // the offered peer prekey never reaches the host

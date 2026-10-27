@@ -156,7 +156,7 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
 
     private func entry(_ v: JSONValue, retained: Bool) throws -> Entry {
         guard let o = v.objectValue, Set(o.keys) == (retained ? ["prekey", "createdAt", "supersededAt", "secret"] : ["prekey", "createdAt", "secret"]),
-              let prekey = Prekey(o["prekey"], ownSeed: true), let created = o["createdAt"]?.wireInt else { throw malformed }
+              let prekey = Prekey(o["prekey"]), let created = o["createdAt"]?.wireInt else { throw malformed }
         var superseded: Int?
         if retained {
             guard let n = o["supersededAt"]?.wireInt else { throw malformed }
@@ -167,7 +167,7 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
 
     private func seed(_ v: JSONValue) throws -> Seed? {
         if v == .null { return nil }
-        guard let o = v.objectValue, Set(o.keys) == ["prekey", "offeredAt", "secret"], let prekey = Prekey(o["prekey"], ownSeed: true),
+        guard let o = v.objectValue, Set(o.keys) == ["prekey", "offeredAt", "secret"], let prekey = Prekey(o["prekey"]),
               let at = o["offeredAt"]?.wireInt else { throw malformed }
         return Seed(prekey: prekey, offeredAt: at, secret: try secret(o["secret"]))
     }
@@ -177,9 +177,8 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
         guard let o = v.objectValue, Set(o.keys) == ["publicKey", "timestamp", "pin"], let text = o["publicKey"]?.stringValue,
               let ts = o["timestamp"]?.wireInt, let pin = o["pin"]?.stringValue, isSHA256Hex(pin),
               let raw = try? decodeB64(text, code: .storageFailed, what: "held prekey", maxBytes: ACELimits.kemPublicKeySize),
-              raw.count == ACELimits.kemPublicKeySize else { throw malformed }
-        // The vault trusts its own document: the key was checked by `hold` (no trial encapsulation on every load).
-        return Held(prekey: Prekey(validated: raw), timestamp: ts, pin: pin)
+              let prekey = try? Prekey(publicKey: raw) else { throw malformed }
+        return Held(prekey: prekey, timestamp: ts, pin: pin)
     }
 
     private func save(_ doc: Document) throws {
@@ -227,7 +226,7 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
     private func generate() throws -> (Prekey, JSONValue) {
         var seed = XWing.generateSeed()
         defer { seed.resetBytes(in: 0..<seed.count) }
-        let prekey = Prekey(validated: try XWing.publicKey(fromSeed: seed))
+        let prekey = try Prekey(publicKey: XWing.publicKey(fromSeed: seed))
         switch protection {
         case .software: return (prekey, ["seed": .string(ACEBase64.encode(seed))])
         case .secureEnclave: return (prekey, ["seal": try SecureEnclaveSeal.seal(seed, info: Self.sealInfo).jsonValue])
@@ -349,8 +348,8 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
     public func hold(peer: String, prekey: Prekey, timestamp: Int, pin: String) throws {
         try Self.check(peer: peer, now: timestamp)
         guard isSHA256Hex(pin) else { throw ACEError(.invalidArgument, "pin must be 64 lowercase hex") }
-        guard XWing.isPublicKey(prekey.publicKey), sha256Hex(prekey.publicKey) == prekey.id else {
-            throw ACEError(.invalidArgument, "prekey must be an X-Wing public key and its ID")
+        guard prekey.publicKey.count == ACELimits.kemPublicKeySize, sha256Hex(prekey.publicKey) == prekey.id else {
+            throw ACEError(.invalidArgument, "prekey must be a \(ACELimits.kemPublicKeySize)-byte public key and its ID")
         }
         try update { doc in
             var p = doc.peers[peer] ?? Peer()

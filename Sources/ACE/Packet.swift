@@ -7,7 +7,6 @@
 //    header  = encodePayload("ace.v1.packet", from, to, messageId, decimal(timestamp), prekeyId, kemCiphertextBytes)
 //    (ss, kemCiphertext) = XWing.Encapsulate(prekey.publicKey)
 //    key     = HKDF-SHA256(ikm = ss, salt = "", info = header, L = 32)
-//    plaintext = u32be(len(content)) ‖ content ‖ zeros to a bucket (03 § Encryption)
 //    payload = nonce[12] ‖ AES-256-GCM(key, nonce, plaintext, aad = header)
 //    signature (action "packet") over M(from, timestamp, seq, encodePayload(to, messageId, prekeyId, kemCiphertextBytes, payloadBytes))
 //
@@ -27,17 +26,11 @@ public struct Prekey: Sendable, Equatable, Hashable {
     public let id: String
     public let publicKey: Data
 
-    /// `invalid_argument` unless `publicKey` is 1216 bytes that decode as an X-Wing public key (`XWing.isPublicKey`).
+    /// `invalid_argument` unless `publicKey` is 1216 bytes.
     public init(publicKey: Data) throws {
-        guard XWing.isPublicKey(publicKey) else {
-            throw ACEError(.invalidArgument, "prekey must be a \(ACELimits.kemPublicKeySize)-byte X-Wing public key")
+        guard publicKey.count == ACELimits.kemPublicKeySize else {
+            throw ACEError(.invalidArgument, "X-Wing public key must be \(ACELimits.kemPublicKeySize) bytes")
         }
-        self.init(validated: publicKey)
-    }
-
-    /// A key already known to be an X-Wing public key (derived from a seed we hold, or checked when its content was
-    /// decoded): no trial encapsulation again.
-    package init(validated publicKey: Data) {
         self.publicKey = publicKey
         self.id = sha256Hex(publicKey)
     }
@@ -45,18 +38,11 @@ public struct Prekey: Sendable, Equatable, Hashable {
     /// `{id, publicKey}`.
     public var jsonValue: JSONValue { ["id": .string(id), "publicKey": .string(ACEBase64.encode(publicKey))] }
 
-    /// Exactly `{id, publicKey}` with a canonical 1216-byte X-Wing public key whose SHA-256 is `id`; nil otherwise.
-    /// `ownSeed`: the public half stored beside a seed we hold (the vault), checked for its length and ID only.
-    package init?(_ v: JSONValue?, ownSeed: Bool = false) {
+    /// Exactly `{id, publicKey}` with a canonical 1216-byte key whose SHA-256 is `id`; nil otherwise.
+    package init?(_ v: JSONValue?) {
         guard let o = v?.objectValue, Set(o.keys) == ["id", "publicKey"], let id = o["id"]?.stringValue, let text = o["publicKey"]?.stringValue,
               let raw = try? decodeB64(text, code: .invalidArgument, what: "prekey", maxBytes: ACELimits.kemPublicKeySize),
-              raw.count == ACELimits.kemPublicKeySize else { return nil }
-        let key: Prekey
-        if ownSeed { key = Prekey(validated: raw) } else {
-            guard let checked = try? Prekey(publicKey: raw) else { return nil }
-            key = checked
-        }
-        guard key.id == id else { return nil }
+              let key = try? Prekey(publicKey: raw), key.id == id else { return nil }
         self = key
     }
 }
@@ -70,19 +56,6 @@ public enum XWing {
     public static func publicKey(fromSeed seed: Data) throws -> Data {
         Data(try privateKey(seed).publicKey.rawRepresentation)
     }
-
-    /// True when `raw` is 1216 bytes whose ML-KEM-768 half (the first 1184 bytes) is a valid FIPS 203 encapsulation key.
-    /// CryptoKit accepts out-of-range coefficients at construction, so a trial encapsulation with that ML-KEM key alone
-    /// (its result discarded) checks the modulus. Any 32 bytes are an X25519 half: no small-order or all-zero check
-    /// (03 § X-Wing).
-    public static func isPublicKey(_ raw: Data) -> Bool {
-        guard raw.count == ACELimits.kemPublicKeySize,
-              let key = try? MLKEM768.PublicKey(rawRepresentation: raw.prefix(mlkemPublicKeySize)) else { return false }
-        return (try? key.encapsulate()) != nil
-    }
-
-    /// The ML-KEM-768 half of an X-Wing public key (`pk_M ‖ pk_X`).
-    private static let mlkemPublicKeySize = 1184
 
     package static func privateKey(_ seed: Data) throws -> XWingMLKEM768X25519.PrivateKey {
         guard seed.count == ACELimits.kemSeedSize else { throw ACEError(.invalidArgument, "X-Wing seed must be 32 bytes") }
@@ -200,8 +173,6 @@ public struct PrivateContent: Sendable, Equatable {
               prekey.count == ACELimits.kemPublicKeySize else {
             throw ACEError(.invalidBody, "prekey must be \(ACELimits.kemPublicKeySize) bytes of canonical Base64")
         }
-        // A key that does not decode as an X-Wing public key is malformed: never held, never encrypted to.
-        guard XWing.isPublicKey(prekey) else { throw ACEError(.invalidBody, "prekey is not an X-Wing public key") }
         var threadId: String?
         if let t = o["threadId"] {
             guard let s = t.stringValue else { throw ACEError(.invalidBody, "invalid threadId") }
@@ -249,55 +220,9 @@ public struct PacketEncryption: Sendable, Equatable {
 /// A decoded packet. Obtain from `Packet(json:)` or `createPacket`.
 public struct Packet: Sendable, Equatable {
     public static let version = "1"
-    /// Decoded `encryption.payload`: `nonce[12] ‖ ciphertext ‖ tag[16]`, its ciphertext length a plaintext bucket.
+    /// Decoded `encryption.payload`: `nonce[12] ‖ ciphertext ‖ tag[16]`.
     package static let minPayloadBytes = 28
-    package static let maxPayloadBytes = largestPlaintextBucket + minPayloadBytes
-
-    /// `u32be` length prefix of a padded plaintext.
-    private static let lengthPrefixBytes = 4
-    /// The bucket of every content over 2^20 − 4 bytes: `MAX_PLAINTEXT_BYTES + 4`.
-    private static let largestPlaintextBucket = ACELimits.maxPlaintextBytes + lengthPrefixBytes
-
-    /// Every padded plaintext length: the powers of two from `MIN_PLAINTEXT_BUCKET` to 2^20, and `MAX_PLAINTEXT_BYTES + 4`.
-    package static let plaintextBuckets: Set<Int> = Set(
-        sequence(first: ACELimits.minPlaintextBucket) { $0 < 1 << 20 ? $0 * 2 : nil } + [largestPlaintextBucket])
-
-    /// The padded length of `contentLength` content bytes: the smallest power of two ≥ `MIN_PLAINTEXT_BUCKET` holding
-    /// `contentLength + 4`; above 2^20, `MAX_PLAINTEXT_BYTES + 4`.
-    package static func plaintextBucket(_ contentLength: Int) -> Int {
-        let n = contentLength + lengthPrefixBytes
-        if n > 1 << 20 { return largestPlaintextBucket }
-        var b = ACELimits.minPlaintextBucket
-        while b < n { b *= 2 }
-        return b
-    }
-
-    /// `u32be(len(content)) ‖ content ‖ zeros` to `plaintextBucket(len(content))`; `content` must be at most
-    /// `MAX_PLAINTEXT_BYTES` (`sealPacket` checks it: `limit_exceeded`).
-    package static func pad(_ content: Data) -> Data {
-        let n = content.count
-        precondition(n <= ACELimits.maxPlaintextBytes, "Packet.pad: content exceeds MAX_PLAINTEXT_BYTES")
-        let bucket = plaintextBucket(n)
-        var out = Data(capacity: bucket)
-        out.append(contentsOf: [UInt8(truncatingIfNeeded: n >> 24), UInt8(truncatingIfNeeded: n >> 16), UInt8(truncatingIfNeeded: n >> 8),
-                                UInt8(truncatingIfNeeded: n)])
-        out.append(content)
-        out.append(Data(count: bucket - out.count))
-        return out
-    }
-
-    /// The content inside a padded plaintext; `invalid_body` unless its length is a bucket, the prefix is at most
-    /// `MAX_PLAINTEXT_BYTES` and fits, the bucket is the one the prefix implies and the padding is all zero.
-    package static func unpad(_ p: Data) throws -> Data {
-        guard plaintextBuckets.contains(p.count) else { throw ACEError(.invalidBody, "plaintext padding is invalid") }
-        let n = p.prefix(lengthPrefixBytes).reduce(0) { $0 << 8 | Int($1) }
-        let start = p.startIndex + lengthPrefixBytes  // a slice keeps its parent's indices
-        guard n <= ACELimits.maxPlaintextBytes, lengthPrefixBytes + n <= p.count, plaintextBucket(n) == p.count,
-              p[(start + n)...].allSatisfy({ $0 == 0 }) else {
-            throw ACEError(.invalidBody, "plaintext padding is invalid")
-        }
-        return p.subdata(in: start..<(start + n))
-    }
+    package static let maxPayloadBytes = ACELimits.maxPlaintextBytes + minPayloadBytes
 
     public let messageId: String
     public let from: String
@@ -347,9 +272,7 @@ public struct Packet: Sendable, Equatable {
               kem.count == ACELimits.kemCiphertextSize else { throw bad("encryption.kemCiphertext must be 1120 bytes of canonical Base64") }
         guard let payloadText = enc["payload"]?.stringValue,
               let payload = try? decodeB64(payloadText, code: .invalidPacket, what: "payload", maxBytes: Self.maxPayloadBytes),
-              Self.plaintextBuckets.contains(payload.count - Self.minPayloadBytes) else {
-            throw bad("encryption.payload is not a padded bucket")
-        }
+              payload.count >= Self.minPayloadBytes else { throw bad("encryption.payload must be 28..\(Self.maxPayloadBytes) bytes") }
         guard let signature = SignatureEnvelope(operational: o["signature"]) else {
             throw bad("signature must be {scheme: ml-dsa-65, seq, value}")
         }
@@ -428,14 +351,14 @@ public func createPacket(sender: any ACEIdentity, to: String, prekey: Prekey, co
 }
 
 /// The deterministic core of `createPacket` (vectors inject `sharedSecret`, `kemCiphertext` and `nonce`): seals
-/// `Packet.pad(plaintext)`, `plaintext` being the content's canonical JSON.
+/// `plaintext`, the content's canonical JSON.
 package func sealPacket(sender: any ACEIdentity, from: String, to: String, messageId: String, timestamp: Int, prekey: String, plaintext: Data,
                         sharedSecret: SymmetricKey, kemCiphertext: Data, nonce: AES.GCM.Nonce = AES.GCM.Nonce()) throws -> Packet {
     guard plaintext.count <= ACELimits.maxPlaintextBytes else {
         throw ACEError(.limitExceeded, "private content exceeds \(ACELimits.maxPlaintextBytes) bytes")
     }
     let header = Packet.header(from: from, to: to, messageId: messageId, timestamp: timestamp, prekey: prekey, kemCiphertext: kemCiphertext)
-    let payload = try Packet.seal(Packet.pad(plaintext), sharedSecret: sharedSecret, header: header, nonce: nonce)
+    let payload = try Packet.seal(plaintext, sharedSecret: sharedSecret, header: header, nonce: nonce)
     let signature = try operationalSign(sender, action: "packet", timestamp: timestamp,
                                         payload: Packet.signPayload(to: to, messageId: messageId, prekey: prekey, kemCiphertext: kemCiphertext,
                                                                     payload: payload))
@@ -452,14 +375,14 @@ public func verifyPacketSignature(_ packet: Packet, sender: KelState, now: Int) 
                                                       kemCiphertext: packet.kemCiphertext, payload: packet.payload), now: now)
 }
 
-/// Decrypt with the prekey seed (`decryption_failed` for every crypto failure), then unpad and decode the private content
+/// Decrypt with the prekey seed (`decryption_failed` for every crypto failure), then decode the private content
 /// (`invalid_body`).
 public func decryptPacket(_ packet: Packet, seed: Data) throws -> PrivateContent {
     try PrivateContent(json: try decryptPlaintext(packet, seed: seed))
 }
 
-/// 06 step 6: decrypt with the prekey seed (`decryption_failed` for every crypto failure) and unpad (`invalid_body`); the
-/// content bytes, not yet decoded.
+/// 06 step 6: decrypt with the prekey seed (`decryption_failed` for every crypto failure); the content bytes, not yet
+/// decoded.
 package func decryptPlaintext(_ packet: Packet, seed: Data) throws -> Data {
     let key = try XWing.privateKey(seed)
     guard sha256Hex(Data(key.publicKey.rawRepresentation)) == packet.encryption.prekey else {
@@ -468,14 +391,12 @@ package func decryptPlaintext(_ packet: Packet, seed: Data) throws -> Data {
     let shared: SymmetricKey
     do { shared = try key.decapsulate(packet.kemCiphertext) } catch { throw ACEError(.decryptionFailed, "X-Wing decapsulation failed") }
     let header = packet.header, p = packet.payload
-    let plaintext: Data
     do {
         let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: p.prefix(12)), ciphertext: p.dropFirst(12).dropLast(16), tag: p.suffix(16))
-        plaintext = try AES.GCM.open(box, using: Packet.aeadKey(shared, header: header), authenticating: header)
+        return try AES.GCM.open(box, using: Packet.aeadKey(shared, header: header), authenticating: header)
     } catch {
         throw ACEError(.decryptionFailed, "AEAD authentication failed")
     }
-    return try Packet.unpad(plaintext)
 }
 
 /// `now - OFFLINE_WINDOW_SECONDS <= timestamp <= now + TIMESTAMP_WINDOW_SECONDS` (06 step 5), or `stale_timestamp`.

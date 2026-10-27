@@ -4,7 +4,7 @@
 //    ACEInterop gen-identity <dir> [--handle H] --now N
 //    ACEInterop create-packet <dir> --to-agent F --kind K --out P [--prekey-agent F2] [--message M] [--message-id ID]
 //                             [--ref-message-id ID] [--ref-prekey ID] [--code C] [--note N]
-//                             [--to-prekey B64] [--offer-prekey B64] --now N
+//                             [--to-prekey B64] --now N
 //    ACEInterop open-packet <dir> --from-agent F --packet P --out R --now N
 //    ACEInterop verify-card <card.json> --now N        (prints {"ok": true, aceId, handle?, contact, listed} or {"error": code})
 //
@@ -110,14 +110,7 @@ func createPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws 
     default:
         throw Failure(description: "unknown kind \(kind)")
     }
-    // The prekey offered to the recipient, or (--offer-prekey) arbitrary 1216 bytes for a tamper case.
-    let offered: Data
-    if let b64 = o["offer-prekey"] {
-        guard let raw = Data(base64Encoded: b64) else { throw Failure(description: "--offer-prekey is not Base64") }
-        offered = raw
-    } else {
-        offered = try vault(dir).offer(peer: to.aceId, now: now).publicKey
-    }
+    let offered = try vault(dir).offer(peer: to.aceId, now: now).publicKey  // the prekey offered to the recipient
     let packet = try createPacket(sender: identity, to: to.aceId, prekey: target, content: content.with(prekey: offered),
                                   messageId: o["message-id"] ?? UUID().uuidString.lowercased(), timestamp: now)
     try packet.jsonData().write(to: URL(fileURLWithPath: out))

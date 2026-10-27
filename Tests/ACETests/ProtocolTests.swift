@@ -47,7 +47,7 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
         let p = try sealPacket(sender: a.identity, from: a.aceId, to: b.aceId, messageId: id, timestamp: NOW, prekey: b.agent.descriptor.prekey.id,
                                plaintext: plaintext, sharedSecret: ss, kemCiphertext: kem, nonce: nonce)
         let key = HKDF<SHA256>.deriveKey(inputKeyMaterial: ss, salt: Data(), info: p.header, outputByteCount: 32)
-        let box = try AES.GCM.seal(Packet.pad(plaintext), using: key, nonce: nonce, authenticating: p.header)
+        let box = try AES.GCM.seal(plaintext, using: key, nonce: nonce, authenticating: p.header)
         #expect(p.payload == Data(nonce) + box.ciphertext + box.tag)
         try verifyPacketSignature(p, sender: a.state, now: NOW)
     }
@@ -98,55 +98,20 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
     }
 }
 
-/// 03 § Encryption: the plaintext is the content padded to a bucket; 03 § Private content: `prekey` is required.
-@Suite struct PaddingTests {
-    @Test(arguments: [(0, 4096), (4092, 4096), (4093, 8192), ((1 << 20) - 4, 1 << 20), ((1 << 20) - 3, 1_179_652),
-                      (ACELimits.maxPlaintextBytes, 1_179_652)])
-    func bucket(_ n: Int, _ b: Int) { #expect(Packet.plaintextBucket(n) == b) }
-
-    @Test func bucketSet() {
-        #expect(Packet.plaintextBuckets == Set((0...8).map { 4096 << $0 } + [ACELimits.maxPlaintextBytes + 4]))
-        #expect(ACELimits.minPlaintextBucket == 4096)
-    }
-
-    @Test func padUnpadRoundTrip() throws {
-        let c = Data(repeating: 0x78, count: 5000)
-        let p = Packet.pad(c)
-        #expect(p.count == 8192 && p.prefix(4) == Data([0, 0, 0x13, 0x88]) && p.suffix(8192 - 5004).allSatisfy { $0 == 0 })
-        #expect(try Packet.unpad(p) == c)
-        #expect(try Packet.unpad(Packet.pad(Data())) == Data())
-    }
-
-    @Test func unpadRejects() {
-        func u32(_ n: Int) -> Data { Data([UInt8(n >> 24 & 0xFF), UInt8(n >> 16 & 0xFF), UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF)]) }
-        func buf(_ size: Int, prefix n: Int) -> Data { var d = u32(n) + Data(repeating: 0x61, count: min(n, size - 4)); d.append(Data(count: size - d.count)); return d }
-        var nonZero = Packet.pad(Data("abc".utf8))
-        nonZero[4095] = 1
-        let cases: [(String, Data)] = [
-            ("not a bucket", Data(count: 4095)),
-            ("prefix past the end", buf(4096, prefix: 4093)),
-            ("prefix 5000 in 4096", buf(4096, prefix: 5000)),
-            ("bucket mismatch", buf(8192, prefix: 10)),
-            ("non-zero padding", nonZero),
-            ("prefix over MAX_PLAINTEXT_BYTES", buf(1_179_652, prefix: ACELimits.maxPlaintextBytes + 1)),
-        ]
-        for (label, pt) in cases { expectCode(.invalidBody, label) { try Packet.unpad(pt) } }
-    }
-
-    @Test func payloadLengthIsABucket() throws {
+/// 03 § Encryption: the payload bounds; 03 § Private content: `prekey` is required.
+@Suite struct PayloadTests {
+    @Test func payloadBounds() throws {
         let a = try TestAgent(), b = try TestAgent()
         let p = try createPacket(sender: a.identity, to: b.aceId, prekey: b.agent.descriptor.prekey, content: textContent(), timestamp: NOW)
-        #expect(p.payload.count == 4096 + 28)
+        #expect(p.payload.count == (try textContent().jsonData().count) + 28)
         func withPayload(_ n: Int) -> Data {
             mutate(p) { o in var e = o["encryption"]!.objectValue!; e["payload"] = .string(ACEBase64.encode(Data(count: n))); o["encryption"] = .object(e) }
         }
         expectCode(.invalidPacket) { try Packet(json: withPayload(27)) }
-        expectCode(.invalidPacket) { try Packet(json: withPayload(4096 + 27)) }
-        expectCode(.invalidPacket) { try Packet(json: withPayload(4096 + 29)) }
-        #expect(try Packet(json: withPayload(4096 + 28)).payload.count == 4096 + 28)
+        #expect(try Packet(json: withPayload(28)).payload.count == 28)
     }
 
-    /// Content of exactly `MAX_PLAINTEXT_BYTES` pads to the top bucket and its packet fits `MAX_PACKET_BYTES`.
+    /// Content of exactly `MAX_PLAINTEXT_BYTES` fits a packet of at most `MAX_PACKET_BYTES`.
     @Test func largestContentFitsAPacket() throws {
         let a = try TestAgent(), b = try TestAgent(), d = String(repeating: "a", count: 64)
         let key = somePrekey()
@@ -156,7 +121,7 @@ private func mutate(_ p: Packet, _ body: (inout [String: JSONValue]) -> Void) ->
         let c = try content(ACELimits.maxPlaintextBytes - (try content(0).jsonData().count))
         #expect(try c.jsonData().count == ACELimits.maxPlaintextBytes)
         let p = try createPacket(sender: a.identity, to: b.aceId, prekey: b.agent.descriptor.prekey, content: c, timestamp: NOW)
-        #expect(p.payload.count == 1_179_652 + 28 && p.jsonData().count <= ACELimits.maxPacketBytes)
+        #expect(p.payload.count == ACELimits.maxPlaintextBytes + 28 && p.jsonData().count <= ACELimits.maxPacketBytes)
         #expect(try openPacket(Packet(json: p.jsonData()), sender: a.state, recipient: b.aceId, vault: b.vault) == c)
         expectCode(.limitExceeded) { try content(ACELimits.maxPlaintextBytes - (try content(0).jsonData().count) + 1).jsonData() }
     }
