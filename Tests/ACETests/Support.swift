@@ -37,7 +37,7 @@ func openPacket(_ packet: Packet, sender: KelState, recipient: String, vault: an
     guard packet.to == recipient else { throw ACEError(.wrongRecipient) }
     try verifyPacketSignature(packet, sender: sender, now: now)
     try checkPacketTime(packet, now: now)
-    guard let seed = try vault.open(packet.encryption.prekey, now: now) else { throw ACEError(.unknownPrekey) }
+    guard let seed = try vault.open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
     return try decryptPacket(packet, seed: seed)
 }
 
@@ -152,7 +152,7 @@ struct NetPeer {
             received.value.append(m)
         }
         let network = try await NetworkClient.open(identity: identity, store: store, relay: try relay.client(clock: clock.fn),
-                                                   prekeys: StorePrekeyVault(store: store), configuration: config,
+                                                   prekeys: StorePrekeyVault(store: store, protection: testPrekeyProtection), configuration: config,
                                                    foreignRelay: { _ in throw ACEError(.blockedAddress) }, clock: clock.fn, capacity: capacity)
         try await network.publish()  // registers on demand
         return NetPeer(identity: identity, store: store, network: network, received: received)

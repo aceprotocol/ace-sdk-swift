@@ -341,11 +341,11 @@ package actor Inbox {
         let now = try now()
         try verifyPacketSignature(packet, sender: state, now: now)
         try checkPacketTime(packet, now: now)
-        // 6. decrypt (an unknown prekey or an unparsable plaintext is rejected; the type is not known yet)
+        // 6. decrypt (an unknown prekey or an unparsable plaintext is rejected; the type is not known yet). A storage
+        // failure of the vault is a retry.
         let content: PrivateContent
         do {
-            guard let seed = try network.prekeys.open(packet.encryption.prekey, now: now) else { throw ACEError(.unknownPrekey) }
-            content = try decryptPacket(packet, seed: seed)
+            content = try PrivateContent(json: try decrypt(packet, now: now))
         } catch let e as ACEError where e.code == .unknownPrekey || e.code == .invalidBody {
             // L1: an unknown_prekey rejection names the prekey it could not open (06 § Receipts).
             try await sendReceipt(to: packet.from, messageId: packet.messageId, outcome: "rejected", code: e.outcomeCode,
@@ -355,13 +355,28 @@ package actor Inbox {
         return try await authenticated(packet, content: content, state: state, record: record, now: now)
     }
 
-    /// Steps 7–11 for an authenticated, decrypted packet. A message's `admission` (never on a core packet: decoding refuses
-    /// it, 03 § Private content) has its reply permit held like a receipt renewal (05 § Admission recovery) and never
-    /// reaches the host.
+    /// Step 6 (`unknown_prekey`, `decryption_failed`, `invalid_body` for bad padding), then the issuer rule (04 § Peer
+    /// prekeys): a packet that opened under the key we offered `from` makes it the in-use key, whatever its disposition from
+    /// step 7 on. The content bytes, not yet decoded.
+    private func decrypt(_ packet: Packet, now: Int) throws -> Data {
+        guard let seed = try network.prekeys.open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
+        let plaintext = try decryptPlaintext(packet, seed: seed)
+        try network.prekeys.used(peer: packet.from, prekeyId: packet.encryption.prekey, now: now)
+        return plaintext
+    }
+
+    /// Steps 7–11 for an authenticated, decrypted packet (`state`: the sender's pin, from step 3 or the recovery path). The
+    /// holder rule first (04 § Peer prekeys): the key the content offers is held for the sender under that pin when the
+    /// packet is newer than the one that carried the held key (a duplicate records too); contact packets record nothing.
+    /// A message's `admission` (never on a core packet: decoding refuses it, 03 § Private content) has its reply permit
+    /// held like a receipt renewal (05 § Admission recovery) and never reaches the host; neither does `prekey`.
     private func authenticated(_ packet: Packet, content carried: PrivateContent, state: KelState, record: AdmissionRecord?,
                                now: Int) async throws -> ReceiveOutcome {
         let me = identity.getACEId()
         let core = carried.type == CoreTypes.receipt || carried.type == CoreTypes.contact
+        if carried.type != CoreTypes.contact, let offered = carried.prekey {
+            try network.prekeys.hold(peer: packet.from, prekey: try Prekey(publicKey: offered), timestamp: packet.timestamp, pin: state.lastHash)
+        }
         var content = carried.with(admission: nil)
         content.prekey = nil  // the offered peer prekey never reaches the host
         do {
@@ -567,9 +582,10 @@ package actor Inbox {
     private func unauthenticated(_ packet: Packet, record: AdmissionRecord?, recoverable: Bool) async throws -> ReceiveOutcome {
         let now = try now()
         guard (try? checkPacketTime(packet, now: now)) != nil else { return .dropped(.staleTimestamp) }
-        guard let seed = try network.prekeys.open(packet.encryption.prekey, now: now) else { return .dropped(.unknownPrekey) }
         let content: PrivateContent
-        do { content = try decryptPacket(packet, seed: seed) } catch let e as ACEError where e.category == .permanent { return .dropped(e.code) }
+        do { content = try PrivateContent(json: try decrypt(packet, now: now)) } catch let e as ACEError where e.category == .permanent {
+            return .dropped(e.code)
+        }
         if recoverable, let admission = content.admission, validProof(admission.proof, from: packet.from, now: now) {
             return try await recovered(packet, content: content, admission: admission, now: now)
         }

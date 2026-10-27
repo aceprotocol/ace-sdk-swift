@@ -48,6 +48,7 @@ import Testing
         let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
         let (alice, bob) = try await reinstalled(relay, clock)
         _ = try await alice.network.agent(bob.aceId, refresh: true)  // Bob's new prekey: the first attempt is readable
+        try alice.network.prekeys.dropHeld(peer: bob.aceId)  // and not the peer prekey the old install offered
         _ = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "first"])
         #expect(try await bob.network.pull() == [.dropped(.notPermitted)])
         #expect(try bob.network.admission.get(alice.aceId) == nil)

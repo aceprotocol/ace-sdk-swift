@@ -16,7 +16,7 @@ One library product, `ACE`. No binary or chain dependencies (CryptoKit only).
 | Layer | API |
 |---|---|
 | Identity | `SoftwareIdentity`, `SecureEnclaveIdentity` (an `ml-dsa-65` root, a committed next root, one delegated `ml-dsa-65` signing key), `ACEKel`, `checkUsable`; exports hold no encryption seed (`jsonData()` / `init(json:)`) |
-| Prekeys | `PrekeyVault` (`current`, `rotate(now:)`, `open(_:now:)`, `prune(now:)`), `StorePrekeyVault(store:protection:)` over `MemoryStore` / `FileStore`, `.secureEnclave` seals seeds with Secure Enclave ML-KEM |
+| Prekeys | `PrekeyVault` (`current`, `rotate(now:)`, `open(_:sender:now:)`, `prune(now:)`; peer prekeys: `offer`, `used`, `hold`, `held`, `dropHeld`), `StorePrekeyVault(store:protection:)` over `MemoryStore` / `FileStore`, `.secureEnclave` seals seeds (published and peer) with Secure Enclave ML-KEM |
 | Packet | `createPacket`, `Packet(json:)`, `verifyPacketSignature`, `decryptPacket`, `PrivateContent`, `conversationKey` |
 | Documents | `createPublishedAgent` / `verifyPublishedAgent` (`DescriptorClaims`), `createCardRecord` / `verifyCardBundle` (`CardRecord`, `AgentCard`, `Contact`), `createDelegation` / `verifyDelegation`, `createPermit` / `verifyPermit` (30 days), `ERC8004Binding`, `verifyErc8004Registration` |
 | Profiles | `ProfileManifest` (`.core`, `.text`, `.commerce`, bundled as resources byte-identical to `ace-spec/profiles`), `InstalledProfiles`, `ProfileRules` |

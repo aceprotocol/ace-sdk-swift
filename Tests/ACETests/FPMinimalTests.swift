@@ -39,9 +39,10 @@ private final class Gate: PacketTransport, @unchecked Sendable {
 
     init(_ prekey: Prekey) { prekeyValue = prekey }
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
-    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {
+    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey {
         posts.value += 1
         await withCheckedContinuation { c in lock.withLock { continuation = c } }
+        return prekey
     }
     var waiting: Bool { lock.withLock { continuation != nil } }
     func release() { lock.withLock { continuation?.resume(); continuation = nil } }
@@ -338,7 +339,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Slow: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { try await Task.sleep(for: .seconds(60)); throw ACEError(.relayUnavailable, "late") }
-            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {}
+            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         let stopped = Task { try await outbox.deliver(e.messageId, via: Slow()) }
         #expect(await settles { try! await outbox.entry(e.messageId)?.inFlightUntil != nil })
@@ -363,7 +364,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Bad: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { throw ACEError(.invalidArgument, "bad prekey") }
-            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {}
+            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         let done = try await outbox.deliver(e.messageId, via: Bad())
         #expect(done.status == .rejected && done.code == "invalid_argument" && done.settledAt == NOW)
@@ -565,7 +566,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Capped: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { throw ACEError(.limitExceeded, "relay cap") }
-            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {}
+            func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         let done = try await outbox.deliver(e.messageId, via: Capped())
         #expect(done.status == .pending && done.lastError?.contains("limit_exceeded") == true, "\(done)")

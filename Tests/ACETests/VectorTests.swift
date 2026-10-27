@@ -37,17 +37,25 @@ private func codeOf(_ body: () throws -> Void) -> String? {
 
 private func expected(_ c: JSONValue, _ key: String = "error") -> String? { c[key]?.stringValue }
 
-/// A vault holding exactly one seed (the vector prekey).
-private struct OneSeedVault: PrekeyVault {
-    let seed: Data
-    var id: String { sha256Hex(try! XWing.publicKey(fromSeed: seed)) }
-    func current() throws -> PrekeyRecord? { PrekeyRecord(prekey: try Prekey(publicKey: XWing.publicKey(fromSeed: seed)), createdAt: 0, supersededAt: nil) }
-    func rotate(now: Int) throws -> PrekeyRecord { try current()! }
-    func open(_ prekeyId: String, now: Int) throws -> Data? { prekeyId == id ? seed : nil }
-    func prune(now: Int) throws {}
+/// A vault holding the vector prekey seed as its current published prekey and, per `peerSeeds` entry, the peer prekey
+/// offered to that peer (offeredAt = the vectors' `now`, nothing in use or held): the `prekeys.json` document, version 2.
+private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVault {
+    func entry(_ seedHex: String, _ at: String, _ t: Int) throws -> JSONValue {
+        let seed = hex(seedHex)
+        return .object(["prekey": try Prekey(publicKey: XWing.publicKey(fromSeed: seed)).jsonValue, at: .number(Double(t)),
+                        "secret": ["seed": .string(ACEBase64.encode(seed))]])
+    }
+    var peers: [String: JSONValue] = [:]
+    for (peer, seed) in peerSeeds?.objectValue ?? [:] {
+        peers[peer] = ["offered": try entry(seed.s, "offeredAt", VNOW), "inUse": .null, "held": .null]
+    }
+    let store = MemoryStore()
+    try store.write("prekeys.json", try JSONValue.object([
+        "version": 2, "current": try entry(V["packet"]!["deterministic"]!["prekeySeed"]!.s, "createdAt", VNOW), "retained": .array([]),
+        "peers": .object(peers),
+    ]).jsonData())
+    return StorePrekeyVault(store: store)
 }
-
-private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]!["prekeySeed"]!.s))
 
 @Suite struct VectorTests {
     @Test func agentsLoadFromTheirExports() throws {
@@ -234,7 +242,7 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
         let enc = d["packet"]!["encryption"]!
         #expect(made.encryption == PacketEncryption(prekey: enc["prekey"]!.s, kemCiphertext: enc["kemCiphertext"]!.s, payload: enc["payload"]!.s))
         for packet in [made, try Packet(json: d["packet"]!.data)] {
-            let opened = try openPacket(packet, sender: try stateOf("alice"), recipient: bob, vault: vectorVault, now: VNOW)
+            let opened = try openPacket(packet, sender: try stateOf("alice"), recipient: bob, vault: try vectorVault(), now: VNOW)
             #expect(opened == content)
         }
     }
@@ -247,12 +255,12 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
     }
 
     @Test func packetOpen() {
-        // Task 11: a `peerSeeds` case needs the vault's peer prekeys (`open(_:sender:now:)`); skipped until then.
-        for c in V["packet"]!["open"]!.a where c["peerSeeds"] == nil {
+        for c in V["packet"]!["open"]!.a {
             let now = c["now"]!.i
             let got = codeOf {
                 let p = try Packet(json: c["packet"]!.data)
-                _ = try openPacket(p, sender: try stateOf(c["sender"]!.s, now), recipient: agentId(c["recipient"]!.s), vault: vectorVault, now: now)
+                _ = try openPacket(p, sender: try stateOf(c["sender"]!.s, now), recipient: agentId(c["recipient"]!.s),
+                            vault: try vectorVault(c["peerSeeds"]), now: now)
             }
             #expect(got == expected(c), "\(label(c))")
         }
@@ -484,21 +492,22 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
     // MARK: receive pipeline
 
     @Test func receivePipeline() async throws {
-        // Task 11: `peerSeeds` / `vaultAfter` cases need the vault's peer prekeys; skipped until then.
-        for c in V["pipeline"]!["cases"]!.a where c["peerSeeds"] == nil && c["vaultAfter"] == nil {
-            let clock = TestClock(VNOW), store = MemoryStore()
+        for c in V["pipeline"]!["cases"]!.a {
+            let clock = TestClock(VNOW), store = MemoryStore(), vault = try vectorVault(c["peerSeeds"])
             let sent = LockedValue<[JSONValue]>([])
             // One recording relay stands for every route: the receipts the receiver posts.
             let relay = try makeRelay({ req, body in
                 if req.url!.path == "/v1/send", let v = try? JSONValue(json: body) { sent.value.append(v) }
                 return .json(200, ["ok": true] as JSONValue)
             }, clock: clock.fn)
-            let network = try await NetworkClient.open(identity: try identity(c["receiver"]!.s), store: store, relay: relay, prekeys: vectorVault,
+            let network = try await NetworkClient.open(identity: try identity(c["receiver"]!.s), store: store, relay: relay, prekeys: vault,
                                                        configuration: NetworkConfiguration(contact: c["contact"]!.s == "open" ? .open : .closed),
                                                        foreignRelay: { _ in relay }, clock: clock.fn, capacity: c["capacity"]!.i)
             if c["contact"]!.s == "open" { try await network.publish() }  // its own card record is open
+            var pins: [String: String] = [:]  // the receiver's pin per admitted peer: its last KEL event digest
             for (_, source) in c["admitted"]!.o {
                 let agent = try await network.peers.adopt(source: source)
+                pins[agent.aceId] = agent.state.lastHash
                 try network.admission.update(agent.aceId) { _ in AdmissionRecord(aceId: agent.aceId, state: .admitted, updatedAt: 0) }
             }
             let inbox = try #require(await network.inbox)
@@ -518,6 +527,21 @@ private let vectorVault = OneSeedVault(seed: hex(V["packet"]!["deterministic"]![
                 #expect((sent.value.count > before) == !want["receipt"]!.isNull, "\(label(c)) step \(i): receipt")
             }
             await network.close()
+            if let after = c["vaultAfter"] {
+                // peers[peer].inUse is that key; the key offered to peer (a receipt offers a fresh one) is another
+                let peer = after["peer"]!.s, inUse = after["inUse"]!.s, now = clock.now
+                let doc = try #require(try vault.document())
+                #expect(doc["peers"]?[peer]?["inUse"]?["prekey"]?["id"]?.stringValue == inUse, "\(label(c))")
+                #expect(doc["peers"]?[peer]?["offered"]?["prekey"]?["id"]?.stringValue != inUse, "\(label(c))")
+                #expect(try vault.open(inUse, sender: peer, now: now) != nil, "\(label(c))")
+                let other = V["agents"]!.o.values.map { $0["aceId"]!.s }.first { $0 != peer }!
+                #expect(try vault.open(inUse, sender: other, now: now) == nil, "\(label(c))")
+                if let h = after["held"] {
+                    let got = try vault.held(peer: peer, pin: try #require(pins[peer]), now: now)
+                    #expect(got.map { ACEBase64.encode($0.publicKey) } == h["publicKey"]!.s, "\(label(c))")
+                    #expect(doc["peers"]?[peer]?["held"]?["timestamp"]?.wireInt == h["timestamp"]!.i, "\(label(c))")
+                }
+            }
         }
     }
 

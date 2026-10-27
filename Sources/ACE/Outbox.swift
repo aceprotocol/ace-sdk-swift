@@ -3,8 +3,8 @@
 //  ACE SDK
 //
 //  Sender durability (06 § Outbox). Each message is stored as `{messageId, to, privateContent, createdAt}` plus its
-//  attempt state. Every attempt re-encrypts to the peer's current prekey and re-signs at the current time; `messageId`
-//  never changes. Retries back off `min(60·2^(n-1), 3600)` s until a receipt arrives or `OFFLINE_WINDOW_SECONDS` have
+//  attempt state. Every attempt re-encrypts (the first to the peer prekey held for the peer, when there is one, every
+//  other to its current published prekey) and re-signs at the current time; `messageId` never changes. Retries back off `min(60·2^(n-1), 3600)` s until a receipt arrives or `OFFLINE_WINDOW_SECONDS` have
 //  passed since the first attempt (`expired`). A relay `{ok: true}` is not delivery. `expired` (or abandoned) means the
 //  sender stopped retrying, the outcome is unknown: a late receipt still settles the entry.
 //
@@ -15,9 +15,18 @@ import Foundation
 package protocol PacketTransport: Sendable {
     /// The peer's current prekey from a valid descriptor; `refresh` forces a descriptor refresh first.
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey
-    /// Encrypt `content` to `prekey`, sign it now and post it to the peer's relays (one attempt). `retry`: an attempt after
-    /// the first, which carries `admission` (05 § Admission recovery).
-    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws
+    /// Encrypt `content`, offering our peer prekey for `aceId`, sign it now and post it to the peer's relays (one attempt).
+    /// `prekey` is the peer's published prekey; the first attempt (`attempts == 0`) goes to the peer prekey held for it
+    /// instead, when there is one (06 § Outbox step 2). An attempt after the first carries `admission` (05 § Admission
+    /// recovery). Returns the prekey the packet was encrypted to.
+    @discardableResult
+    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey
+    /// A `rejected:unknown_prekey` named `prekeyId`: when that is the peer prekey held for `aceId`, drop it and return true.
+    func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool
+}
+
+extension PacketTransport {
+    package func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
 }
 
 public enum OutboxStatus: String, Sendable {
@@ -236,21 +245,23 @@ public actor Outbox {
             return current
         }
         let refreshAtStart = e.refreshPrekey
-        var failure: ACEError?, posted: Prekey?
+        var failure: ACEError?, posted: Prekey?, heldRejected = false
         do {
+            // 04 § Peer prekeys: a rejection naming the peer prekey held for `to` drops it; the retry then goes to the
+            // published prekey like any other retry (no forced refresh: the published one was not refused).
+            if e.refreshPrekey, let last = e.lastPrekey { heldRejected = try await transport.dropHeld(e.to, ifId: last) }
+            let refresh = e.refreshPrekey && !heldRejected
             // Every retry refreshes the descriptor (the peer may have lost its prekeys with its state); if that fails, a
             // cached one still unexpired and bound to the pins is used (06 § Outbox step 1).
-            let retry = e.attempts > 0
             let prekey: Prekey
-            if retry, !e.refreshPrekey, let fresh = try? await transport.prekey(for: e.to, refresh: true) {
+            if e.attempts > 0, !refresh, let fresh = try? await transport.prekey(for: e.to, refresh: true) {
                 prekey = fresh
             } else {
-                prekey = try await transport.prekey(for: e.to, refresh: e.refreshPrekey)
+                prekey = try await transport.prekey(for: e.to, refresh: refresh)
             }
             // The peer refused the prekey that is still its current one: final.
-            if e.refreshPrekey, prekey.id == e.lastPrekey { throw ACEError(.unknownPrekey, "the peer refused its current prekey") }
-            try await transport.post(to: e.to, content: e.content, messageId: e.messageId, prekey: prekey, retry: retry)
-            posted = prekey
+            if refresh, prekey.id == e.lastPrekey { throw ACEError(.unknownPrekey, "the peer refused its current prekey") }
+            posted = try await transport.post(to: e.to, content: e.content, messageId: e.messageId, prekey: prekey, attempts: e.attempts)
         } catch let err as ACEError {
             failure = err
         } catch {
@@ -287,6 +298,7 @@ public actor Outbox {
             } else if let failure {
                 e.lastError = "\(failure)"
             }
+            if heldRejected { e.refreshPrekey = false }  // a rejection of the held key is settled once it is dropped
             if current.refreshPrekey && !refreshAtStart {
                 // Keep the refused prekey, its code and the immediate retry.
                 e.refreshPrekey = true

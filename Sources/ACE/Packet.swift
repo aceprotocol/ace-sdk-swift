@@ -244,28 +244,31 @@ public struct Packet: Sendable, Equatable {
         return b
     }
 
-    /// `u32be(len(content)) ‖ content ‖ zeros` to `plaintextBucket(len(content))` (`content` at most `MAX_PLAINTEXT_BYTES`).
+    /// `u32be(len(content)) ‖ content ‖ zeros` to `plaintextBucket(len(content))`; `content` must be at most
+    /// `MAX_PLAINTEXT_BYTES` (`sealPacket` checks it: `limit_exceeded`).
     package static func pad(_ content: Data) -> Data {
         let n = content.count
-        var out = Data(capacity: plaintextBucket(n))
+        precondition(n <= ACELimits.maxPlaintextBytes, "Packet.pad: content exceeds MAX_PLAINTEXT_BYTES")
+        let bucket = plaintextBucket(n)
+        var out = Data(capacity: bucket)
         out.append(contentsOf: [UInt8(truncatingIfNeeded: n >> 24), UInt8(truncatingIfNeeded: n >> 16), UInt8(truncatingIfNeeded: n >> 8),
                                 UInt8(truncatingIfNeeded: n)])
         out.append(content)
-        out.append(Data(count: plaintextBucket(n) - out.count))
+        out.append(Data(count: bucket - out.count))
         return out
     }
 
     /// The content inside a padded plaintext; `invalid_body` unless its length is a bucket, the prefix is at most
     /// `MAX_PLAINTEXT_BYTES` and fits, the bucket is the one the prefix implies and the padding is all zero.
-    package static func unpad(_ plaintext: Data) throws -> Data {
-        let p = Data(plaintext)  // zero-based indices
+    package static func unpad(_ p: Data) throws -> Data {
         guard plaintextBuckets.contains(p.count) else { throw ACEError(.invalidBody, "plaintext padding is invalid") }
         let n = p.prefix(lengthPrefixBytes).reduce(0) { $0 << 8 | Int($1) }
+        let start = p.startIndex + lengthPrefixBytes  // a slice keeps its parent's indices
         guard n <= ACELimits.maxPlaintextBytes, lengthPrefixBytes + n <= p.count, plaintextBucket(n) == p.count,
-              p[(lengthPrefixBytes + n)...].allSatisfy({ $0 == 0 }) else {
+              p[(start + n)...].allSatisfy({ $0 == 0 }) else {
             throw ACEError(.invalidBody, "plaintext padding is invalid")
         }
-        return p.subdata(in: lengthPrefixBytes..<(lengthPrefixBytes + n))
+        return p.subdata(in: start..<(start + n))
     }
 
     public let messageId: String
@@ -400,6 +403,9 @@ public func createPacket(sender: any ACEIdentity, to: String, prekey: Prekey, co
 /// `Packet.pad(plaintext)`, `plaintext` being the content's canonical JSON.
 package func sealPacket(sender: any ACEIdentity, from: String, to: String, messageId: String, timestamp: Int, prekey: String, plaintext: Data,
                         sharedSecret: SymmetricKey, kemCiphertext: Data, nonce: AES.GCM.Nonce = AES.GCM.Nonce()) throws -> Packet {
+    guard plaintext.count <= ACELimits.maxPlaintextBytes else {
+        throw ACEError(.limitExceeded, "private content exceeds \(ACELimits.maxPlaintextBytes) bytes")
+    }
     let header = Packet.header(from: from, to: to, messageId: messageId, timestamp: timestamp, prekey: prekey, kemCiphertext: kemCiphertext)
     let payload = try Packet.seal(Packet.pad(plaintext), sharedSecret: sharedSecret, header: header, nonce: nonce)
     let signature = try operationalSign(sender, action: "packet", timestamp: timestamp,
@@ -421,6 +427,12 @@ public func verifyPacketSignature(_ packet: Packet, sender: KelState, now: Int) 
 /// Decrypt with the prekey seed (`decryption_failed` for every crypto failure), then unpad and decode the private content
 /// (`invalid_body`).
 public func decryptPacket(_ packet: Packet, seed: Data) throws -> PrivateContent {
+    try PrivateContent(json: try decryptPlaintext(packet, seed: seed))
+}
+
+/// 06 step 6: decrypt with the prekey seed (`decryption_failed` for every crypto failure) and unpad (`invalid_body`); the
+/// content bytes, not yet decoded.
+package func decryptPlaintext(_ packet: Packet, seed: Data) throws -> Data {
     let key = try XWing.privateKey(seed)
     guard sha256Hex(Data(key.publicKey.rawRepresentation)) == packet.encryption.prekey else {
         throw ACEError(.decryptionFailed, "seed is not the packet's prekey")
@@ -435,7 +447,7 @@ public func decryptPacket(_ packet: Packet, seed: Data) throws -> PrivateContent
     } catch {
         throw ACEError(.decryptionFailed, "AEAD authentication failed")
     }
-    return try PrivateContent(json: try Packet.unpad(plaintext))
+    return try Packet.unpad(plaintext)
 }
 
 /// `now - OFFLINE_WINDOW_SECONDS <= timestamp <= now + TIMESTAMP_WINDOW_SECONDS` (06 step 5), or `stale_timestamp`.

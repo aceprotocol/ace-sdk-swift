@@ -609,20 +609,25 @@ public actor NetworkClient: PacketTransport {
 
     /// One Outbox attempt. It carries the peer's newest permit valid under its current pin; without one it is
     /// `not_permitted` (retried on the schedule until a renewal or refresh) and never falls back to the stranger path
-    /// (06 § Outbox step 3). A retry to an admitted peer also carries `admission`: that permit as the proof, a reply
+    /// (06 § Outbox step 3). The first attempt goes to the peer prekey held for `aceId` under its current pin, when there is
+    /// one, else (and every later attempt) to `published`; every packet offers our peer prekey for `aceId` (06 § Outbox
+    /// step 2, 04 § Peer prekeys). A retry to an admitted peer also carries `admission`: that permit as the proof, a reply
     /// permit and our PublishedAgent, so a peer that lost its admission table recovers us without a lookup (05 § Admission
     /// recovery); left out when the content would outgrow `MAX_PLAINTEXT_BYTES`.
-    package func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, retry: Bool) async throws {
+    @discardableResult
+    package func post(to aceId: String, content: PrivateContent, messageId: String, prekey published: Prekey, attempts: Int) async throws -> Prekey {
         let agent = try await agent(aceId)
         guard let permit = try validTheirPermit(aceId, agent.state) else { throw noValidPermit }
-        // Task 11: the vault's `offer(peer:now:)` key; a throwaway one until then.
-        var sent = content.with(prekey: try XWing.publicKey(fromSeed: XWing.generateSeed()))
+        let now = try now(), retry = attempts > 0
+        var prekey = published
+        if !retry, let pin = try await peers.pinned(aceId), let held = try prekeys.held(peer: aceId, pin: pin.lastHash, now: now) { prekey = held }
+        var sent = content.with(prekey: try prekeys.offer(peer: aceId, now: now).publicKey)
         let reply = retry ? try replyPermit(for: aceId) : nil
         if let reply, let source = currentSource() {
             let carried = sent.with(admission: Admission(proof: permit, permit: reply.permit, source: source))
             if (try? carried.jsonData()) != nil { sent = carried }
         }
-        let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: try now())
+        let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: now)
         do {
             try await onRoutes(agent.descriptor.relays) { try await $0.send(packet, permit: permit) }
         } catch let e as ACEError where e.code == .notPermitted {
@@ -630,6 +635,17 @@ public actor NetworkClient: PacketTransport {
             throw noValidPermit
         }
         if let reply, reply.fresh, sent.admission != nil { try admission.noteIssued(aceId, permit: reply.permit) }
+        return prekey
+    }
+
+    /// A `rejected:unknown_prekey` named `prekeyId`: when that is the peer prekey held for `aceId` (under its current pin),
+    /// it is dropped (04 § Peer prekeys) and the answer is true.
+    package func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool {
+        guard let pin = try await peers.pinned(aceId), try prekeys.held(peer: aceId, pin: pin.lastHash, now: try now())?.id == prekeyId else {
+            return false
+        }
+        try prekeys.dropHeld(peer: aceId)
+        return true
     }
 
     /// Our last published PublishedAgent for a retry's `admission`, while unexpired (upkeep republishes it before then);
@@ -656,9 +672,10 @@ public actor NetworkClient: PacketTransport {
                           permit explicit: JSONValue? = nil) async throws {
         let target: VerifiedAgent
         if let agent { target = agent } else { target = try await self.agent(aceId) }
-        // Task 11: the vault's `offer(peer:now:)` key; a throwaway one until then.
-        let content = try profiles.content(type: type, body: body).with(prekey: try XWing.publicKey(fromSeed: XWing.generateSeed()))
-        let packet = try createPacket(sender: identity, to: aceId, prekey: target.descriptor.prekey, content: content, timestamp: try now())
+        // Receipts and contacts go to the published prekey and offer our peer prekey like every packet (04 § Peer prekeys).
+        let now = try now()
+        let content = try profiles.content(type: type, body: body).with(prekey: try prekeys.offer(peer: aceId, now: now).publicKey)
+        let packet = try createPacket(sender: identity, to: aceId, prekey: target.descriptor.prekey, content: content, timestamp: now)
         let permit = try explicit ?? validTheirPermit(aceId, target.state)
         try await onRoutes(target.descriptor.relays) { try await $0.send(packet, permit: permit) }
     }
@@ -853,7 +870,8 @@ public actor NetworkClient: PacketTransport {
         try? await sendContact("rejected", to: aceId, profile: request.profile, source: source, agent: agent, deliveryPermit: request.permit)
     }
 
-    /// Block `aceId`: at once locally (the enforcement point; it survives restart) and its held request is dropped, then
+    /// Block `aceId`: at once locally (the enforcement point; it survives restart), its held request and the peer prekey held
+    /// for it are dropped, then
     /// at the home relay (its permits stop working there). A relay failure does not throw: `maintain` registers
     /// the block again.
     public func block(_ aceId: String) async throws {
@@ -863,6 +881,7 @@ public actor NetworkClient: PacketTransport {
             r.state = .blocked
             return r
         }
+        try prekeys.dropHeld(peer: aceId)  // 04 § Peer prekeys: nothing is sent to it, and the key is not kept
         await registerBlock(record)
     }
 

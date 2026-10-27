@@ -146,6 +146,8 @@ final class FakeRelay: @unchecked Sendable {
     private var wakes: [String: (gateway: String, token: String)] = [:]
     private var seq = 0
     private(set) var sends: [String] = []
+    /// Every packet `/v1/send` parsed, in order (accepted or not): the wire facts tests assert on.
+    private var postedPackets: [Packet] = []
     private(set) var requests: [String] = []
     /// When set, `/v1/send` answers this status/code once.
     var failSend: (Int, String)?
@@ -176,6 +178,12 @@ final class FakeRelay: @unchecked Sendable {
     /// The wake registration `aceId` holds (nil when none).
     func wake(_ aceId: String) -> (gateway: String, token: String)? { withLock { wakes[aceId] } }
     func registered(_ aceId: String) -> KelState? { withLock { kels[aceId] } }
+    /// The number of packets posted so far (a mark for `posted(since:from:to:)`).
+    var postedCount: Int { withLock { postedPackets.count } }
+    /// The packets posted from `from` to `to` since mark `n`.
+    func posted(since n: Int, from: String, to: String) -> [Packet] {
+        withLock { postedPackets[n...].filter { $0.from == from && $0.to == to } }
+    }
     func sendCount(to aceId: String) -> Int { withLock { sends.filter { $0 == aceId }.count } }
     /// The stored card bundle of `aceId`.
     func card(_ aceId: String) -> JSONValue? { withLock { cards[aceId] } }
@@ -263,6 +271,7 @@ final class FakeRelay: @unchecked Sendable {
                 guard let pv = body?["packet"], let packet = try? Packet(json: try pv.jsonData()) else { return err(400, "invalid_packet") }
                 guard kels[packet.to] != nil else { return err(404, "unknown_peer") }
                 sends.append(packet.to)
+                postedPackets.append(packet)
                 if let f = failSend { failSend = nil; return err(f.0, f.1) }
                 let bytes = packet.jsonData()
                 if queues[packet.to]?.contains(where: { $0.packet == bytes }) == true { return ok }
