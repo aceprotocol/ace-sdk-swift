@@ -71,12 +71,18 @@ public enum XWing {
         Data(try privateKey(seed).publicKey.rawRepresentation)
     }
 
-    /// True when `raw` is 1216 bytes that decode as an X-Wing public key. CryptoKit accepts an ML-KEM-768 key with
-    /// out-of-range coefficients at construction, so a trial encapsulation (its result discarded) checks it too.
+    /// True when `raw` is 1216 bytes whose ML-KEM-768 half (the first 1184 bytes) is a valid FIPS 203 encapsulation key.
+    /// CryptoKit accepts out-of-range coefficients at construction, so a trial encapsulation with that ML-KEM key alone
+    /// (its result discarded) checks the modulus. Any 32 bytes are an X25519 half: no small-order or all-zero check
+    /// (03 § X-Wing).
     public static func isPublicKey(_ raw: Data) -> Bool {
-        guard raw.count == ACELimits.kemPublicKeySize, let key = try? XWingMLKEM768X25519.PublicKey(rawRepresentation: raw) else { return false }
+        guard raw.count == ACELimits.kemPublicKeySize,
+              let key = try? MLKEM768.PublicKey(rawRepresentation: raw.prefix(mlkemPublicKeySize)) else { return false }
         return (try? key.encapsulate()) != nil
     }
+
+    /// The ML-KEM-768 half of an X-Wing public key (`pk_M ‖ pk_X`).
+    private static let mlkemPublicKeySize = 1184
 
     package static func privateKey(_ seed: Data) throws -> XWingMLKEM768X25519.PrivateKey {
         guard seed.count == ACELimits.kemSeedSize else { throw ACEError(.invalidArgument, "X-Wing seed must be 32 bytes") }

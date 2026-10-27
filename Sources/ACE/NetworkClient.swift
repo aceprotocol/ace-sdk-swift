@@ -627,7 +627,16 @@ public actor NetworkClient: PacketTransport {
             let carried = sent.with(admission: Admission(proof: permit, permit: reply.permit, source: source))
             if (try? carried.jsonData()) != nil { sent = carried }
         }
-        let packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: now)
+        let packet: Packet
+        do {
+            packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: now)
+        } catch let e as ACEError where e.code == .invalidArgument && prekey != published {
+            // The held key does not encapsulate (e.g. CryptoKit refuses its X25519 half): drop it and use the published
+            // prekey in this same attempt. A failure with the published prekey is reported as before.
+            try prekeys.dropHeld(peer: aceId)
+            prekey = published
+            packet = try createPacket(sender: identity, to: aceId, prekey: prekey, content: sent, messageId: messageId, timestamp: now)
+        }
         do {
             try await onRoutes(agent.descriptor.relays) { try await $0.send(packet, permit: permit) }
         } catch let e as ACEError where e.code == .notPermitted {

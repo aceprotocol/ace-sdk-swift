@@ -18,6 +18,9 @@ private let PIN = String(repeating: "a", count: 64), OTHER_PIN = String(repeatin
 
 private func freshKey() throws -> Prekey { try Prekey(publicKey: somePrekey()) }
 
+/// A valid ML-KEM-768 half followed by an all-zero X25519 half.
+private func zeroX25519Key() -> Data { somePrekey().prefix(1184) + Data(count: 32) }
+
 private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromSeed: try #require(seed)) }
 
 @Suite struct PeerPrekeyVaultTests {
@@ -159,6 +162,15 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
                                     "held": ["publicKey": .string(ACEBase64.encode(bad)), "timestamp": .number(Double(T)), "pin": .string(PIN)]]])
         try store.write("prekeys.json", try JSONValue.object(doc).jsonData())
         expectCode(.storageFailed) { _ = try v.held(peer: A, pin: PIN, now: T) }
+    }
+
+    /// Only the ML-KEM-768 half is checked: an all-zero X25519 half is a valid X-Wing public key (03 § X-Wing).
+    @Test func anAllZeroX25519HalfIsAPublicKey() throws {
+        let key = zeroX25519Key()
+        #expect(XWing.isPublicKey(key))
+        #expect(try Prekey(publicKey: key).publicKey == key)
+        let c = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:]).with(prekey: key)
+        #expect(try PrivateContent(json: try c.jsonData()).prekey == key)
     }
 
     @Test func aSealedPeerSeedThatFailsToOpenIsIdentityUnavailable() throws {
@@ -396,6 +408,27 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(await bob.network.inbox!.receive(p.jsonData()) == .retry(.storageFailed))
         try bob.store.write("prekeys.json", saved)
         guard case .delivered = await bob.network.inbox!.receive(p.jsonData()) else { Issue.record("not delivered once restored"); return }
+    }
+
+    /// A held key that does not encapsulate (CryptoKit refuses an all-zero X25519 half) is dropped and the same attempt
+    /// goes to the published prekey.
+    @Test func aHeldKeyThatDoesNotEncapsulateFallsBackToThePublishedPrekey() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connectedText(relay, clock)
+        let dead = try Prekey(publicKey: zeroX25519Key())
+        #expect(throws: ACEError.self) {
+            _ = try createPacket(sender: alice.identity, to: bob.aceId, prekey: dead,
+                                 content: try alice.network.profiles.content(type: "ace:text:1", body: [:]).with(prekey: somePrekey()), timestamp: clock.now)
+        }
+        try alice.network.prekeys.hold(peer: bob.aceId, prekey: dead, timestamp: clock.now, pin: try await pin(alice, bob))
+        #expect(try await held(alice, bob, clock) == dead)
+        let n = relay.postedCount
+        let entry = try await alice.network.send(to: bob.aceId, type: "ace:text:1", body: ["message": "x"])
+        #expect(try one(relay, since: n, alice, bob).encryption.prekey == (try published(bob)))
+        #expect(try await held(alice, bob, clock) == nil)
+        guard case .delivered? = try await bob.network.pull().first else { Issue.record("not delivered"); return }
+        _ = try await alice.network.pull()
+        #expect(try await alice.network.outbox.entry(entry.messageId)?.status == .delivered)
     }
 
     @Test func contactPacketsRecordNoHeldKey() async throws {
