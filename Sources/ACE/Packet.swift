@@ -315,8 +315,7 @@ public struct Packet: Sendable, Equatable {
         HKDF<SHA256>.deriveKey(inputKeyMaterial: sharedSecret, salt: Data(), info: header, outputByteCount: 32)
     }
 
-    /// `nonce ‖ AES-256-GCM(key, nonce, plaintext, aad = header)` (deterministic given `nonce`: vectors); `plaintext` is
-    /// already padded.
+    /// `nonce ‖ AES-256-GCM(key, nonce, plaintext, aad = header)` (deterministic given `nonce`: vectors).
     package static func seal(_ plaintext: Data, sharedSecret: SymmetricKey, header: Data, nonce: AES.GCM.Nonce = AES.GCM.Nonce()) throws -> Data {
         do {
             let box = try AES.GCM.seal(plaintext, using: aeadKey(sharedSecret, header: header), nonce: nonce, authenticating: header)

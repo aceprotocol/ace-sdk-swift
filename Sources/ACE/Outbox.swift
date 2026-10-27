@@ -249,12 +249,19 @@ public actor Outbox {
             if e.refreshPrekey, let last = e.lastPrekey { heldRejected = try await transport.dropHeld(e.to, ifId: last) }
             let refresh = e.refreshPrekey && !heldRejected
             // Every retry refreshes the descriptor (the peer may have lost its prekeys with its state); if that fails, a
-            // cached one still unexpired and bound to the pins is used (06 § Outbox step 1).
+            // cached one still unexpired and bound to the pins is used (06 § Outbox step 1), except one still publishing
+            // the prekey an `unknown_prekey` rejection named: only a fresh descriptor decides whether that is final.
             let prekey: Prekey
-            if e.attempts > 0, !refresh, let fresh = try? await transport.prekey(for: e.to, refresh: true) {
-                prekey = fresh
+            if e.attempts > 0 || refresh {
+                do {
+                    prekey = try await transport.prekey(for: e.to, refresh: true)
+                } catch {
+                    let cached = try await transport.prekey(for: e.to, refresh: false)
+                    if refresh, cached.id == e.lastPrekey { throw error }
+                    prekey = cached
+                }
             } else {
-                prekey = try await transport.prekey(for: e.to, refresh: refresh)
+                prekey = try await transport.prekey(for: e.to, refresh: false)
             }
             // The peer refused the prekey that is still its current one: final.
             if refresh, prekey.id == e.lastPrekey { throw ACEError(.unknownPrekey, "the peer refused its current prekey") }

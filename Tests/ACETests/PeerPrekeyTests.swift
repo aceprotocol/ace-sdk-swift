@@ -31,7 +31,7 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         let v = vault()
         let k1 = try v.offer(peer: A, now: T)
         #expect(try v.offer(peer: A, now: T + 1) == k1)
-        try v.used(peer: A, prekeyId: k1.id, now: T + 2)
+        try v.used(peer: A, prekeyId: k1.id)
         let k2 = try v.offer(peer: A, now: T + 3)
         #expect(k2.id != k1.id)
         #expect(try publicKey(try v.open(k1.id, sender: A, now: T + 3)) == k1.publicKey)  // in use: still opens for A
@@ -43,9 +43,9 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
     @Test func usedDeletesThePreviousInUseSeed() throws {
         let v = vault()
         let k1 = try v.offer(peer: A, now: T)
-        try v.used(peer: A, prekeyId: k1.id, now: T)
+        try v.used(peer: A, prekeyId: k1.id)
         let k2 = try v.offer(peer: A, now: T + 1)
-        try v.used(peer: A, prekeyId: k2.id, now: T + 1)
+        try v.used(peer: A, prekeyId: k2.id)
         #expect(try v.open(k1.id, sender: A, now: T + 1) == nil)
         #expect(try v.open(k2.id, sender: A, now: T + 1) != nil)
     }
@@ -53,12 +53,12 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
     @Test func inUseIsUnchangedOnReuse() throws {
         let v = vault()
         let k1 = try v.offer(peer: A, now: T)
-        try v.used(peer: A, prekeyId: k1.id, now: T)
+        try v.used(peer: A, prekeyId: k1.id)
         let k2 = try v.offer(peer: A, now: T + 1)
-        try v.used(peer: A, prekeyId: k1.id, now: T + 2)  // the in-use key again: nothing changes
+        try v.used(peer: A, prekeyId: k1.id)  // the in-use key again: nothing changes
         #expect(try v.open(k1.id, sender: A, now: T + 2) != nil)
         #expect(try v.offer(peer: A, now: T + 3) == k2)
-        try v.used(peer: A, prekeyId: String(repeating: "0", count: 64), now: T + 3)  // an unknown ID: nothing
+        try v.used(peer: A, prekeyId: String(repeating: "0", count: 64))  // an unknown ID: nothing
         #expect(try v.offer(peer: A, now: T + 4) == k2)
     }
 
@@ -69,7 +69,7 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(try v.open(k1.id, sender: A, now: T + W) == nil)
         #expect(try v.offer(peer: A, now: T + W).id != k1.id)
         let k2 = try v.offer(peer: B, now: T)
-        try v.used(peer: B, prekeyId: k2.id, now: T + 1)  // in use keeps its offeredAt
+        try v.used(peer: B, prekeyId: k2.id)  // in use keeps its offeredAt
         #expect(try v.open(k2.id, sender: B, now: T + W - 1) != nil)
         #expect(try v.open(k2.id, sender: B, now: T + W) == nil)
     }
@@ -458,5 +458,41 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         let (alice, bob) = try await connectedText(relay, clock)
         #expect(try await held(alice, bob, clock) == nil)
         #expect(try await held(bob, alice, clock) == nil)
+    }
+}
+
+/// Posts to the prekey given (`held` on the first attempt, as `NetworkClient` does with a held key); a forced refresh fails
+/// and the cached descriptor publishes `published`.
+private struct RefreshDownTransport: PacketTransport {
+    let published: Prekey, held: Prekey
+    func prekey(for aceId: String, refresh: Bool) async throws -> Prekey {
+        if refresh { throw ACEError(.relayUnavailable, "down") }
+        return published
+    }
+    func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }  // the held key was since replaced
+    func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey {
+        attempts == 0 ? held : prekey
+    }
+}
+
+@Suite struct PeerPrekeyOutboxFallbackTests {
+    /// 06 § Outbox step 1: after `unknown_prekey` named a held key since replaced, a failed refresh falls back to the cached
+    /// descriptor unless it publishes the rejected ID; then the retry goes to the published prekey.
+    @Test(arguments: [false, true]) func refreshFailureAfterAHeldKeyRejection(cachedPublishesRejected: Bool) async throws {
+        let me = try makeIdentity(now: systemClock()), peer = try TestAgent(now: systemClock())
+        let outbox = Outbox(identity: me, store: MemoryStore(), profiles: try InstalledProfiles([.text]))
+        let published = try freshKey(), h1 = try freshKey()
+        let transport = RefreshDownTransport(published: cachedPublishesRejected ? h1 : published, held: h1)
+        let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
+        #expect(try await outbox.deliver(e.messageId, via: transport).lastPrekey == h1.id)
+        let receipt: [String: JSONValue] = ["messageId": .string(e.messageId), "outcome": "rejected", "code": "unknown_prekey", "prekey": .string(h1.id)]
+        #expect(try await outbox.handleReceipt(from: peer.aceId, body: receipt)?.refreshPrekey == true)
+        let done = try await outbox.deliver(e.messageId, via: transport)
+        #expect(done.attempts == 2 && done.status == .pending)
+        if cachedPublishesRejected {
+            #expect(done.refreshPrekey && done.lastPrekey == h1.id && done.lastError != nil)  // failed: retried on schedule
+        } else {
+            #expect(!done.refreshPrekey && done.lastPrekey == published.id && done.lastError == nil)
+        }
     }
 }

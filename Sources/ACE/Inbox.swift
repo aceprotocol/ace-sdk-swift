@@ -377,7 +377,7 @@ package actor Inbox {
     private func decrypt(_ packet: Packet, now: Int) throws -> Data {
         guard let seed = try network.prekeys.open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
         let plaintext = try decryptPlaintext(packet, seed: seed)
-        try network.prekeys.used(peer: packet.from, prekeyId: packet.encryption.prekey, now: now)
+        try network.prekeys.used(peer: packet.from, prekeyId: packet.encryption.prekey)
         return plaintext
     }
 

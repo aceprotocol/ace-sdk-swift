@@ -40,7 +40,7 @@ public protocol PrekeyVault: Sendable {
     func offer(peer: String, now: Int) throws -> Prekey
     /// A packet from `peer` opened under `prekeyId`: when that is the offered key it becomes the in-use key (the previous
     /// in-use seed is deleted) and the next `offer` generates a new one. Any other ID changes nothing.
-    func used(peer: String, prekeyId: String, now: Int) throws
+    func used(peer: String, prekeyId: String) throws
     /// Hold the key `peer` offered in a packet dated `timestamp`, authenticated under pin `pin` (the last pinned KEL event
     /// digest), unless the held key came from a packet at least as new.
     func hold(peer: String, prekey: Prekey, timestamp: Int, pin: String) throws
@@ -334,8 +334,8 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
         }
     }
 
-    public func used(peer: String, prekeyId: String, now: Int) throws {
-        try Self.check(peer: peer, now: now)
+    public func used(peer: String, prekeyId: String) throws {
+        guard isACEId(peer) else { throw ACEError(.invalidArgument, "peer must be an ACE ID") }
         try update { doc in
             guard var p = doc.peers[peer], let o = p.offered, o.prekey.id == prekeyId else { return ((), false) }
             p.inUse = o  // the previous in-use seed is deleted
