@@ -3,7 +3,8 @@
 //
 //    ACEInterop gen-identity <dir> [--handle H] --now N
 //    ACEInterop create-packet <dir> --to-agent F --kind K --out P [--prekey-agent F2] [--message M] [--message-id ID]
-//                             [--ref-message-id ID] [--ref-prekey ID] [--code C] [--note N] --now N
+//                             [--ref-message-id ID] [--ref-prekey ID] [--code C] [--note N]
+//                             [--to-prekey B64] [--offer-prekey B64] --now N
 //    ACEInterop open-packet <dir> --from-agent F --packet P --out R --now N
 //    ACEInterop verify-card <card.json> --now N        (prints {"ok": true, aceId, handle?, contact, listed} or {"error": code})
 //
@@ -72,7 +73,14 @@ func createPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws 
     let own = try readJSON(path(dir, "agent.json"))
     guard let toPath = o["to-agent"], let kind = o["kind"], let out = o["out"] else { throw Failure(description: "missing arguments") }
     let to = try verifyPublishedAgent(try readJSON(toPath), now: now)
-    let target = try o["prekey-agent"].map { try verifyPublishedAgent(try readJSON($0), now: now) } ?? to
+    // --to-prekey: a peer prekey the recipient offered (04 § Peer prekeys), else a descriptor prekey.
+    let target: Prekey
+    if let b64 = o["to-prekey"] {
+        guard let raw = Data(base64Encoded: b64) else { throw Failure(description: "--to-prekey is not Base64") }
+        target = try Prekey(publicKey: raw)
+    } else {
+        target = try o["prekey-agent"].map { try verifyPublishedAgent(try readJSON($0), now: now) }?.descriptor.prekey ?? to.descriptor.prekey
+    }
     func permit() throws -> JSONValue { try createPermit(identity: identity, subject: to.aceId, now: now) }
     let content: PrivateContent
     switch kind {
@@ -102,10 +110,18 @@ func createPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws 
     default:
         throw Failure(description: "unknown kind \(kind)")
     }
-    let packet = try createPacket(sender: identity, to: to.aceId, prekey: target.descriptor.prekey, content: content,
+    // The prekey offered to the recipient, or (--offer-prekey) arbitrary 1216 bytes for a tamper case.
+    let offered: Data
+    if let b64 = o["offer-prekey"] {
+        guard let raw = Data(base64Encoded: b64) else { throw Failure(description: "--offer-prekey is not Base64") }
+        offered = raw
+    } else {
+        offered = try vault(dir).offer(peer: to.aceId, now: now).publicKey
+    }
+    let packet = try createPacket(sender: identity, to: to.aceId, prekey: target, content: content.with(prekey: offered),
                                   messageId: o["message-id"] ?? UUID().uuidString.lowercased(), timestamp: now)
     try packet.jsonData().write(to: URL(fileURLWithPath: out))
-    try writeJSON(out + ".content.json", content.jsonValue)
+    try writeJSON(out + ".content.json", content.with(prekey: offered).jsonValue)
 }
 
 /// The receive pipeline of 06 minus admission, pinning and deduplication, in the README's order.
@@ -124,7 +140,7 @@ func openPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws ->
         try verifyPacketSignature(packet, sender: sender, now: now)                         // 3
         guard packet.timestamp >= now - ACELimits.offlineWindowSeconds,
               packet.timestamp <= now + ACELimits.timestampWindowSeconds else { throw ACEError(.staleTimestamp) }  // 4
-        guard let seed = try vault(dir).open(packet.encryption.prekey, now: now) else { throw ACEError(.unknownPrekey) }
+        guard let seed = try vault(dir).open(packet.encryption.prekey, sender: packet.from, now: now) else { throw ACEError(.unknownPrekey) }
         let content = try decryptPacket(packet, seed: seed)                                  // 5
         try installed.validate(content)                                                      // 6
         let b = content.body                                                                 // 7
@@ -143,7 +159,8 @@ func openPacketCommand(_ dir: String, _ o: [String: String], now: Int) throws ->
             if let permit = b["permit"] { _ = try verifyPermit(permit, issuer: sender, subject: me, now: now) }
         }
         var out: [String: JSONValue] = ["ok": true, "from": .string(packet.from), "messageId": .string(packet.messageId),
-                                        "type": .string(content.type), "schemaDigest": .string(content.schemaDigest), "body": .object(b)]
+                                        "type": .string(content.type), "schemaDigest": .string(content.schemaDigest), "body": .object(b),
+                                        "prekeyId": .string(sha256Hex(content.prekey ?? Data()))]
         if let t = content.threadId { out["threadId"] = .string(t) }
         return .object(out)
     } catch let e as ACEError {

@@ -154,14 +154,33 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         o["prekey"] = .string(ACEBase64.encode(bad))
         expectCode(.invalidBody) { try PrivateContent(json: try JSONValue.object(o).jsonData()) }
         expectCode(.invalidArgument) { try Prekey(publicKey: bad) }
-        // a store holding one is corrupt
+        // `hold` refuses it
+        let v = vault()
+        expectCode(.invalidArgument) { try v.hold(peer: A, prekey: Prekey(validated: bad), timestamp: T, pin: PIN) }
+        #expect(try v.held(peer: A, pin: PIN, now: T) == nil)
+    }
+
+    /// The vault trusts its own document at load: a held key is checked for its length (and gets its ID) only, never
+    /// trial-encapsulated, so a load costs nothing per peer. A planted key with an invalid ML-KEM half proves no check ran;
+    /// a wrong length is still `storage_failed`.
+    @Test func loadsDoNotRevalidateHeldKeys() throws {
+        let unchecked = Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize)
         let store = MemoryStore(), v = vault(store)
-        try v.hold(peer: A, prekey: try freshKey(), timestamp: T, pin: PIN)
-        var doc = try #require(try store.readJSON("prekeys.json")?.objectValue)
-        doc["peers"] = .object([A: ["offered": .null, "inUse": .null,
-                                    "held": ["publicKey": .string(ACEBase64.encode(bad)), "timestamp": .number(Double(T)), "pin": .string(PIN)]]])
-        try store.write("prekeys.json", try JSONValue.object(doc).jsonData())
-        expectCode(.storageFailed) { _ = try v.held(peer: A, pin: PIN, now: T) }
+        var peers: [String: JSONValue] = [:]
+        for i in 0..<50 {
+            peers[peerId("peer-\(i)")] = ["offered": .null, "inUse": .null,
+                                         "held": ["publicKey": .string(ACEBase64.encode(unchecked)), "timestamp": .number(Double(T)), "pin": .string(PIN)]]
+        }
+        let doc: JSONValue = ["version": 2, "current": .null, "retained": .array([]), "peers": .object(peers)]
+        try store.write("prekeys.json", try doc.jsonData())
+        #expect(try v.held(peer: peerId("peer-0"), pin: PIN, now: T)?.publicKey == unchecked)
+        for _ in 0..<20 { _ = try v.current() }  // 20 loads of 50 held keys: no encapsulation (would be 1000)
+        var short = try #require(try store.readJSON("prekeys.json")?.objectValue)
+        short["peers"] = .object([A: ["offered": .null, "inUse": .null,
+                                      "held": ["publicKey": .string(ACEBase64.encode(Data(count: 1215))), "timestamp": .number(Double(T)),
+                                               "pin": .string(PIN)]]])
+        try store.write("prekeys.json", try JSONValue.object(short).jsonData())
+        expectCode(.storageFailed) { _ = try v.current() }
     }
 
     /// Only the ML-KEM-768 half is checked: an all-zero X25519 half is a valid X-Wing public key (03 § X-Wing).

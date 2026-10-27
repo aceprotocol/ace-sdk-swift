@@ -177,8 +177,9 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
         guard let o = v.objectValue, Set(o.keys) == ["publicKey", "timestamp", "pin"], let text = o["publicKey"]?.stringValue,
               let ts = o["timestamp"]?.wireInt, let pin = o["pin"]?.stringValue, isSHA256Hex(pin),
               let raw = try? decodeB64(text, code: .storageFailed, what: "held prekey", maxBytes: ACELimits.kemPublicKeySize),
-              let prekey = try? Prekey(publicKey: raw) else { throw malformed }
-        return Held(prekey: prekey, timestamp: ts, pin: pin)
+              raw.count == ACELimits.kemPublicKeySize else { throw malformed }
+        // The vault trusts its own document: the key was checked by `hold` (no trial encapsulation on every load).
+        return Held(prekey: Prekey(validated: raw), timestamp: ts, pin: pin)
     }
 
     private func save(_ doc: Document) throws {
@@ -348,8 +349,8 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
     public func hold(peer: String, prekey: Prekey, timestamp: Int, pin: String) throws {
         try Self.check(peer: peer, now: timestamp)
         guard isSHA256Hex(pin) else { throw ACEError(.invalidArgument, "pin must be 64 lowercase hex") }
-        guard prekey.publicKey.count == ACELimits.kemPublicKeySize, sha256Hex(prekey.publicKey) == prekey.id else {
-            throw ACEError(.invalidArgument, "prekey must be a 1216-byte key and its ID")
+        guard XWing.isPublicKey(prekey.publicKey), sha256Hex(prekey.publicKey) == prekey.id else {
+            throw ACEError(.invalidArgument, "prekey must be an X-Wing public key and its ID")
         }
         try update { doc in
             var p = doc.peers[peer] ?? Peer()
