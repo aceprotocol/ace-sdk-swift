@@ -110,7 +110,7 @@ public actor PeerStore {
 
     /// `pinned(_:)` read synchronously, without the actor's cache: for profile rules, whose `check` is synchronous
     /// (`delegationRules`).
-    public nonisolated func pinnedState(_ aceId: String) throws -> KelState? {
+    package nonisolated func pinnedState(_ aceId: String) throws -> KelState? {
         try Self.checkId(aceId)
         let key = Self.key(aceId)
         guard let raw = try store.checkedRead(key) else { return nil }
@@ -118,7 +118,7 @@ public actor PeerStore {
     }
 
     /// The store clock (`invalid_argument` for a reading outside [0, 2^53 − 1]).
-    public nonisolated func clockNow() throws -> Int { try unixNow(clock) }
+    package nonisolated func clockNow() throws -> Int { try unixNow(clock) }
 
     /// Whether a live descriptor served by a relay vouched for the pinned KEL (`adopt(_:live:)`); false without a pin.
     public func kelLive(_ aceId: String) throws -> Bool {

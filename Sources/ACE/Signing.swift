@@ -92,7 +92,10 @@ package func verifyOperational(_ sig: SignatureEnvelope, state: KelState, action
     guard let key = state.signing, sig.seq == key.seq else {
         throw ACEError(.stalePeerBinding, "signature.seq is not the current signing delegation")
     }
-    if state.events.indices.contains(key.seq), let dlgTs = wireInt(state.events[key.seq]["ts"]), timestamp < dlgTs {
+    guard state.events.indices.contains(key.seq), let dlgTs = wireInt(state.events[key.seq]["ts"]) else {
+        throw ACEError(.stalePeerBinding, "no delegating dlg ts for signature.seq")
+    }
+    if timestamp < dlgTs {
         throw ACEError(.stalePeerBinding, "signed before the delegating dlg's ts")
     }
     if let notAfter = key.notAfter, timestamp >= notAfter {
