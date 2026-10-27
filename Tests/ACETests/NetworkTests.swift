@@ -207,6 +207,8 @@ private final class GateTransport: PacketTransport, @unchecked Sendable {
 
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
 
+    func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
+
     func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey {
         posts.value += 1
         await withCheckedContinuation { c in
@@ -248,6 +250,7 @@ private final class GateTransport: PacketTransport, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Down: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { throw ACEError(.relayUnavailable) }
+            func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
             func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         #expect(try await outbox.deliver(e.messageId, via: Down()).nextAttemptAt == NOW + 60)

@@ -881,8 +881,10 @@ public actor NetworkClient: PacketTransport {
             r.state = .blocked
             return r
         }
-        try prekeys.dropHeld(peer: aceId)  // 04 § Peer prekeys: nothing is sent to it, and the key is not kept
         await registerBlock(record)
+        // 04 § Peer prekeys: the key held for it is not kept. Best effort after the block is registered: a vault failure
+        // never undoes the block (a stale held key is bound to the pin and expires with its window).
+        try? prekeys.dropHeld(peer: aceId)
     }
 
     /// Remove a block (the explicit admission action, 05 § Blocks): the peer becomes a stranger again until it presents a

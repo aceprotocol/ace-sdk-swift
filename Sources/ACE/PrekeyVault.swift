@@ -65,7 +65,6 @@ public enum PrekeyProtection: Sendable {
     case secureEnclave
 }
 
-
 /// A `PrekeyVault` over an `ACEStore` (`prekeys.json` under lock `prekeys`): `MemoryStore` for in-memory, `FileStore` for
 /// a keystore file, `protection: .secureEnclave` for Secure Enclave–sealed seeds (published and peer seeds alike).
 ///
@@ -157,7 +156,7 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
 
     private func entry(_ v: JSONValue, retained: Bool) throws -> Entry {
         guard let o = v.objectValue, Set(o.keys) == (retained ? ["prekey", "createdAt", "supersededAt", "secret"] : ["prekey", "createdAt", "secret"]),
-              let prekey = Prekey(o["prekey"]), let created = o["createdAt"]?.wireInt else { throw malformed }
+              let prekey = Prekey(o["prekey"], ownSeed: true), let created = o["createdAt"]?.wireInt else { throw malformed }
         var superseded: Int?
         if retained {
             guard let n = o["supersededAt"]?.wireInt else { throw malformed }
@@ -168,7 +167,7 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
 
     private func seed(_ v: JSONValue) throws -> Seed? {
         if v == .null { return nil }
-        guard let o = v.objectValue, Set(o.keys) == ["prekey", "offeredAt", "secret"], let prekey = Prekey(o["prekey"]),
+        guard let o = v.objectValue, Set(o.keys) == ["prekey", "offeredAt", "secret"], let prekey = Prekey(o["prekey"], ownSeed: true),
               let at = o["offeredAt"]?.wireInt else { throw malformed }
         return Seed(prekey: prekey, offeredAt: at, secret: try secret(o["secret"]))
     }
@@ -227,7 +226,7 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
     private func generate() throws -> (Prekey, JSONValue) {
         var seed = XWing.generateSeed()
         defer { seed.resetBytes(in: 0..<seed.count) }
-        let prekey = try Prekey(publicKey: XWing.publicKey(fromSeed: seed))
+        let prekey = Prekey(validated: try XWing.publicKey(fromSeed: seed))
         switch protection {
         case .software: return (prekey, ["seed": .string(ACEBase64.encode(seed))])
         case .secureEnclave: return (prekey, ["seal": try SecureEnclaveSeal.seal(seed, info: Self.sealInfo).jsonValue])
@@ -305,7 +304,10 @@ public final class StorePrekeyVault: PrekeyVault, @unchecked Sendable {
         try update { doc in
             let entries = Self.pruned(doc.entries, now: now)
             var peers: [String: Peer] = [:]
-            for (peer, p) in doc.peers where !p.pruned(now).isEmpty { peers[peer] = p.pruned(now) }
+            for (peer, p) in doc.peers {
+                let kept = p.pruned(now)
+                if !kept.isEmpty { peers[peer] = kept }
+            }
             let changed = entries.count != doc.entries.count || peers != doc.peers
             doc.entries = entries
             doc.peers = peers

@@ -143,6 +143,35 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(try vault(try FileStore(directory: dir)).open(k.id, sender: A, now: T) != nil)
     }
 
+    @Test func aPrekeyThatIsNotAnXWingKeyIsMalformed() throws {
+        let bad = Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize)
+        #expect(!XWing.isPublicKey(bad) && XWing.isPublicKey(somePrekey()))
+        let good = try PrivateContent(type: "ace:text:1", schemaDigest: String(repeating: "0", count: 64), body: [:]).with(prekey: somePrekey())
+        var o = try #require(good.jsonValue.objectValue)
+        o["prekey"] = .string(ACEBase64.encode(bad))
+        expectCode(.invalidBody) { try PrivateContent(json: try JSONValue.object(o).jsonData()) }
+        expectCode(.invalidArgument) { try Prekey(publicKey: bad) }
+        // a store holding one is corrupt
+        let store = MemoryStore(), v = vault(store)
+        try v.hold(peer: A, prekey: try freshKey(), timestamp: T, pin: PIN)
+        var doc = try #require(try store.readJSON("prekeys.json")?.objectValue)
+        doc["peers"] = .object([A: ["offered": .null, "inUse": .null,
+                                    "held": ["publicKey": .string(ACEBase64.encode(bad)), "timestamp": .number(Double(T)), "pin": .string(PIN)]]])
+        try store.write("prekeys.json", try JSONValue.object(doc).jsonData())
+        expectCode(.storageFailed) { _ = try v.held(peer: A, pin: PIN, now: T) }
+    }
+
+    @Test func aSealedPeerSeedThatFailsToOpenIsIdentityUnavailable() throws {
+        let store = MemoryStore(), v = vault(store)
+        let k = try v.offer(peer: A, now: T)
+        var doc = try #require(try store.readJSON("prekeys.json")?.objectValue)
+        doc["peers"] = .object([A: ["offered": ["prekey": k.jsonValue, "offeredAt": .number(Double(T)),
+                                                "secret": ["seal": ["key": "AAAA", "encapsulatedKey": "AAAA", "ciphertext": "AAAA"]]],
+                                    "inUse": .null, "held": .null]])
+        try store.write("prekeys.json", try JSONValue.object(doc).jsonData())
+        expectCode(.identityUnavailable) { _ = try v.open(k.id, sender: A, now: T) }
+    }
+
     @Test(.enabled(if: testPrekeyProtection == .secureEnclave)) func peerSeedsAreSealed() throws {
         let store = MemoryStore(), v = vault(store)
         let k = try v.offer(peer: A, now: T)
@@ -340,6 +369,33 @@ private func publicKey(_ seed: Data?) throws -> Data { try XWing.publicKey(fromS
         #expect(try alice.network.prekeys.held(peer: bob.aceId, pin: p, now: clock.now) != nil)
         try await alice.network.block(bob.aceId)
         #expect(try alice.network.prekeys.held(peer: bob.aceId, pin: p, now: clock.now) == nil)
+    }
+
+    /// A content `prekey` that is not an X-Wing public key, from a pinned peer: rejected (`invalid_body`), never held.
+    @Test func aMalformedOfferedKeyIsRejectedAndNotHeld() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connectedText(relay, clock)
+        let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"])
+            .with(prekey: Data(repeating: 0xFF, count: ACELimits.kemPublicKeySize))
+        let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: try #require(try bob.network.prekeys.current()).prekey, content: c,
+                                 timestamp: clock.now)
+        #expect(await bob.network.inbox!.receive(p.jsonData()) == .rejected("invalid_body"))
+        #expect(try await held(bob, alice, clock) == nil)
+        #expect(bob.received.value.isEmpty)
+    }
+
+    /// A vault storage failure at step 6 is a retry, never a drop or a rejection.
+    @Test func aVaultStorageFailureAtStep6IsARetry() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let (alice, bob) = try await connectedText(relay, clock)
+        let c = try alice.network.profiles.content(type: "ace:text:1", body: ["message": "x"]).with(prekey: somePrekey())
+        let p = try createPacket(sender: alice.identity, to: bob.aceId, prekey: try #require(try bob.network.prekeys.current()).prekey, content: c,
+                                 timestamp: clock.now)
+        let saved = try #require(try bob.store.read("prekeys.json"))
+        try bob.store.write("prekeys.json", Data("{\"version\":1,\"keys\":[]}".utf8))
+        #expect(await bob.network.inbox!.receive(p.jsonData()) == .retry(.storageFailed))
+        try bob.store.write("prekeys.json", saved)
+        guard case .delivered = await bob.network.inbox!.receive(p.jsonData()) else { Issue.record("not delivered once restored"); return }
     }
 
     @Test func contactPacketsRecordNoHeldKey() async throws {

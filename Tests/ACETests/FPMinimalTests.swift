@@ -39,6 +39,7 @@ private final class Gate: PacketTransport, @unchecked Sendable {
 
     init(_ prekey: Prekey) { prekeyValue = prekey }
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
+    func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
     func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey {
         posts.value += 1
         await withCheckedContinuation { c in lock.withLock { continuation = c } }
@@ -339,6 +340,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Slow: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { try await Task.sleep(for: .seconds(60)); throw ACEError(.relayUnavailable, "late") }
+            func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
             func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         let stopped = Task { try await outbox.deliver(e.messageId, via: Slow()) }
@@ -364,6 +366,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Bad: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { throw ACEError(.invalidArgument, "bad prekey") }
+            func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
             func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         let done = try await outbox.deliver(e.messageId, via: Bad())
@@ -566,6 +569,7 @@ private final class InterleavingStore: ACEStore, @unchecked Sendable {
         let e = try await outbox.enqueue(to: peer.aceId, type: "ace:text:1", body: ["message": "x"])
         struct Capped: PacketTransport {
             func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { throw ACEError(.limitExceeded, "relay cap") }
+            func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
             func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
         }
         let done = try await outbox.deliver(e.messageId, via: Capped())

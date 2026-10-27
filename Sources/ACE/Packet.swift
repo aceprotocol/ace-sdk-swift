@@ -27,11 +27,17 @@ public struct Prekey: Sendable, Equatable, Hashable {
     public let id: String
     public let publicKey: Data
 
-    /// `invalid_argument` unless `publicKey` is 1216 bytes.
+    /// `invalid_argument` unless `publicKey` is 1216 bytes that decode as an X-Wing public key (`XWing.isPublicKey`).
     public init(publicKey: Data) throws {
-        guard publicKey.count == ACELimits.kemPublicKeySize else {
-            throw ACEError(.invalidArgument, "X-Wing public key must be \(ACELimits.kemPublicKeySize) bytes")
+        guard XWing.isPublicKey(publicKey) else {
+            throw ACEError(.invalidArgument, "prekey must be a \(ACELimits.kemPublicKeySize)-byte X-Wing public key")
         }
+        self.init(validated: publicKey)
+    }
+
+    /// A key already known to be an X-Wing public key (derived from a seed we hold, or checked when its content was
+    /// decoded): no trial encapsulation again.
+    package init(validated publicKey: Data) {
         self.publicKey = publicKey
         self.id = sha256Hex(publicKey)
     }
@@ -39,11 +45,18 @@ public struct Prekey: Sendable, Equatable, Hashable {
     /// `{id, publicKey}`.
     public var jsonValue: JSONValue { ["id": .string(id), "publicKey": .string(ACEBase64.encode(publicKey))] }
 
-    /// Exactly `{id, publicKey}` with a canonical 1216-byte key whose SHA-256 is `id`; nil otherwise.
-    package init?(_ v: JSONValue?) {
+    /// Exactly `{id, publicKey}` with a canonical 1216-byte X-Wing public key whose SHA-256 is `id`; nil otherwise.
+    /// `ownSeed`: the public half stored beside a seed we hold (the vault), checked for its length and ID only.
+    package init?(_ v: JSONValue?, ownSeed: Bool = false) {
         guard let o = v?.objectValue, Set(o.keys) == ["id", "publicKey"], let id = o["id"]?.stringValue, let text = o["publicKey"]?.stringValue,
               let raw = try? decodeB64(text, code: .invalidArgument, what: "prekey", maxBytes: ACELimits.kemPublicKeySize),
-              let key = try? Prekey(publicKey: raw), key.id == id else { return nil }
+              raw.count == ACELimits.kemPublicKeySize else { return nil }
+        let key: Prekey
+        if ownSeed { key = Prekey(validated: raw) } else {
+            guard let checked = try? Prekey(publicKey: raw) else { return nil }
+            key = checked
+        }
+        guard key.id == id else { return nil }
         self = key
     }
 }
@@ -56,6 +69,13 @@ public enum XWing {
     /// The 1216-byte public key of a 32-byte seed; `invalid_argument` for a malformed seed.
     public static func publicKey(fromSeed seed: Data) throws -> Data {
         Data(try privateKey(seed).publicKey.rawRepresentation)
+    }
+
+    /// True when `raw` is 1216 bytes that decode as an X-Wing public key. CryptoKit accepts an ML-KEM-768 key with
+    /// out-of-range coefficients at construction, so a trial encapsulation (its result discarded) checks it too.
+    public static func isPublicKey(_ raw: Data) -> Bool {
+        guard raw.count == ACELimits.kemPublicKeySize, let key = try? XWingMLKEM768X25519.PublicKey(rawRepresentation: raw) else { return false }
+        return (try? key.encapsulate()) != nil
     }
 
     package static func privateKey(_ seed: Data) throws -> XWingMLKEM768X25519.PrivateKey {
@@ -157,7 +177,7 @@ public struct PrivateContent: Sendable, Equatable {
     }
 
     /// Strict decoding (`invalid_body`): a closed object `{type, schemaDigest, threadId?, body, prekey, admission?}`, depth
-    /// ≤ 32; `prekey` the canonical Base64 of 1216 bytes, kept in `prekey`; `admission` the closed `{proof, permit, source}`
+    /// ≤ 32; `prekey` the canonical Base64 of a 1216-byte X-Wing public key, kept in `prekey`; `admission` the closed `{proof, permit, source}`
     /// of three objects.
     public init(json: Data) throws {
         guard json.count <= ACELimits.maxPlaintextBytes else { throw ACEError(.invalidBody, "private content is too large") }
@@ -174,6 +194,8 @@ public struct PrivateContent: Sendable, Equatable {
               prekey.count == ACELimits.kemPublicKeySize else {
             throw ACEError(.invalidBody, "prekey must be \(ACELimits.kemPublicKeySize) bytes of canonical Base64")
         }
+        // A key that does not decode as an X-Wing public key is malformed: never held, never encrypted to.
+        guard XWing.isPublicKey(prekey) else { throw ACEError(.invalidBody, "prekey is not an X-Wing public key") }
         var threadId: String?
         if let t = o["threadId"] {
             guard let s = t.stringValue else { throw ACEError(.invalidBody, "invalid threadId") }

@@ -375,7 +375,7 @@ package actor Inbox {
         let me = identity.getACEId()
         let core = carried.type == CoreTypes.receipt || carried.type == CoreTypes.contact
         if carried.type != CoreTypes.contact, let offered = carried.prekey {
-            try network.prekeys.hold(peer: packet.from, prekey: try Prekey(publicKey: offered), timestamp: packet.timestamp, pin: state.lastHash)
+            try network.prekeys.hold(peer: packet.from, prekey: Prekey(validated: offered), timestamp: packet.timestamp, pin: state.lastHash)
         }
         var content = carried.with(admission: nil)
         content.prekey = nil  // the offered peer prekey never reaches the host

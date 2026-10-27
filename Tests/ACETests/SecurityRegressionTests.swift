@@ -18,6 +18,7 @@ private final class OnceRule: ProfileRules, @unchecked Sendable {
 private struct InstantTransport: PacketTransport {
     let prekeyValue: Prekey
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
+    func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
     func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey { prekey }
 }
 
@@ -30,6 +31,7 @@ private final class HeldTransport: PacketTransport, @unchecked Sendable {
 
     init(_ prekey: Prekey) { prekeyValue = prekey }
     func prekey(for aceId: String, refresh: Bool) async throws -> Prekey { prekeyValue }
+    func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
     func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey {
         await withCheckedContinuation { c in
             lock.withLock { continuation = c }

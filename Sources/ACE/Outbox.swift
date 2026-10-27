@@ -4,8 +4,9 @@
 //
 //  Sender durability (06 § Outbox). Each message is stored as `{messageId, to, privateContent, createdAt}` plus its
 //  attempt state. Every attempt re-encrypts (the first to the peer prekey held for the peer, when there is one, every
-//  other to its current published prekey) and re-signs at the current time; `messageId` never changes. Retries back off `min(60·2^(n-1), 3600)` s until a receipt arrives or `OFFLINE_WINDOW_SECONDS` have
-//  passed since the first attempt (`expired`). A relay `{ok: true}` is not delivery. `expired` (or abandoned) means the
+//  other to its current published prekey) and re-signs at the current time; `messageId` never changes. Retries back off
+//  `min(60·2^(n-1), 3600)` s until a receipt arrives or `OFFLINE_WINDOW_SECONDS` have passed since the first attempt
+//  (`expired`). A relay `{ok: true}` is not delivery. `expired` (or abandoned) means the
 //  sender stopped retrying, the outcome is unknown: a late receipt still settles the entry.
 //
 
@@ -23,10 +24,6 @@ package protocol PacketTransport: Sendable {
     func post(to aceId: String, content: PrivateContent, messageId: String, prekey: Prekey, attempts: Int) async throws -> Prekey
     /// A `rejected:unknown_prekey` named `prekeyId`: when that is the peer prekey held for `aceId`, drop it and return true.
     func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool
-}
-
-extension PacketTransport {
-    package func dropHeld(_ aceId: String, ifId prekeyId: String) async throws -> Bool { false }
 }
 
 public enum OutboxStatus: String, Sendable {
