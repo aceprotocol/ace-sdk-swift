@@ -25,7 +25,7 @@ import Testing
         let st = try ACEKel.verify(kel, now: NOW)
         #expect(st.aceId == id.getACEId() && st.rootPublicKey == Self.root(0).publicKey())
         #expect(id.getSigningPublicKey() == signing.publicKey() && st.signing?.publicKey == signing.publicKey())
-        #expect(id.rotationCount == 0)
+        #expect(try Self.rotCount(try id.getKel()) == 0)
         #expect(try checkUsable(id, now: NOW).aceId == id.getACEId())
     }
 
@@ -64,7 +64,7 @@ import Testing
                 #expect(!text.contains(ACEBase64.encode(Self.root(n).seed)), "\(label): seed \(n)")
             }
             let kelRoots = Set(export.kel.compactMap { $0["root"]?.objectValue?["publicKey"]?.stringValue })
-            let held = ACEBase64.encode(Self.root(id.rotationCount + 1).publicKey())
+            let held = ACEBase64.encode(Self.root(Self.rotCount(try id.getKel()) + 1).publicKey())
             #expect(!kelRoots.contains(held) && !text.contains(held), "\(label): next root public key")
         }
         try check("incept")
@@ -128,7 +128,7 @@ import Testing
         let signing = SoftwareKey.generate()
         let r = try ExternalRootIdentity.recover(kel: kel, revealing: Self.root(1), nextRootDigest: Self.digest(2),
                                                  signingKey: signing, now: NOW + 5)
-        #expect(r.getACEId() == lost.getACEId() && r.rotationCount == 1)
+        #expect(try r.getACEId() == lost.getACEId() && Self.rotCount(try r.getKel()) == 1)
         #expect(try r.getSigningSeq() > lost.getSigningSeq())
         let st = try checkUsable(r, now: NOW + 5)
         #expect(st.signing?.publicKey == signing.publicKey() && st.rootPublicKey == Self.root(1).publicKey())
@@ -162,7 +162,7 @@ import Testing
         let (id, signing) = try Self.incept()
         let aceId = id.getACEId()
         try id.rotate(revealing: Self.root(1), nextRootDigest: Self.digest(2), now: NOW + 1)
-        #expect(id.getACEId() == aceId && id.rotationCount == 1)
+        #expect(try id.getACEId() == aceId && Self.rotCount(try id.getKel()) == 1)
         #expect(try checkUsable(id, now: NOW + 1).signing?.publicKey == signing.publicKey())
         expectCode(.invalidArgument, "not committed") {
             try id.rotate(revealing: Self.root(3), nextRootDigest: Self.digest(4), now: NOW + 3)
@@ -177,7 +177,7 @@ import Testing
         func check() throws {
             let kel = try id.getKel()
             let st = try ACEKel.verify(kel, now: now)
-            #expect(st.aceId == id.getACEId() && Self.rotCount(kel) == id.rotationCount)
+            #expect(try st.aceId == id.getACEId() && Self.rotCount(kel) == Self.rotCount(try id.getKel()))
             #expect(try checkUsable(id, now: now).signing?.publicKey == id.getSigningPublicKey())
         }
         try check()
@@ -186,11 +186,11 @@ import Testing
             try id.rotate(revealing: Self.root(k), nextRootDigest: Self.digest(k + 1), now: now)
             try check()
         }
-        #expect(id.rotationCount == 3)
+        #expect(try Self.rotCount(try id.getKel()) == 3)
         // A recovery from the full log continues the chain at key(4).
         let r = try ExternalRootIdentity.recover(kel: try id.getKel(), revealing: Self.root(4), nextRootDigest: Self.digest(5),
                                                  signingKey: SoftwareKey.generate(), now: now + 1)
-        #expect(r.rotationCount == 4 && r.getACEId() == id.getACEId())
+        #expect(try Self.rotCount(try r.getKel()) == 4 && r.getACEId() == id.getACEId())
         _ = try ACEKel.verify(try r.getKel(), now: now + 1)
     }
 
@@ -204,14 +204,86 @@ import Testing
         #expect(try ExternalRootIdentity.aceId(roots: roots, inceptedAt: 0) == id.getACEId())
         try id.rotate(roots: roots, now: NOW + 1)
         try id.rotate(roots: roots, now: NOW + 2)
-        #expect(id.rotationCount == 2 && id.getState().rotationCount == 2)
+        #expect(try Self.rotCount(try id.getKel()) == 2 && Self.rotCount(id.getState().events) == 2)
         // Recovery reveals key(3) and commits digest(key(4)): the next explicit step needs key(4).
         let r = try ExternalRootIdentity.recover(kel: try id.getKel(), roots: roots, signingKey: SoftwareKey.generate(), now: NOW + 3)
-        #expect(r.rotationCount == 3 && r.getACEId() == id.getACEId())
+        #expect(try Self.rotCount(try r.getKel()) == 3 && r.getACEId() == id.getACEId())
         try r.rotate(revealing: Self.root(4), nextRootDigest: Self.digest(5), now: NOW + 4)
         // A chain that is not this identity's fails closed.
         expectCode(.invalidArgument, "foreign chain") {
             try ExternalRootIdentity.recover(kel: try id.getKel(), roots: { Self.root($0 + 10) }, signingKey: SoftwareKey.generate(), now: NOW + 3)
         }
+    }
+
+    // MARK: Fallback root (01 § Rotation and recovery)
+
+    /// The backup chain fb(i), independent of the main chain.
+    static func backup(_ i: Int) throws -> SoftwareKey { try SoftwareKey(seed: Data(repeating: UInt8(100 + i), count: 32)) }
+    static func fbDigest(_ i: Int) -> String { hexEncode(keyDigest(publicKey: try! backup(i).publicKey())) }
+
+    /// Main incepts, then a primary rotate with main present adds the backup chain's fb(0) as the fallback.
+    static func withFallback() throws -> ExternalRootIdentity {
+        let id = try ExternalRootIdentity.incept(roots: root, signingKey: SoftwareKey.generate(), inceptedAt: 0, now: NOW)
+        try id.rotate(roots: root, fallback: .set(backup), now: NOW + 1)
+        return id
+    }
+
+    @Test func rotateSetsKeepsAndRemovesTheFallback() throws {
+        let id = try Self.withFallback()
+        let aceId = try ExternalRootIdentity.aceId(roots: Self.root, inceptedAt: 0)
+        #expect(id.getACEId() == aceId)  // the fallback never changes the ACE ID
+        #expect(id.getState().fallback == Self.fbDigest(0) && id.getState().next == hexEncode(Self.digest(2)))
+        try id.rotate(roots: Self.root, now: NOW + 2)
+        #expect(id.getState().fallback == Self.fbDigest(0) && id.getState().next == hexEncode(Self.digest(3)))
+        try id.rotate(revealing: Self.root(3), nextRootDigest: Self.digest(4), now: NOW + 3)
+        #expect(id.getState().fallback == Self.fbDigest(0))
+        try id.rotate(roots: Self.root, fallback: .remove, now: NOW + 4)
+        #expect(id.getState().fallback == nil)
+        expectCode(.invalidArgument, "no fallback committed") {
+            try ExternalRootIdentity.recover(kel: try id.getKel(), fallbackRoots: Self.backup, signingKey: SoftwareKey.generate(), now: NOW + 5)
+        }
+    }
+
+    /// The backup alone takes the identity over: same ACE ID, the next root carried, fb(1) committed; peers recover it.
+    @Test func theFallbackRootRecoversAlone() throws {
+        let id = try Self.withFallback()
+        let pinned = id.getState()
+        let r = try ExternalRootIdentity.recover(kel: try id.getKel(), fallbackRoots: Self.backup, signingKey: SoftwareKey.generate(), now: NOW + 2)
+        let st = r.getState()
+        let fb0 = try Self.backup(0).publicKey()
+        #expect(r.getACEId() == id.getACEId() && st.rootPublicKey == fb0)
+        #expect(st.next == pinned.next && st.fallback == Self.fbDigest(1))
+        #expect(try ACEKel.extend(pinned: pinned, events: st.events, now: NOW + 2).outcome == .recovered)
+        // The backup again, on another device: it reveals fb(1) and commits fb(2).
+        let r2 = try ExternalRootIdentity.recover(kel: st.events, fallbackRoots: Self.backup, signingKey: SoftwareKey.generate(), now: NOW + 3)
+        #expect(r2.getState().fallback == Self.fbDigest(2) && r2.getState().next == pinned.next)
+        // Main with main present afterwards: a primary rot after the backup's epoch would keep the backup's commitment,
+        // so main's recovery reclaims from the first fallback rot instead.
+        let m = try ExternalRootIdentity.recover(kel: try r2.getKel(), roots: Self.root, signingKey: SoftwareKey.generate(), now: NOW + 4)
+        let ms = m.getState()
+        #expect(m.getACEId() == id.getACEId() && ms.rootPublicKey == Self.root(2).publicKey() && ms.next == hexEncode(Self.digest(3)))
+        #expect(ms.fallback == nil)  // fb(0) was revealed on the dropped branch: the host sets a fresh one with the backup
+        #expect(try ACEKel.extend(pinned: r2.getState(), events: ms.events, now: NOW + 4).outcome == .recovered)
+        try m.rotate(roots: Self.root, fallback: .set(Self.backup), now: NOW + 5)
+        // The kept log reveals no backup key, so the backup chain starts over at fb(0) (its keys stand or fall together).
+        #expect(m.getState().fallback == Self.fbDigest(0))
+    }
+
+    /// A thief holding the backup takes the identity over and commits keys of its own; main reclaims it.
+    @Test func theNextRootReclaimsFromAStolenFallback() throws {
+        let id = try Self.withFallback()
+        let base = id.getState()
+        let thiefNext = SoftwareKey.generate(), thiefFallback = SoftwareKey.generate()
+        let rot = try ACEKel.createRotation(state: base, newRoot: Self.backup(0), nextDigest: keyDigest(publicKey: thiefNext.publicKey()),
+                                            ts: NOW + 2, fallbackDigest: keyDigest(publicKey: thiefFallback.publicKey()))
+        var stolen = try ACEKel.verify(base.events + [rot], now: NOW + 2)
+        let rot2 = try ACEKel.createRotation(state: stolen, newRoot: thiefNext, nextDigest: keyDigest(publicKey: SoftwareKey.generate().publicKey()), ts: NOW + 3)
+        stolen = try ACEKel.verify(stolen.events + [rot2], now: NOW + 3)
+        stolen = try KelSteps.delegate(stolen, root: thiefNext, keyPublic: SoftwareKey.generate().publicKey(), ts: NOW + 3, notAfter: nil)
+        let m = try ExternalRootIdentity.recover(kel: stolen.events, roots: Self.root, signingKey: SoftwareKey.generate(), now: NOW + 4)
+        #expect(m.getACEId() == id.getACEId() && m.getState().seq == base.seq + 2)
+        #expect(try ACEKel.extend(pinned: stolen, events: try m.getKel(), now: NOW + 4).outcome == .recovered)
+        // The thief cannot take it back with the backup: its rot is fallback at the same seq.
+        expectCode(.kelConflict) { try ACEKel.extend(pinned: m.getState(), events: stolen.events, now: NOW + 4) }
     }
 }

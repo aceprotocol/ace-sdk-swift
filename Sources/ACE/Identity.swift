@@ -56,7 +56,7 @@ package func identityNow(_ now: Int?, clock: () -> Int = systemClock) throws -> 
 
 /// `key` is the next root `state` commits to, or `invalid_argument`.
 package func checkCommitted(_ key: any ACEKeyProvider, _ state: KelState) throws {
-    guard state.commits(to: key.publicKey()) else {
+    guard state.commitsNext(to: key.publicKey()) else {
         throw ACEError(.invalidArgument, "nextRoot does not match the committed next root")
     }
 }
@@ -117,33 +117,36 @@ package enum KelSteps {
         return (try ACEKel.verify(events, now: ts), ts, full.events)
     }
 
-    /// `rot` revealing `revealed` (the committed next root, else `invalid_argument`) and committing `nextDigest`, then
-    /// `dlg` of `signingPublicKey` signed by the revealed root (a `rot` revokes the signing delegation).
-    package static func rotate(_ state: KelState, revealed: any ACEKeyProvider, nextDigest: Data, signingPublicKey: Data,
-                               ts: Int) throws -> KelState {
-        try checkCommitted(revealed, state)
-        let st = try appended(state, try ACEKel.createRotation(state: state, newRoot: revealed, nextDigest: nextDigest, ts: ts), ts)
+    /// `rot` revealing `revealed` (a committed root: callers check which) and committing `nextDigest` and `fallbackDigest`,
+    /// then `dlg` of `signingPublicKey` signed by the revealed root (a `rot` revokes the signing delegation).
+    package static func rotate(_ state: KelState, revealed: any ACEKeyProvider, nextDigest: Data, fallbackDigest: Data? = nil,
+                               signingPublicKey: Data, ts: Int) throws -> KelState {
+        let rot = try ACEKel.createRotation(state: state, newRoot: revealed, nextDigest: nextDigest, ts: ts, fallbackDigest: fallbackDigest)
+        let st = try appended(state, rot, ts)
         return try delegate(st, root: revealed, keyPublic: signingPublicKey, ts: ts, notAfter: nil)
     }
 
-    /// `dlg` of `keyPublic`, signed by the current root. A signing key that is the current root, or the committed next
-    /// root, is refused (`invalid_argument`): its signatures would expose a root key (01 § Rotation and recovery).
+    /// `dlg` of `keyPublic`, signed by the current root. A signing key that is the current root, or a committed next or
+    /// fallback root, is refused (`invalid_argument`): its signatures would expose a root key (01 § Rotation and recovery).
     package static func delegate(_ state: KelState, root: any ACEKeyProvider, keyPublic: Data, ts: Int, notAfter: Int?) throws -> KelState {
         guard keyPublic != state.rootPublicKey, !state.commits(to: keyPublic) else {
-            throw ACEError(.invalidArgument, "the signing key must be neither the current nor the committed next root")
+            throw ACEError(.invalidArgument, "the signing key must be neither the current nor a committed root")
         }
         return try appended(state, try ACEKel.createDelegation(state: state, root: root, keyPublic: keyPublic, ts: ts, notAfter: notAfter), ts)
+    }
+
+    /// The digests of every key `events` reveals: each root and delegated signing key, each possibly exposed.
+    package static func revealedDigests(_ events: [KelEvent]) throws -> Set<Data> {
+        Set(try events.map { ev in
+            let member = ev["t"] == "dlg" ? "key" : "root"
+            return keyDigest(publicKey: try ACEKel.keyBytes(ev[member], member).publicKey)
+        })
     }
 
     /// Committing any key the log reveals (a current or past root, or a delegated signing key), each possibly exposed, is
     /// refused (pre-rotation, 01 § Rotation and recovery).
     package static func checkFreshNext(_ digest: Data, current: Data, events: [KelEvent]) throws {
-        var revealed: Set<Data> = [keyDigest(publicKey: current)]
-        for ev in events {
-            let member = ev["t"] == "dlg" ? "key" : "root"
-            revealed.insert(keyDigest(publicKey: try ACEKel.keyBytes(ev[member], member).publicKey))
-        }
-        guard !revealed.contains(digest) else {
+        guard digest != keyDigest(publicKey: current), !(try revealedDigests(events)).contains(digest) else {
             throw ACEError(.invalidArgument, "the next root must differ from every root and signing key the log reveals")
         }
     }
@@ -165,7 +168,7 @@ package final class KelIdentityCore<Key: ACEKeyProvider>: @unchecked Sendable {
     package init(root: Key, nextRoot: Key?, signing: Key, kel: [KelEvent], now: Int, makeKey: @escaping MakeKey) throws {
         let state = try ACEKel.verify(kel, now: now)
         guard state.rootPublicKey == root.publicKey() else { throw ACEError(.invalidArgument, "root key does not match the kel") }
-        if let nextRoot, !state.commits(to: nextRoot.publicKey()) {
+        if let nextRoot, !state.commitsNext(to: nextRoot.publicKey()) {
             throw ACEError(.invalidArgument, "next root key does not match the commitment")
         }
         guard let s = state.signing else { throw ACEError(.invalidKel, "kel has no signing delegation") }

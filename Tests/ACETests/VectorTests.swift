@@ -155,7 +155,7 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
             let now = c["now"]!.i
             let st = try ACEKel.verify(events, now: now)
             #expect(st.aceId == c["aceId"]!.s && st.seq == c["seq"]!.i && st.lastHash == c["lastHash"]!.s)
-            #expect(c["rootScheme"]!.s == SigningScheme.mlDsa65.rawValue && st.next == c["next"]!.s)
+            #expect(c["rootScheme"]!.s == SigningScheme.mlDsa65.rawValue && st.next == c["next"]!.s && st.fallback == c["fallback"]!.stringValue)
             if c["signing"]!.isNull {
                 #expect(st.signing == nil)
             } else {
@@ -182,6 +182,7 @@ private func vectorVault(_ peerSeeds: JSONValue? = nil) throws -> StorePrekeyVau
             } else {
                 let (st, outcome) = try ACEKel.extend(pinned: pinned, events: c["candidate"]!.events, now: now)
                 #expect(outcome.rawValue == c["outcome"]!.s && st.seq == c["seq"]!.i, "\(label(c))")
+                #expect(st.next == c["next"]!.s && st.fallback == c["fallback"]!.stringValue, "\(label(c))")
             }
         }
         for c in k["operational"]!.a {

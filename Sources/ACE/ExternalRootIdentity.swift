@@ -33,8 +33,8 @@ public struct ExternalRootIdentityExport: Sendable, Equatable {
 }
 
 /// A person identity: root key(n) is held outside (the caller supplies it per operation), the signing key is injected.
-/// KEL convention: inception root key(0) commits digest(key(1)); the k-th `rot` reveals key(k) and commits
-/// digest(key(k+1)); the current root is key(`rotationCount`).
+/// KEL convention: inception root key(0) commits digest(key(1)); the k-th primary `rot` reveals key(k) and commits
+/// digest(key(k+1)). An optional fallback root chain fb(0), fb(1), … is committed as `fallback` (see `RootChain`).
 /// Not an `ACEManagedIdentity`: it holds no root, so it cannot delegate on its own (a new signing key comes with `recover`).
 public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
     private let lock = NSLock()
@@ -62,24 +62,25 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
 
     /// Take the identity over from its log (another device's, or a relay's copy): fork at the start of the current root
     /// epoch, `rot` revealing `nextRoot` (the committed next root, else `invalid_argument`) and committing
-    /// `nextRootDigest`, then `dlg` of `signingKey`, dated `max(now, ts of the epoch start)`. Every delegation of the
-    /// epoch, the previous device's included, is revoked.
+    /// `nextRootDigest` and the log's fallback (unless the log revealed it), then `dlg` of `signingKey`, dated
+    /// `max(now, ts of the epoch start)`. Every delegation of the epoch, the previous device's included, is revoked.
     public static func recover(kel: [KelEvent], revealing nextRoot: SoftwareKey, nextRootDigest: Data, signingKey: any ACEKeyProvider,
                                now: Int? = nil) throws -> ExternalRootIdentity {
-        try recover(kel: kel, next: { _ in (nextRoot, nextRootDigest) }, signingKey: signingKey, now: now)
+        let (state, ts, full) = try KelSteps.epochStart(kel, now: try identityNow(now))
+        return try recover(state, ts: ts, full: full, revealing: nextRoot, nextRootDigest: nextRootDigest, signingKey: signingKey)
     }
 
-    /// `recover`, with the next root and the digest to commit chosen once the log verified: `next(k)` gets the index k of
-    /// the root to reveal (the epoch's `rotationCount` + 1).
-    private static func recover(kel: [KelEvent], next: (Int) throws -> (root: SoftwareKey, digest: Data), signingKey: any ACEKeyProvider,
-                                now: Int?) throws -> ExternalRootIdentity {
-        let (state, ts, full) = try KelSteps.epochStart(kel, now: try identityNow(now))
-        let (nextRoot, nextRootDigest) = try next(state.rotationCount + 1)
+    /// `rot` revealing the committed next root `nextRoot` after `state` (a verified prefix of `full`), keeping its fallback
+    /// unless `full` revealed it, then `dlg` of `signingKey`, both at `ts`.
+    private static func recover(_ state: KelState, ts: Int, full: [KelEvent], revealing nextRoot: SoftwareKey, nextRootDigest: Data,
+                                signingKey: any ACEKeyProvider) throws -> ExternalRootIdentity {
         let d = try checkNextDigest(nextRootDigest)
         try checkCommitted(nextRoot, state)
         // The whole verified log: a key revealed only on the dropped branch is exposed all the same.
         try KelSteps.checkFreshNext(d, current: nextRoot.publicKey(), events: full)
-        let st = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: d, signingPublicKey: signingKey.publicKey(), ts: ts)
+        let fallback = try state.fallback.flatMap(hexDecode).flatMap { try KelSteps.revealedDigests(full).contains($0) ? nil : $0 }
+        let st = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: d, fallbackDigest: fallback,
+                                     signingPublicKey: signingKey.publicKey(), ts: ts)
         return try ExternalRootIdentity(state: st, signing: signingKey)
     }
 
@@ -89,29 +90,27 @@ public final class ExternalRootIdentity: HeldKelIdentity, @unchecked Sendable {
         try self.init(state: ACEKel.verify(export.kel, now: try identityNow(now)), signing: signingKey)
     }
 
-    /// `rot` revealing `nextRoot` (the committed next root, key(`rotationCount` + 1), else `invalid_argument`) and
-    /// committing `nextRootDigest`, then `dlg` of the current signing key by the revealed root (a `rot` revokes the
-    /// signing delegation). A new signing key comes with `recover` (a new device).
+    /// `rot` revealing `nextRoot` (the committed next root, else `invalid_argument`) and committing `nextRootDigest`,
+    /// keeping the fallback, then `dlg` of the current signing key by the revealed root (a `rot` revokes the signing
+    /// delegation). A new signing key comes with `recover` (a new device).
     public func rotate(revealing nextRoot: SoftwareKey, nextRootDigest: Data, now: Int? = nil) throws {
-        try rotate(revealing: nextRoot, nextRootDigest: nextRootDigest, now: now, from: nil)
+        let st = getState()
+        try rotate(revealing: nextRoot, nextRootDigest: nextRootDigest, fallback: st.fallback.flatMap(hexDecode), now: now, from: st.lastHash)
     }
 
-    /// `from`: the `rotationCount` the keys were derived for; another one (a concurrent rotation) is `invalid_argument`.
-    private func rotate(revealing nextRoot: SoftwareKey, nextRootDigest: Data, now: Int?, from: Int?) throws {
+    /// `from`: the `lastHash` the keys were chosen for; another one (a concurrent rotation) is `invalid_argument`.
+    private func rotate(revealing nextRoot: SoftwareKey, nextRootDigest: Data, fallback: Data?, now: Int?, from: String) throws {
         let d = try checkNextDigest(nextRootDigest)
         try withLock {
-            if let from, from != state.rotationCount {
-                throw ACEError(.invalidArgument, "rotationCount moved from \(from) to \(state.rotationCount) during rotate(roots:)")
-            }
+            guard from == state.lastHash else { throw ACEError(.invalidArgument, "the log changed during rotate") }
             let ts = try identityNow(now)
             try checkCommitted(nextRoot, state)
-            try KelSteps.checkFreshNext(d, current: nextRoot.publicKey(), events: state.events)
-            state = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: d, signingPublicKey: signing.publicKey(), ts: ts)
+            for c in [d, fallback].compactMap({ $0 }) {
+                try KelSteps.checkFreshNext(c, current: nextRoot.publicKey(), events: state.events)
+            }
+            state = try KelSteps.rotate(state, revealed: nextRoot, nextDigest: d, fallbackDigest: fallback, signingPublicKey: signing.publicKey(), ts: ts)
         }
     }
-
-    /// The number of `rot` events in the log: the index n of the current root key(n).
-    public var rotationCount: Int { withLock { state.rotationCount } }
 
     /// The signing key reference and the log (the host persists them). Never a root. Only a Secure Enclave signing key
     /// has a reference; any other key (a `SoftwareKey` would export its seed in clear) is `invalid_argument`.
@@ -169,12 +168,41 @@ extension ExternalRootIdentityExport: CustomStringConvertible, CustomDebugString
 // MARK: - Root chain
 
 /// For a host whose roots form a chain key(0), key(1), … it derives on demand (e.g. from one passkey PRF): `roots(k)`
-/// returns key(k), and ACE picks k from the log (the current root is key(`rotationCount`); a step reveals key(n + 1) and
-/// commits digest(key(n + 2))), so the host never indexes the chain itself. Each key is dropped after the call.
+/// returns key(k), and ACE picks k from the log by finding which keys of the chain it reveals, so the host never indexes
+/// the chain itself. Each key is dropped after the call.
+///
+/// A second, independent chain fb(0), fb(1), … (e.g. from a backup passkey's PRF) can be committed as the fallback root
+/// (01 § Rotation and recovery): `rotate(roots:fallback: .set(fb))` commits fb(i), the first key of it the log has not
+/// revealed, and `recover(kel:fallbackRoots:signingKey:)` takes the identity over with fb alone. The next root outranks the
+/// fallback: `recover(kel:roots:signingKey:)` forks at the first `rot` after the chain's own last root, so it reclaims the
+/// identity from any fallback recovery (a stolen backup included).
 extension ExternalRootIdentity {
     public typealias RootChain = (Int) throws -> SoftwareKey
 
+    /// What a primary `rotate(roots:fallback:)` commits as the fallback root.
+    public enum FallbackChange {
+        /// The log's current fallback commitment, if any.
+        case keep
+        /// fb(i) of this chain, i the number of its keys the log reveals.
+        case set(RootChain)
+        /// No fallback.
+        case remove
+    }
+
     private static func digest(_ roots: RootChain, _ k: Int) throws -> Data { keyDigest(publicKey: try roots(k).publicKey()) }
+
+    /// How many keys of `chain` `events` reveals as roots, in order from key(0), and the index of the last event that
+    /// revealed one (nil when none).
+    private static func revealed(_ events: [KelEvent], _ chain: RootChain) throws -> (count: Int, last: Int?) {
+        var n = 0, last: Int?, d = try digest(chain, 0)
+        for (i, ev) in events.enumerated() where ev["t"] != "dlg" {
+            guard keyDigest(publicKey: try ACEKel.keyBytes(ev["root"], "root").publicKey) == d else { continue }
+            n += 1
+            last = i
+            d = try digest(chain, n)
+        }
+        return (n, last)
+    }
 
     /// The ACE ID `incept(roots:signingKey:inceptedAt:)` makes, without a signing key: the hash of the inception by key(0)
     /// committing digest(key(1)) dated `inceptedAt`.
@@ -183,20 +211,59 @@ extension ExternalRootIdentity {
         return ACEKel.computeACEId(inceptionBytes: try ACEKel.eventBytes(icp))
     }
 
-    /// `incept` by key(0) committing digest(key(1)).
+    /// `incept` by key(0) committing digest(key(1)), with no fallback (the ACE ID is a function of `roots` alone).
     public static func incept(roots: RootChain, signingKey: any ACEKeyProvider, inceptedAt: Int, now: Int? = nil) throws -> ExternalRootIdentity {
         try incept(root: roots(0), nextRootDigest: digest(roots, 1), signingKey: signingKey, inceptedAt: inceptedAt, now: now)
     }
 
-    /// `recover` revealing key(n + 1) and committing digest(key(n + 2)), n read off the verified log.
+    /// Take the identity over with the next root: the log reveals key(0) … key(n − 1) of `roots` (else `invalid_argument`);
+    /// fork at the first `rot` after the last of them (a fallback `rot`, which a primary `rot` supersedes, 01 rule 6) or,
+    /// when there is none, at the start of its epoch; `rot` revealing key(n), committing digest(key(n + 1)) and the
+    /// fallback committed before the fork unless the log revealed it, then `dlg` of `signingKey`, dated
+    /// `max(now, ts of the last kept event)`. Every delegation and commitment after the fork is revoked.
     public static func recover(kel: [KelEvent], roots: RootChain, signingKey: any ACEKeyProvider, now: Int? = nil) throws -> ExternalRootIdentity {
-        try recover(kel: kel, next: { k in (try roots(k), try digest(roots, k + 1)) }, signingKey: signingKey, now: now)
+        let nowTs = try identityNow(now)
+        let full = try ACEKel.verify(kel, now: nowTs).events
+        let (n, last) = try revealed(full, roots)
+        guard let last else { throw ACEError(.invalidArgument, "the roots did not incept this log") }
+        let cut = full[(last + 1)...].firstIndex { $0["t"] == "rot" } ?? last + 1
+        let kept = Array(full[..<cut])
+        let ts = atLogTail(kept, now: nowTs)
+        return try recover(try ACEKel.verify(kept, now: ts), ts: ts, full: full, revealing: roots(n), nextRootDigest: digest(roots, n + 1),
+                           signingKey: signingKey)
     }
 
-    /// `rotate` revealing key(`rotationCount` + 1) and committing digest(key(`rotationCount` + 2)).
-    public func rotate(roots: RootChain, now: Int? = nil) throws {
-        // `roots` runs outside the lock (host code); the count it was read at is checked again under the lock.
-        let n = rotationCount
-        try rotate(revealing: roots(n + 1), nextRootDigest: Self.digest(roots, n + 2), now: now, from: n)
+    /// Take the identity over with the fallback root: fork at the start of the current root epoch; `rot` revealing fb(i),
+    /// the first key of `fallbackRoots` the log has not revealed (the committed fallback, else `invalid_argument`),
+    /// carrying the committed next root and committing digest(fb(i + 1)), then `dlg` of `signingKey`, dated
+    /// `max(now, ts of the epoch start)`. The holder of the next root can reclaim the identity from it at any time.
+    public static func recover(kel: [KelEvent], fallbackRoots: RootChain, signingKey: any ACEKeyProvider, now: Int? = nil) throws -> ExternalRootIdentity {
+        let (state, ts, full) = try KelSteps.epochStart(kel, now: try identityNow(now))
+        let i = try revealed(state.events, fallbackRoots).count
+        let root = try fallbackRoots(i)
+        guard hexEncode(keyDigest(publicKey: root.publicKey())) == state.fallback else {
+            throw ACEError(.invalidArgument, "fallbackRoots(\(i)) is not the committed fallback root")
+        }
+        let d = try digest(fallbackRoots, i + 1)
+        try KelSteps.checkFreshNext(d, current: root.publicKey(), events: full)
+        guard let next = hexDecode(state.next) else { throw ACEError(.invalidKel, "next must be 64 lowercase hex") }
+        let st = try KelSteps.rotate(state, revealed: root, nextDigest: next, fallbackDigest: d,
+                                     signingPublicKey: signingKey.publicKey(), ts: ts)
+        return try ExternalRootIdentity(state: st, signing: signingKey)
+    }
+
+    /// `rotate` revealing key(n), the first key of `roots` the log has not revealed, committing digest(key(n + 1)) and the
+    /// fallback `fallback` selects.
+    public func rotate(roots: RootChain, fallback: FallbackChange = .keep, now: Int? = nil) throws {
+        // `roots` runs outside the lock (host code); the log it was read at is checked again under the lock.
+        let st = getState()
+        let n = try Self.revealed(st.events, roots).count
+        let fd: Data?
+        switch fallback {
+        case .keep: fd = st.fallback.flatMap(hexDecode)
+        case .remove: fd = nil
+        case .set(let chain): fd = try Self.digest(chain, Self.revealed(st.events, chain).count)
+        }
+        try rotate(revealing: roots(n), nextRootDigest: Self.digest(roots, n + 1), fallback: fd, now: now, from: st.lastHash)
     }
 }

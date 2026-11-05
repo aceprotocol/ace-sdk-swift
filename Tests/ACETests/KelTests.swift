@@ -212,7 +212,7 @@ private func rawDlg(_ st: KelState, _ scheme: String, _ pk: Data, _ ts: Int) thr
             let d = try ACEKel.createDelegation(state: st, root: R0, keyPublic: pk, ts: ts)
             ev.append(d)
             st = KelState(aceId: st.aceId, seq: st.seq + 1, lastHash: sha256Hex(try ACEKel.eventBytes(d)),
-                          rootPublicKey: st.rootPublicKey, next: st.next, signing: st.signing, events: [])
+                          rootPublicKey: st.rootPublicKey, next: st.next, fallback: nil, signing: st.signing, events: [])
         }
         #expect(try ACEKel.verify(ev, now: ts).seq == ACELimits.maxKelEvents - 1)
         ts += 1

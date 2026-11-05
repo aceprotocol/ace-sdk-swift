@@ -26,23 +26,29 @@ public struct KelState: Sendable, Equatable, Hashable {
     public let lastHash: String
     public let rootPublicKey: Data
     public let next: String
+    /// The committed fallback root's digest, or nil (01 § Rotation and recovery).
+    public let fallback: String?
     public let signing: DelegatedKey?
     /// The verified events, owned by the state. Excluded from `==` / `hash` (`lastHash` already commits to them).
     public let events: [KelEvent]
 
     public static func == (a: KelState, b: KelState) -> Bool {
-        a.aceId == b.aceId && a.seq == b.seq && a.lastHash == b.lastHash && a.rootPublicKey == b.rootPublicKey && a.next == b.next && a.signing == b.signing
+        a.aceId == b.aceId && a.seq == b.seq && a.lastHash == b.lastHash && a.rootPublicKey == b.rootPublicKey && a.next == b.next && a.fallback == b.fallback
+            && a.signing == b.signing
     }
 
     public func hash(into h: inout Hasher) {
-        h.combine(aceId); h.combine(seq); h.combine(lastHash); h.combine(rootPublicKey); h.combine(next); h.combine(signing)
+        h.combine(aceId); h.combine(seq); h.combine(lastHash); h.combine(rootPublicKey); h.combine(next); h.combine(fallback); h.combine(signing)
     }
 
-    /// The pre-rotation commitment: `next` is `hex(keyDigest(publicKey))`.
-    package func commits(to publicKey: Data) -> Bool { hexEncode(keyDigest(publicKey: publicKey)) == next }
+    /// A pre-rotation commitment: `next` or `fallback` is `hex(keyDigest(publicKey))`.
+    package func commits(to publicKey: Data) -> Bool {
+        let d = hexEncode(keyDigest(publicKey: publicKey))
+        return d == next || d == fallback
+    }
 
-    /// The number of `rot` events: the index n of the current root key(n) (key(0) incepts).
-    public var rotationCount: Int { events.filter { $0["t"] == .string("rot") }.count }
+    /// The pre-rotation commitment of the next root: `next` is `hex(keyDigest(publicKey))`.
+    package func commitsNext(to publicKey: Data) -> Bool { hexEncode(keyDigest(publicKey: publicKey)) == next }
 }
 
 /// How `ACEKel.extend` treated a candidate log against the pinned one.
@@ -82,25 +88,25 @@ public enum ACEKel {
     /// Canonical bytes (signatures excluded). Shape errors are `invalid_kel`.
     public static func eventBytes(_ event: KelEvent) throws -> Data {
         guard case .string(let t)? = event["t"], let members = keys[t] else { throw bad("event must be icp, rot or dlg") }
-        let allowed = t == "dlg" ? members.union(["notAfter"]) : members
+        let allowed = members.union([t == "dlg" ? "notAfter" : "fallback"])
         let required = members.subtracting(["sig"])  // signatures are not part of the canonical bytes
         let present = Set(event.keys)
         guard present.isSubset(of: allowed), required.isSubset(of: present) else { throw bad("\(t) has unknown or missing members") }
         guard let seq = event["seq"]?.wireInt, let ts = event["ts"]?.wireInt else { throw bad("seq and ts must be wire integers") }
-        if t == "icp" {
-            let (scheme, pk) = try keyBytes(event["root"], "root")
-            let next = try sha256HexBytes(event["next"], "next")
-            return ACESigning.encodePayload([
-                .string("icp"), .string(decimal(seq)), .string(decimal(ts)), .string(scheme), .data(pk), .data(next),
-            ])
+        var head: [PayloadField] = [.string(t), .string(decimal(seq)), .string(decimal(ts))]
+        if t != "icp" {
+            guard case .string(let prev)? = event["prev"], isSHA256Hex(prev) else { throw bad("prev must be 64 lowercase hex") }
+            head.append(.string(prev))
         }
-        guard case .string(let prev)? = event["prev"], isSHA256Hex(prev) else { throw bad("prev must be 64 lowercase hex") }
-        if t == "rot" {
+        if t != "dlg" {
             let (scheme, pk) = try keyBytes(event["root"], "root")
-            let next = try sha256HexBytes(event["next"], "next")
-            return ACESigning.encodePayload([
-                .string("rot"), .string(decimal(seq)), .string(decimal(ts)), .string(prev), .string(scheme), .data(pk), .data(next),
-            ])
+            var commits = [PayloadField.data(try sha256HexBytes(event["next"], "next"))]
+            if let fallback = event["fallback"] {
+                let d = try sha256HexBytes(fallback, "fallback")
+                guard fallback != event["next"] else { throw bad("fallback must differ from next") }
+                commits.append(.data(d))
+            }
+            return ACESigning.encodePayload(head + [.string(scheme), .data(pk)] + commits)
         }
         let (scheme, pk) = try keyBytes(event["key"], "key")
         var na = ""
@@ -108,10 +114,7 @@ public enum ACEKel {
             guard let n = v.wireInt else { throw bad("notAfter must be a wire integer") }
             na = decimal(n)
         }
-        return ACESigning.encodePayload([
-            .string("dlg"), .string(decimal(seq)), .string(decimal(ts)), .string(prev), .string(scheme), .data(pk),
-            .string(na),
-        ])
+        return ACESigning.encodePayload(head + [.string(scheme), .data(pk), .string(na)])
     }
 
     /// `ace:sha256:` + hex(SHA-256(inception event bytes)).
@@ -139,7 +142,8 @@ public enum ACEKel {
         }
     }
 
-    public static func createInception(root: any ACEKeyProvider, nextDigest: Data, ts: Int) throws -> KelEvent {
+    /// `icp` committing `nextDigest` and, optionally, `fallbackDigest`.
+    public static func createInception(root: any ACEKeyProvider, nextDigest: Data, ts: Int, fallbackDigest: Data? = nil) throws -> KelEvent {
         var ev: KelEvent = [
             "t": "icp",
             "seq": 0,
@@ -147,15 +151,18 @@ public enum ACEKel {
             "root": keyValue(root.publicKey()),
             "next": .string(hexEncode(nextDigest)),
         ]
+        if let fallbackDigest { ev["fallback"] = .string(hexEncode(fallbackDigest)) }
         let eb = try eventBytes(ev)
         ev["sig"] = try sig(root, computeACEId(inceptionBytes: eb), ts, eb)
         return ev
     }
 
-    /// `rot` revealing the committed `newRoot`, signed by it alone (pre-rotation).
-    public static func createRotation(state: KelState, newRoot: any ACEKeyProvider, nextDigest: Data, ts: Int) throws -> KelEvent {
+    /// `rot` revealing the committed next or fallback `newRoot`, signed by it alone (pre-rotation), committing `nextDigest`
+    /// and `fallbackDigest`. A commitment it does not reveal is kept only when passed again (`state.next`, `state.fallback`).
+    public static func createRotation(state: KelState, newRoot: any ACEKeyProvider, nextDigest: Data, ts: Int,
+                                      fallbackDigest: Data? = nil) throws -> KelEvent {
         guard state.commits(to: newRoot.publicKey()) else {
-            throw bad("new root does not match the committed next digest")
+            throw bad("new root does not match a committed digest")
         }
         var ev: KelEvent = [
             "t": "rot",
@@ -165,6 +172,7 @@ public enum ACEKel {
             "root": keyValue(newRoot.publicKey()),
             "next": .string(hexEncode(nextDigest)),
         ]
+        if let fallbackDigest { ev["fallback"] = .string(hexEncode(fallbackDigest)) }
         let eb = try eventBytes(ev)
         ev["sig"] = try sig(newRoot, state.aceId, ts, eb)
         return ev
@@ -240,7 +248,7 @@ public enum ACEKel {
         guard ACESigning.isValidSigningPublicKey(rootSchemeName, rootPk) else { throw bad("root key must be ml-dsa-65") }
         let icpNext = events[0]["next"]?.stringValue ?? ""  // validated by eventBytes
         var state = resume ?? KelState(aceId: aceId, seq: 0, lastHash: sha256Hex(eb), rootPublicKey: rootPk,
-                                       next: icpNext, signing: nil, events: [])
+                                       next: icpNext, fallback: events[0]["fallback"]?.stringValue, signing: nil, events: [])
         let first = resume?.events.count ?? 0
         // Rule 1: the whole log's structure before any signature.
         var bytes: [Data] = []
@@ -267,18 +275,18 @@ public enum ACEKel {
             let t = ev["t"]?.stringValue ?? ""
             let ts = ev["ts"]?.wireInt ?? 0
             var signing = state.signing
-            let newRoot: (publicKey: Data, next: String)
+            let newRoot: (publicKey: Data, next: String, fallback: String?)
             if t == "icp" {
                 try checkSig(ev["sig"], aceId, ts, eb, rootPk, "icp")
-                newRoot = (rootPk, ev["next"]?.stringValue ?? "")
+                newRoot = (rootPk, ev["next"]?.stringValue ?? "", ev["fallback"]?.stringValue)
             } else if t == "rot" {
                 let (scheme, pk) = try keyBytes(ev["root"], "root")
                 guard ACESigning.isValidSigningPublicKey(scheme, pk) else { throw bad("event \(i): root key must be ml-dsa-65") }
                 guard state.commits(to: pk) else {
-                    throw bad("event \(i): revealed root does not match commitment")
+                    throw bad("event \(i): revealed root does not match a commitment")
                 }
                 try checkSig(ev["sig"], aceId, ts, eb, pk, "rot")  // the revealed root alone
-                newRoot = (pk, ev["next"]?.stringValue ?? "")
+                newRoot = (pk, ev["next"]?.stringValue ?? "", ev["fallback"]?.stringValue)
                 signing = nil
             } else {
                 try checkSig(ev["sig"], aceId, ts, eb, state.rootPublicKey, "dlg")
@@ -289,12 +297,13 @@ public enum ACEKel {
                     throw bad("event \(i): signing key must be ml-dsa-65")
                 }
                 signing = DelegatedKey(publicKey: pk, seq: i, notAfter: na)
-                newRoot = (state.rootPublicKey, state.next)
+                newRoot = (state.rootPublicKey, state.next, state.fallback)
             }
             state = KelState(aceId: aceId, seq: i, lastHash: sha256Hex(eb), rootPublicKey: newRoot.publicKey,
-                             next: newRoot.next, signing: signing, events: [])
+                             next: newRoot.next, fallback: newRoot.fallback, signing: signing, events: [])
         }
-        return KelState(aceId: aceId, seq: state.seq, lastHash: state.lastHash, rootPublicKey: state.rootPublicKey, next: state.next, signing: state.signing, events: events)
+        return KelState(aceId: aceId, seq: state.seq, lastHash: state.lastHash, rootPublicKey: state.rootPublicKey, next: state.next,
+                        fallback: state.fallback, signing: state.signing, events: events)
     }
 
     /// A signing key is delegated and, when it has a `notAfter`, `now < notAfter`.
@@ -308,6 +317,20 @@ public enum ACEKel {
         try extend(pinned: pinned, verified: try verify(events, now: now))
     }
 
+    private static func rootDigest(_ ev: KelEvent) throws -> String {
+        hexEncode(keyDigest(publicKey: try keyBytes(ev["root"], "root").publicKey))
+    }
+
+    /// 01 rule 6 reclaim at fork point `k` (both logs verified, equal before `k`): the candidate's `rot` reveals the `next`
+    /// committed before `k` (by the last `icp` or `rot`), the pinned event there is a (fallback) `rot`, and no pinned
+    /// event from `k` on reveals that root.
+    private static func reclaims(_ pinned: [KelEvent], _ cand: [KelEvent], _ k: Int) throws -> Bool {
+        guard k > 0, cand[k]["t"] == .string("rot"), pinned[k]["t"] == .string("rot"),
+              let next = cand[..<k].last(where: { $0["t"] != .string("dlg") })?["next"]?.stringValue,
+              try rootDigest(cand[k]) == next else { return false }
+        return try !pinned[k...].contains { try $0["t"] != .string("dlg") && rootDigest($0) == next }
+    }
+
     /// `extend` of a candidate already returned by `verify`.
     package static func extend(pinned: KelState?, verified cand: KelState) throws -> (state: KelState, outcome: ExtendOutcome) {
         guard let pinned else { return (cand, .adopted) }
@@ -315,11 +338,12 @@ public enum ACEKel {
         let ph = try pinned.events.map { sha256Hex(try eventBytes($0)) }
         let ch = try cand.events.map { sha256Hex(try eventBytes($0)) }
         for k in 0..<min(ph.count, ch.count) where ph[k] != ch[k] {
-            // a rot supersedes the pinned events from the fork point only when none of them is a rot:
-            // otherwise a holder of a revealed root could re-reveal it (01 rule 6)
+            // a rot supersedes the pinned events from the fork point when none of them is a rot (otherwise a holder of a
+            // revealed root could re-reveal it), or when the next root reclaims the identity from a fallback rot (01 rule 6)
             if cand.events[k]["t"] == .string("rot") && !pinned.events[k...].contains(where: { $0["t"] == .string("rot") }) {
                 return (cand, .recovered)
             }
+            if try reclaims(pinned.events, cand.events, k) { return (cand, .recovered) }
             throw ACEError(.kelConflict, "conflicting event at seq \(k)")
         }
         if ch.count > ph.count { return (cand, .extended) }
