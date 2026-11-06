@@ -266,6 +266,25 @@ public actor RelayClient {
         return card
     }
 
+    /// `GET /v1/fallbacks/{digest}`: the registered log of the identity the fallback commitment `digest` (64 lowercase hex)
+    /// is bound to at this relay (07 § Registration), verified, and required to commit `digest` as a `fallback`. A holder
+    /// of only the fallback root finds its log this way, by its chain's first commitment fb(0), then recovers with
+    /// `ExternalRootIdentity.recover(kel:fallbackRoots:signingKey:)`.
+    public func fallbackKel(_ digest: String) async throws -> KelState {
+        guard isSHA256Hex(digest) else { throw ACEError(.invalidArgument, "digest must be 64 lowercase hex") }
+        let state: KelState = try verified(try await call("GET", "/v1/fallbacks/" + digest), "log", nil, idOf: \.aceId) { v, now in
+            guard case .object(let o) = v, Set(o.keys) == ["kel"], let kel = o["kel"]?.arrayValue else {
+                throw ACEError(.relayProtocolError, "expected {kel}")
+            }
+            return try ACEKel.verify(try kel.map { guard case .object(let e) = $0 else { throw ACEError(.invalidKel, "event must be an object") }; return e },
+                                     now: now)
+        }
+        guard state.events.contains(where: { $0["fallback"]?.stringValue == digest }) else {
+            throw ACEError(.relayProtocolError, "the log does not commit this fallback")
+        }
+        return state
+    }
+
     /// `GET /v1/cards`: the public directory (card records listed at this relay), optionally only cards carrying `tag`
     /// (`^[a-z0-9-]{1,32}$`, else `invalid_argument`). Each entry is verified on its own: one that fails verification
     /// permanently, is not listed here or does not carry `tag` is skipped; a transient failure throws. `profile` is the

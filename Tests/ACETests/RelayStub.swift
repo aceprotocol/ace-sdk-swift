@@ -141,6 +141,8 @@ final class FakeRelay: @unchecked Sendable {
     private var cards: [String: JSONValue] = [:]
     /// Handle bindings (permanent, set once per identity).
     private var handles: [String: String] = [:]
+    /// Fallback bindings: digest → the first identity whose registered log committed it (permanent).
+    private var fallbacks: [String: String] = [:]
     private var queues: [String: [(id: String, packet: Data)]] = [:]
     private var blocks: [String: [String: (blocked: Bool, revision: Int)]] = [:]
     private var wakes: [String: (gateway: String, token: String)] = [:]
@@ -195,6 +197,7 @@ final class FakeRelay: @unchecked Sendable {
     /// Bind `handle` to `aceId` as is.
     func bindHandle(_ handle: String, to aceId: String) { withLock { handles[handle] = aceId } }
     func handleOwner(_ handle: String) -> String? { withLock { handles[handle] } }
+    func bindFallback(_ digest: String, to aceId: String) { withLock { fallbacks[digest] = aceId } }
     /// The stored PublishedAgent of `aceId` (nil when none was published).
     func publishedAgent(_ aceId: String) -> VerifiedAgent? { withLock { agents[aceId] } }
     /// Drop `aceId`'s stored PublishedAgent (a relay that lost it).
@@ -226,6 +229,7 @@ final class FakeRelay: @unchecked Sendable {
             case ("POST", "/v1/register"):
                 guard let body, let st = try? verifyRegistration(body, now: now) else { return err(400, "invalid_kel") }
                 kels[st.aceId] = st
+                for ev in st.events { if let d = ev["fallback"]?.stringValue, fallbacks[d] == nil { fallbacks[d] = st.aceId } }
                 return .json(200, ["ok": true, "status": "registered"] as JSONValue)
             case ("POST", "/v1/descriptor"):
                 guard let body, let a = try? verifyPublishedAgent(body, now: now) else { return err(401, "invalid_authorization") }
@@ -315,6 +319,12 @@ final class FakeRelay: @unchecked Sendable {
                     let id = String(path.dropFirst("/v1/card/".count))
                     guard kels[id] != nil, let c = cards[id] else { return err(404, "unknown_peer") }
                     return .json(200, c)
+                }
+                if method == "GET", path.hasPrefix("/v1/fallbacks/") {
+                    guard let owner = fallbacks[String(path.dropFirst("/v1/fallbacks/".count))], let st = kels[owner] else {
+                        return err(404, "unknown_peer")
+                    }
+                    return .json(200, ["kel": .array(st.events.map { .object($0) })] as JSONValue)
                 }
                 if method == "GET", path.hasPrefix("/v1/handles/") {
                     let h = String(path.dropFirst("/v1/handles/".count))

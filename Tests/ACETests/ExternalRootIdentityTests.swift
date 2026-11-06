@@ -286,4 +286,23 @@ import Testing
         // The thief cannot take it back with the backup: its rot is fallback at the same seq.
         expectCode(.kelConflict) { try ACEKel.extend(pinned: m.getState(), events: stolen.events, now: NOW + 4) }
     }
+
+    /// The fallback holder knows only fb(0)'s digest: the relay's fallback binding finds the log (07 § Registration).
+    @Test func theFallbackHolderFindsTheLogByItsFirstCommitment() async throws {
+        let clock = TestClock(systemClock()), relay = FakeRelay(clock: clock.fn)
+        let id = try ExternalRootIdentity.incept(roots: Self.root, signingKey: SoftwareKey.generate(), inceptedAt: 0, now: clock.now)
+        try id.rotate(roots: Self.root, fallback: .set(Self.backup), now: clock.now)
+        let client = try relay.client(clock: clock.fn)
+        _ = try await client.register(id)
+        let found = try await client.fallbackKel(Self.fbDigest(0))
+        #expect(found.aceId == id.getACEId())
+        let r = try ExternalRootIdentity.recover(kel: found.events, fallbackRoots: Self.backup, signingKey: SoftwareKey.generate(), now: clock.now)
+        _ = try await client.register(r)
+        // fb(0) stays bound after the recovery revealed it, so the next recovery looks it up the same way.
+        #expect(try await client.fallbackKel(Self.fbDigest(0)).lastHash == r.getState().lastHash)
+        await expectCodeAsync(.unknownPeer) { try await client.fallbackKel(String(repeating: "ab", count: 32)) }
+        await expectCodeAsync(.invalidArgument) { try await client.fallbackKel("AB") }
+        relay.bindFallback(String(repeating: "cd", count: 32), to: id.getACEId())
+        await expectCodeAsync(.relayProtocolError) { try await client.fallbackKel(String(repeating: "cd", count: 32)) }
+    }
 }
